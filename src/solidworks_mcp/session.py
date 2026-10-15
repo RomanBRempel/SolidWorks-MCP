@@ -488,14 +488,34 @@ class SolidWorksSession:
         held another plane first, and every part came out turned."""
         axes = self._DEFAULT_PLANE_AXES[key]
         planes = self._ref_planes()
+        transforms = []
         for feat in planes:
-            data = binding.wrap(binding.wrap(feat.GetSpecificFeature2(), self._mod.IRefPlane).Transform,
-                                self._mod.IMathTransform).ArrayData
-            through_origin = abs(sum(o * n for o, n in zip(data[9:12], data[6:9]))) < 1e-9
-            if through_origin and all(abs(a - b) < 1e-9 for a, b in zip(data[:9], itertools.chain(*axes))):
+            transforms.append(self._plane_transform(feat))
+            if self._lies_along(transforms[-1], axes):
                 return feat
+        if any(self._lies_along(data, self._Z_UP_FRONT_AXES) for data in transforms):
+            raise SolidWorksError("This part comes from a Z-up part template (an option since SolidWorks 2025): "
+                                  "its Front, Top and Right planes are turned, and the tools build in SolidWorks' "
+                                  "standard Y-up frame. Make new parts Y-up: choose Y-up where SolidWorks offers "
+                                  "the orientation for new documents, or a Y-up part template under Tools > "
+                                  "Options > System Options > Default Templates.")
         raise SolidWorksError(f"The part has no {key} plane: none of {', '.join(f.Name for f in planes)} lies "
                               f"through the origin facing {axes[2]}. Is its template unusual?")
+
+    # the Front plane of a part from a Z-up template, which turns every default
+    # plane: it faces +x, and a sketch on it runs along +y and +z
+    _Z_UP_FRONT_AXES = ((0, 1, 0), (0, 0, 1), (1, 0, 0))
+
+    @staticmethod
+    def _lies_along(data, axes) -> bool:
+        """Whether a plane with Transform `data` runs through the origin with these axes."""
+        through_origin = abs(sum(o * n for o, n in zip(data[9:12], data[6:9]))) < 1e-9
+        return through_origin and all(abs(a - b) < 1e-9 for a, b in zip(data[:9], itertools.chain(*axes)))
+
+    def _plane_transform(self, feat) -> tuple:
+        """A reference plane's IRefPlane.Transform: x axis, y axis, normal, origin (metres)."""
+        return binding.wrap(binding.wrap(feat.GetSpecificFeature2(), self._mod.IRefPlane).Transform,
+                            self._mod.IMathTransform).ArrayData
 
     def _solid_body(self):
         """The first solid body of the current part (early-bound IBody2)."""

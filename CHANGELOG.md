@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- A part from a Z-up template (an option since SOLIDWORKS 2025) is refused
+  with a message that names the Z-up template and how to make new parts
+  Y-up, instead of "The part has no front plane ... Is its template
+  unusual?". The tools build in SolidWorks' standard Y-up frame.
+
 ## [0.16.0] — 2026-10-10
 
 ### Fixed

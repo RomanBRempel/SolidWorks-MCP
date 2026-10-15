@@ -904,3 +904,50 @@ def test_equations_compare_without_spacing_or_case():
     """SolidWorks may respace an equation it keeps; a refused one keeps the old text."""
     assert SolidWorksSession._same_equation('"L"=90', ' "l" = 90 ')
     assert not SolidWorksSession._same_equation('"L" = 90', '"L" = 85')
+
+
+# --- default planes ------------------------------------------------------------------
+
+
+class _Plane:
+    def __init__(self, name):
+        self.Name = name
+
+
+# IRefPlane.Transform of each default plane (x axis, y axis, normal, origin) in a
+# part from a Z-up template: every plane turned, so none has the Y-up axes the
+# tools build in. A user's selftest log showed the Front plane facing +x.
+_Z_UP_PLANES = {"Front Plane": (0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0),
+                "Top Plane": (0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0),
+                "Right Plane": (-1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0)}
+
+
+def _with_planes(s, monkeypatch, transforms):
+    monkeypatch.setattr(s, "_ref_planes", lambda: [_Plane(name) for name in transforms])
+    monkeypatch.setattr(s, "_plane_transform", lambda feat: transforms[feat.Name])
+
+
+@pytest.mark.parametrize("key", ["front", "top", "right"])
+def test_a_part_from_a_z_up_template_is_refused_by_name(s, monkeypatch, key):
+    """With a Z-up template every build failed with 'no front plane ... Is its
+    template unusual?', which did not tell the user what to change."""
+    _with_planes(s, monkeypatch, _Z_UP_PLANES)
+    with pytest.raises(SolidWorksError) as refused:
+        s._default_plane(key)
+    assert "Z-up" in str(refused.value) and "Y-up" in str(refused.value), \
+        f"a Z-up part was not named as such: {refused.value}"
+
+
+def test_other_turned_planes_are_not_called_z_up(s, monkeypatch):
+    _with_planes(s, monkeypatch, {"Plane1": (1, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0)})
+    with pytest.raises(SolidWorksError, match="no front plane") as refused:
+        s._default_plane("front")
+    assert "Z-up" not in str(refused.value), f"blamed a Z-up template that is not there: {refused.value}"
+
+
+@pytest.mark.parametrize("key,name", [("front", "Front Plane"), ("top", "Top Plane"), ("right", "Right Plane")])
+def test_the_y_up_planes_are_found_in_any_order(s, monkeypatch, key, name):
+    _with_planes(s, monkeypatch, {"Right Plane": (0, 0, -1, 0, 1, 0, 1, 0, 0, 0, 0, 0),
+                                  "Top Plane": (1, 0, 0, 0, 0, -1, 0, 1, 0, 0, 0, 0),
+                                  "Front Plane": (1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0)})
+    assert s._default_plane(key).Name == name
