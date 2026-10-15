@@ -3,13 +3,19 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.16.1] — 2026-10-15
 
 ### Changed
 - A part from a Z-up template (an option since SOLIDWORKS 2025) is refused
   with a message that names the Z-up template and how to make new parts
   Y-up, instead of "The part has no front plane ... Is its template
   unusual?". The tools build in SolidWorks' standard Y-up frame.
+
+### Fixed
+- The `add_swept_profile` docs gave the profile's axes wrong: on the Right
+  plane u runs along world -Z and v along +Y, not +Y and +Z. An
+  off-centre profile landed elsewhere than the docs said; a test now pins
+  where it lands.
 
 ## [0.16.0] — 2026-10-10
 
