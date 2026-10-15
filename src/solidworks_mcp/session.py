@@ -1740,7 +1740,7 @@ class SolidWorksSession:
         """Sweep an arbitrary closed PROFILE (cross-section) along a 2D PATH.
 
         profile_mm = [[u, v], ...] in mm: the closed cross-section, drawn on the
-        Right plane (u along world +Y, v along world +Z), centred near the origin.
+        Right plane (u along world -Z, v along world +Y), centred near the origin.
         path_mm = [[x, y], ...] in mm on the Front plane; it MUST start at the
         origin heading +X (so the profile is perpendicular to the path there).
         Interior path corners are rounded with bend_radius_mm; corner_radii_mm

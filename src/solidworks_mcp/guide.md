@@ -18,7 +18,7 @@ short connect-time instructions first; this is the long version.
     the centroid's distance from that line).
   - Sweeps: the path lies on the Front plane. For `add_swept_profile` it **must
     start at the origin heading +X**, and the profile is drawn on the Right
-    plane (u along +Y, v along +Z).
+    plane (u along -Z, v along +Y).
 - Faces are selected by the direction they face: `+x`, `-z`, ... The `*_on_face`
   tools take **3D points on the face** and use the planar face facing that way
   **through the point**: the top, a pocket floor, a step in between. A point on

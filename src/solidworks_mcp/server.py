@@ -237,7 +237,7 @@ async def add_swept_profile(profile_mm: list, path_mm: list,
     """Sweep an arbitrary closed PROFILE (cross-section) along a 2D PATH.
 
     profile_mm = [[u,v],…] in mm: the closed cross-section on the Right plane (u →
-    world +Y, v → world +Z), centred near the origin. path_mm = [[x,y],…] in mm on
+    world -Z, v → world +Y), centred near the origin. path_mm = [[x,y],…] in mm on
     the Front plane — MUST start at the origin heading +X (the profile is
     perpendicular to the path there). Path corners are rounded with bend_radius_mm;
     corner_radii_mm rounds the profile's corners as for add_extruded_profile.

@@ -227,6 +227,18 @@ def test_swept_profile_L_bend(part):
     assert abs(got - 200 * length) < 0.5
 
 
+def test_swept_profile_draws_u_along_minus_z_and_v_along_y(part):
+    """The docs said u runs along +Y and v along +Z; a cross-section placed by
+    them came out turned a quarter. The profile is off-centre and wider in u
+    than in v, so a swap or a flipped sign each land somewhere else."""
+    profile = [[-5, -2], [15, -2], [15, 8], [-5, 8]]  # u -5..15, v -2..8
+    bbox = part.add_swept_profile(profile, [[0, 0], [40, 0]])["mass_properties"]["bounding_box_mm"]
+    # u -> z = -u (-15..5), v -> y = v (-2..8)
+    assert bbox["min_mm"] == pytest.approx([0, -2, -15], abs=1e-6) and \
+        bbox["max_mm"] == pytest.approx([40, 8, 5], abs=1e-6), \
+        f"the cross-section does not lie as documented (u along -z, v along +y): {bbox}"
+
+
 def test_loft_two_squares(part):
     # ruled loft between square side 40 @ z=0 and side 20 @ z=30 -> prismatoid
     # V = h/6 * (a^2 + (a+b)^2 + b^2) = 30/6 * (1600 + 3600 + 400) = 28000
