@@ -1,0 +1,112 @@
+# RBR fork: follow hjbaard/SolidWorks-MCP.
+#
+# Weekly (and on demand): mirror upstream/main into this fork's main, then, if
+# upstream moved, merge it into a sync branch off rbr, run all unit tests on
+# Windows and open a PR into rbr with upstream's commits and CHANGELOG. A
+# merge conflict opens an issue instead. The rbr extension lives in its own
+# subpackage (src/solidworks_mcp/rbr), so conflicts should be rare.
+#
+# Needs: rbr as the default branch (schedules run from it); Settings ->
+# Actions -> General -> "Allow GitHub Actions to create and approve pull requests".
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"   # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM: https://github.com/hjbaard/SolidWorks-MCP.git
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: rbr
+          fetch-depth: 0
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          git config user.name "rbr-sync-bot"
+          git config user.email "rbr-sync-bot@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch upstream main --tags
+          up=$(git rev-parse upstream/main)
+          echo "sha=$up" >> "$GITHUB_OUTPUT"
+          echo "short=${up:0:7}" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor upstream/main rbr; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Mirror upstream main into this fork's main
+        run: git push origin upstream/main:refs/heads/main --force
+      - name: Merge upstream into a sync branch
+        if: steps.fetch.outputs.new == 'true'
+        id: merge
+        run: |
+          branch="sync/upstream-${{ steps.fetch.outputs.short }}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          if gh pr list --head "$branch" --state open --json number --jq 'length' | grep -qv '^0$'; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          git checkout -b "$branch"
+          if git merge --no-ff --no-edit upstream/main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > conflicts.txt
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: astral-sh/setup-uv@v6
+        if: steps.merge.outputs.conflict == 'false'
+      - name: Unit tests on the merged code
+        if: steps.merge.outputs.conflict == 'false'
+        id: tests
+        continue-on-error: true
+        run: uv run --extra dev pytest -m "not solidworks" -q 2>&1 | tail -n 30 | tee tests.txt; exit ${PIPESTATUS[0]}
+      - name: Open PR into rbr
+        if: steps.merge.outputs.conflict == 'false'
+        run: |
+          git push origin "${{ steps.merge.outputs.branch }}"
+          {
+            echo "Upstream hjbaard/SolidWorks-MCP moved to \`${{ steps.fetch.outputs.short }}\`."
+            echo
+            echo "Unit tests on the merge: **${{ steps.tests.outcome }}**"
+            echo
+            echo "### Upstream commits"
+            git log --oneline rbr..upstream/main | head -n 60
+            echo
+            echo "### Upstream CHANGELOG (new lines)"
+            echo '```'
+            git diff rbr upstream/main -- CHANGELOG.md | grep '^+' | grep -v '^+++' | head -n 120
+            echo '```'
+            echo
+            echo "### Before merging"
+            echo "- Live check on SolidWorks: \`python -m solidworks_mcp.rbr --selftest\`"
+            echo "- Upstream changes to \`_iter_features\`, \`_history_snapshot\`, \`_roll_back\`, \`run_guarded\`, \`new_part\`, \`new_assembly\` touch what rbr patches: re-check rbr/fastpath.py, rbr/journal.py"
+            echo
+            echo '```'; cat tests.txt; echo '```'
+          } > body.md
+          gh pr create --base rbr --head "${{ steps.merge.outputs.branch }}" \
+            --title "Upstream sync ${{ steps.fetch.outputs.short }} (tests: ${{ steps.tests.outcome }})" \
+            --body-file body.md
+      - name: Report a conflict
+        if: steps.merge.outputs.conflict == 'true'
+        run: |
+          {
+            echo "Merging upstream \`${{ steps.fetch.outputs.short }}\` into rbr conflicts in:"
+            echo; sed 's/^/- /' conflicts.txt
+            echo; echo "Resolve locally: \`git fetch upstream && git checkout rbr && git merge upstream/main\`."
+          } > issue.md
+          gh issue create --title "Upstream sync conflict at ${{ steps.fetch.outputs.short }}" --body-file issue.md

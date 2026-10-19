@@ -1,0 +1,18 @@
+{
+  "_iter_features": "158205242399",
+  "_history_snapshot": "ec2d19af5806",
+  "_roll_back": "6f817a42a2e0",
+  "_remove_features_since": "4e4344c90df4",
+  "_history": "6432da165fd6",
+  "run_guarded": "c653f23ad6db",
+  "new_part": "91b827e5a496",
+  "new_assembly": "c701e4de7c3b",
+  "_pick_planar_face": "adb49b57fbc5",
+  "_body_faces": "67831febec32",
+  "_solid_body": "98ebf6e13d71",
+  "_component_by_name": "870e8d44c030",
+  "_require_model": "c5099962a1d5",
+  "_require_part": "16ab5e87ec55",
+  "_require_assembly": "5262bc0b4cb1",
+  "_quiet": "939282471864"
+}

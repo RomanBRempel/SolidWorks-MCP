@@ -1,0 +1,18 @@
+# RBR fork: unit tests (no SolidWorks on the runner) on every push / PR to rbr.
+name: RBR tests
+
+on:
+  push:
+    branches: [rbr]
+  pull_request:
+    branches: [rbr]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Upstream + RBR unit tests
+        run: uv run --extra dev pytest -m "not solidworks"
