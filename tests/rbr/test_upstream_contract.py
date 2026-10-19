@@ -17,13 +17,14 @@ CONTRACT = os.path.join(os.path.dirname(__file__), "upstream_contract.json")
 WATCHED = ["_iter_features", "_history_snapshot", "_roll_back", "_remove_features_since", "_history",
            "run_guarded", "new_part", "new_assembly", "_pick_planar_face", "_body_faces", "_solid_body",
            "_component_by_name", "_require_model", "_require_part", "_require_assembly", "_quiet",
-           "connect", "add_shell", "_thin_walls", "_face_triangles", "_reattach_if_gone", "_command_in_progress", "_quiet_ui", "_wake_all"]
+           "connect", "add_shell", "_fillet_refusal", "list_edges", "_edge_entry", "_largest_rounds", "_persist_refs", "_uniform_fillet", "_face_edges", "_feature_edges", "_box_corners", "_MAX_FILLET_TRIALS", "_thin_walls", "_face_triangles", "_reattach_if_gone", "_command_in_progress", "_quiet_ui", "_wake_all"]
 
 
 def _original(name):
     from solidworks_mcp.session import SolidWorksSession
-    from solidworks_mcp.rbr import fastpath, guard, journal
-    fn = (fastpath._ORIGINAL.get(name) or guard._ORIGINAL.get(name) or journal._ORIGINAL.get(name)
+    from solidworks_mcp.rbr import fastpath, guard, journal, speed
+    fn = (fastpath._ORIGINAL.get(name) or speed._ORIGINAL.get(name) or guard._ORIGINAL.get(name)
+          or journal._ORIGINAL.get(name)
           or getattr(SolidWorksSession, name, None))
     return getattr(fn, "__wrapped__", fn)  # new_part/new_assembly carry the original
 
@@ -32,6 +33,9 @@ def current_hashes() -> dict:
     out = {}
     for name in WATCHED:
         fn = _original(name)
+        if fn is not None and not callable(fn):  # a constant: hash its value
+            out[name] = hashlib.sha1(repr(fn).encode()).hexdigest()[:12]
+            continue
         out[name] = None if fn is None else hashlib.sha1(inspect.getsource(fn).replace("\r\n", "\n").encode()).hexdigest()[:12]
     return out
 
