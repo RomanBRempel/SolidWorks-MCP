@@ -17,7 +17,7 @@ from . import fastpath, guard, journal, library, script_tool, speed, tools
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.3.0"
+RBR_VERSION = "1.3.1"
 
 INSTRUCTIONS = """
 
@@ -164,15 +164,21 @@ def register(server) -> None:
         CommandInProgress set; if it raises, what it added to the current part
         is rolled back. The full code is written to the journal.
 
-        Namespace: sw/swApp (ISldWorks, early-bound), mod (typelib wrapper
-        module, e.g. mod.IComponent2), wrap(obj, mod.IFace2) to early-bind,
-        model (current or active IModelDoc2), active, ext (IModelDocExtension),
-        fm (IFeatureManager), selmgr (ISelectionMgr), asm (IAssemblyDoc) or
-        part (IPartDoc), comp(name) -> IComponent2 by list_components name,
-        feature(name) -> IFeature by tree name, select(objs, append=False) ->
-        count selected, session (the server's SolidWorksSession: its methods
-        are the tools), MM = 0.001 (API lengths are metres), DEG, args (dict),
-        print(...) -> returned as stdout; set `result = ...` to return JSON data.
+        Namespace: sw/swApp/swapp (ISldWorks, early-bound), mod (typelib wrapper
+        module, e.g. mod.IComponent2), wrap(obj, mod.IFace2) to early-bind a raw
+        dispatch, model (current or active IModelDoc2), active, ext
+        (IModelDocExtension), fm (IFeatureManager), selmgr (ISelectionMgr), asm
+        (IAssemblyDoc) or part (IPartDoc), comp(name) -> IComponent2 by
+        list_components name, feature(name) -> IFeature, features(type=None) ->
+        all top-level IFeature in one call (do not walk FirstFeature/GetNextFeature),
+        select(objs, append=False) -> count selected, api(obj, contains='') -> the
+        methods and properties an object really has in this SolidWorks (check before
+        guessing names), session (the server's SolidWorksSession: its methods are the
+        tools), MM = 0.001 (API lengths are metres), DEG, args (dict), np (numpy, if
+        installed), print(...) -> stdout; set `result = ...` to return JSON data.
+        COM rules: methods with out-parameters return a tuple (retval, out1, out2...):
+        unpack it, do not call methods on it; objects from Get* calls are often raw
+        dispatches: wrap(x, mod.IFeature) etc. before using them; lengths in metres.
         The result also gives `features` {before, after, added} when the tree changed.
         Example (delete 3 components with their mates in one step):
             n = select([comp(c) for c in ["Bolt-1", "Bolt-2", "Nut-1"]])

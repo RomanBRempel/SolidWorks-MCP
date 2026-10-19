@@ -65,7 +65,7 @@
 
 Ограничение: несколько чатов через **один** процесс сервера для владения — один владелец; разделяются только процессы (`pids` в журнале покажет, сколько их).
 
-**Скрипты**: `run_script`, библиотека `list_scripts` / `get_script` / `save_script` / `run_saved_script(name, args)`.
+**Скрипты**: в пространстве имён `run_script` (1.3.1) — `api(obj, contains)` (реальные методы/свойства объекта в этой версии SW), `features(type)` (дерево одним вызовом), алиас `swapp`, `np`; в описании — правила COM: out-параметры как кортеж, `wrap()` сырых dispatch. Повод: в журнале ошибки `swapp`, `tuple.InvokeTypes`, `ILoftFeatureData.StartConstraint`, `numpy`. `run_script`, библиотека `list_scripts` / `get_script` / `save_script` / `run_saved_script(name, args)`.
 Встроенные: `rbr/lib/*.py`; пользовательские: `%LOCALAPPDATA%\solidworks-mcp\scripts` или папка из `SWMCP_SCRIPTS` (можно общую в Google Drive/git).
 
 **Инструменты**: `set_units`, `get_custom_properties`, `set_custom_properties`, `list_configurations`, `activate_configuration`, `add_configuration`, `export_face_dxf`, `assembly_bom`.
@@ -86,6 +86,8 @@ uv tool install --force --editable $HOME\source\SolidWorks-MCP
   "args": ["-m", "solidworks_mcp.rbr"]
 }
 ```
+
+numpy для скриптов (`np` в `run_script`): `uv tool install --force --editable <путь> --with numpy`.
 
 Обновление: `git -C $HOME\source\SolidWorks-MCP pull` и перезапуск клиента (editable — переустановка не нужна).
 

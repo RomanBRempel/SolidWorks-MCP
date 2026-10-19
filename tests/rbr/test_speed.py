@@ -81,3 +81,22 @@ def test_list_edges_filters_before_reading_curves(monkeypatch):
     assert Edge.curve_calls == 2   # the far edge never had its curve read
     got = speed.list_edges(fake, within_mm=[[-1, -1, -1], [20, 20, 1]], min_length_mm=5)
     assert [e["index"] for e in got["edges"]] == [0]
+
+
+def test_script_api_lists_members_of_a_wrapper_class():
+    from solidworks_mcp.rbr import script_tool
+
+    class IFake:
+        _prop_map_get_ = {"Name": 1, "Visible": 2}
+        _prop_map_put_ = {"Visible": 2}
+
+        def GetBox(self):
+            pass
+
+        def Select4(self):
+            pass
+
+    got = script_tool.api(IFake())
+    assert got["interface"] == "IFake" and got["properties"] == ["Name", "Visible"]
+    assert got["methods"] == ["GetBox", "Select4"]
+    assert script_tool.api(IFake(), "sel")["methods"] == ["Select4"]
