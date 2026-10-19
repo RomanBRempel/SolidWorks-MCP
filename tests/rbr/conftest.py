@@ -136,6 +136,11 @@ class FakeSw:
     def GetDocuments(self):
         return tuple(self.docs)
 
+    pid = 1111
+
+    def GetProcessID(self):
+        return self.pid
+
 
 @pytest.fixture
 def fake_session(monkeypatch, swmcp_home):

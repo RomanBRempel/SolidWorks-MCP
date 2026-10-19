@@ -415,7 +415,8 @@ def shell_verdict(thickness_mm: float, thinnest_mm, radius_rows: list) -> tuple:
     return verdict, reasons
 
 
-def shell_check(session, thickness_mm: float, outward: bool = False, top: int = 15) -> dict:
+def shell_check(session, thickness_mm: float, outward: bool = False, top: int = 15,
+                budget_s: float = 12.0, samples: int = 3000) -> dict:
     """Can a shell of thickness_mm be built on the current part? Checked before trying it.
 
     Measures (1) the material thickness straight through the part, by rays from
@@ -423,7 +424,11 @@ def shell_check(session, thickness_mm: float, outward: bool = False, top: int = 
     convex radius (concave for outward) of every curved face from its
     tessellation: on freeform faces under the thickness the offset folds over.
     After add_shell, also compare the volume: a shell that removed nothing failed.
+    The material check runs first with at most `samples` rays; the curvature
+    pass stops when budget_s is used up and the result says `partial`.
     """
+    import time as _time
+    t0 = _time.perf_counter()
     if thickness_mm <= 0:
         raise SolidWorksError("thickness_mm must be > 0.")
     part = session._require_part()
@@ -431,11 +436,27 @@ def shell_check(session, thickness_mm: float, outward: bool = False, top: int = 
     if not bodies:
         raise SolidWorksError("No solid body.")
     mod = session._mod
+    walls = None
+    saved_cap = type(session)._MAX_WALL_SAMPLES
+    try:
+        type(session)._MAX_WALL_SAMPLES = max(100, int(samples))  # upstream's 100 000 took > 60 s on a loft
+        body0 = binding.wrap(bodies[0], mod.IBody2)
+        triangles = [(index, *tri) for index, face in enumerate(session._body_faces(body0))
+                     for tri in session._face_triangles(binding.wrap(face, mod.IFace2))]
+        walls = session._thin_walls(body0, triangles, 2.5 * thickness_mm)
+    except Exception as exc:  # noqa: BLE001 - the radius check still stands
+        walls = {"error": str(exc)}
+    finally:
+        type(session)._MAX_WALL_SAMPLES = saved_cap
+    walls_s = round(_time.perf_counter() - t0, 2)
     kind = "concave" if outward else "convex"
-    rows, faces_seen, curved = [], 0, 0
+    rows, faces_seen, curved, partial = [], 0, 0, False
     for b_index, raw_body in enumerate(bodies):
         body = binding.wrap(raw_body, mod.IBody2)
         for f_index, raw_face in enumerate(_tuple(body.GetFaces())):
+            if _time.perf_counter() - t0 > budget_s:
+                partial = True
+                break
             faces_seen += 1
             face = binding.wrap(raw_face, mod.IFace2)
             surface = binding.wrap(face.GetSurface(), mod.ISurface)
@@ -454,14 +475,6 @@ def shell_check(session, thickness_mm: float, outward: bool = False, top: int = 
                          "area_mm2": round(face.GetArea() * 1e6, 1), "centre_mm": centre,
                          "surface_type": int(surface.Identity()) if surface is not None else None})
     rows.sort(key=lambda r: r["radius_mm"])
-    walls = None
-    try:
-        body0 = binding.wrap(bodies[0], mod.IBody2)
-        triangles = [(index, *tri) for index, face in enumerate(session._body_faces(body0))
-                     for tri in session._face_triangles(binding.wrap(face, mod.IFace2))]
-        walls = session._thin_walls(body0, triangles, 2.5 * thickness_mm)
-    except Exception as exc:  # noqa: BLE001 - the radius check still stands
-        walls = {"error": str(exc)}
     thinnest = walls.get("thinnest_mm") if isinstance(walls, dict) else None
     verdict, reasons = shell_verdict(thickness_mm, thinnest, rows)
     min_r = rows[0]["radius_mm"] if rows else None
@@ -472,6 +485,7 @@ def shell_check(session, thickness_mm: float, outward: bool = False, top: int = 
             "verdict": verdict, "reasons": reasons,
             "thinnest_material_mm": thinnest, "thin_faces": (walls or {}).get("faces", [])[:max(1, int(top))],
             f"min_{kind}_radius_mm": min_r, "max_safe_thickness_mm": round(min(max_t), 3) if max_t else None,
-            "faces_checked": faces_seen, "curved_faces": curved,
+            "faces_checked": faces_seen, "curved_faces": curved, "partial": partial,
+            "timing_s": {"material": walls_s, "total": round(_time.perf_counter() - t0, 2)},
             "radius_faces": rows[:max(1, int(top))],
             "after_shell": "compare volume_mm3 before/after add_shell: unchanged means the shell did nothing"}

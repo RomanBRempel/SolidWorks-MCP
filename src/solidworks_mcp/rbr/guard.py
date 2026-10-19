@@ -60,7 +60,7 @@ BUSY_FAIL_S = float(os.environ.get("SWMCP_BUSY_FAIL_S", "20"))
 _ORIGINAL = {}
 _state_lock = threading.Lock()
 _state = {"tool": None, "since": None, "doc": None, "calls": 0, "faults": 0, "releases": 0,
-          "last_fault": None, "last_release": None}
+          "last_fault": None, "last_release": None, "quarantine": None}
 
 
 # --- status (any thread) -----------------------------------------------------------------
@@ -240,7 +240,7 @@ def _documents(session):
     return [binding.wrap(d, session._mod.IModelDoc2) for d in docs]
 
 
-def release_ui(session, dry_run: bool = False, _retry: bool = True) -> dict:
+def release_ui(session, dry_run: bool = False, _retry: bool = True, clear_quarantine: bool = False) -> dict:
     """Clear CommandInProgress and switch drawing back on in every open document.
 
     Each setting is reset on its own, so one failure does not leave the rest.
@@ -257,7 +257,7 @@ def release_ui(session, dry_run: bool = False, _retry: bool = True) -> dict:
         if _retry and getattr(exc, "hresult", None) in FAULTS:  # the link died: attach to the running SolidWorks
             session._sw = session._model = None
             _ORIGINAL.get("connect", SolidWorksSession.connect)(session)
-            return release_ui(session, dry_run, _retry=False)
+            return release_ui(session, dry_run, _retry=False, clear_quarantine=clear_quarantine)
         report["errors"].append(f"CommandInProgress: {exc}")
     mod = session._mod
     for doc in _documents(session):
@@ -290,6 +290,9 @@ def release_ui(session, dry_run: bool = False, _retry: bool = True) -> dict:
             session._to_wake = []
         _set(releases=_state["releases"] + 1, last_release=time.strftime("%H:%M:%S"))
     report["dry_run"] = dry_run
+    if clear_quarantine and not dry_run:
+        _set(quarantine=None)
+    report["quarantine"] = _state.get("quarantine")
     report["frozen"] = bool(report["command_in_progress"]) or any(d["switched_off"] for d in report["documents"])
     return report
 
@@ -301,6 +304,36 @@ def _clear_stale_flag(session) -> None:
             session._sw.CommandInProgress = False
     except Exception:  # noqa: BLE001 - _reattach_if_gone in the call deals with a dead link
         pass
+
+
+QUARANTINE_FAULTS = {-2147417851}  # RPC_E_SERVERFAULT: SolidWorks failed inside the call
+
+
+def _sw_pid(session):
+    try:
+        return int(session._sw.GetProcessID())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _check_quarantine(session, tool: str) -> None:
+    """After a SERVERFAULT, refuse changes until SolidWorks is a new process (or it is cleared)."""
+    q = _state.get("quarantine")
+    if not q:
+        return
+    try:
+        session._reattach_if_gone()  # a restarted SolidWorks: attach to it first
+    except Exception:  # noqa: BLE001
+        pass
+    pid = _sw_pid(session)
+    if pid is not None and pid != q.get("sw_pid"):
+        _set(quarantine=None)
+        return
+    raise SolidWorksError(
+        f"SolidWorks failed inside '{q['tool']}' at {q['at']} (RPC_E_SERVERFAULT) and its state is not "
+        "trustworthy: changes are refused until SolidWorks is restarted (reading still works). Files on disk "
+        "are as last saved. After the restart this clears by itself; release_ui(clear_quarantine=True) "
+        "clears it now. Do not repeat the same operation on the same geometry without changing its inputs.")
 
 
 def _title(session):
@@ -319,6 +352,7 @@ def _run_guarded(self, fn, *args, **kwargs):
         if read_only:
             self._reattach_if_gone()
             return fn(*args, **kwargs)
+        _check_quarantine(self, tool)
         if tool not in SWITCHERS:
             check_owner(_title(self), tool)
         _clear_stale_flag(self)
@@ -332,6 +366,14 @@ def _run_guarded(self, fn, *args, **kwargs):
                 release_ui(self)
             except Exception:  # noqa: BLE001 - the original error is what the caller needs
                 pass
+            if hresult in QUARANTINE_FAULTS:
+                _set(quarantine={"tool": tool, "at": time.strftime("%H:%M:%S"), "sw_pid": _sw_pid(self),
+                                 "doc": _state.get("doc")})
+                raise SolidWorksError(
+                    f"SolidWorks failed inside '{tool}' (RPC_E_SERVERFAULT, its own crash, not a refusal). "
+                    "The UI was released, but SolidWorks' state is not trustworthy: further changes are refused "
+                    "until it is restarted; save nothing from it. Do not repeat this operation on this geometry "
+                    "without changing its inputs.") from exc
             raise
         claim(_title(self), tool)
         return result

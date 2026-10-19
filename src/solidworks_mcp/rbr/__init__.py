@@ -17,7 +17,7 @@ from . import fastpath, guard, journal, library, script_tool, tools
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.1.1"
+RBR_VERSION = "1.2.0"
 
 INSTRUCTIONS = """
 
@@ -27,6 +27,7 @@ RBR extension (solidworks-mcp-rbr)
 - Every call is journalled with its arguments and full script code: get_journal. tool_source(name) shows the code any tool runs.
 - Telemetry: get_journal(since='HH:MM', entries=False) gives per-tool stats from the journal file without touching SolidWorks; never read the journal through run_script. server_health shows what the server is doing right now, also while a call runs.
 - If SolidWorks looks frozen while idle (no redraw, tree greyed), call release_ui. A document another server process changed in the last minutes is read-only for you: release_document frees it.
+- An error saying SolidWorks failed inside a call (RPC_E_SERVERFAULT) means its own crash: changes are refused until SolidWorks is restarted. Tell the user, and do not retry the same operation on the same geometry with the same inputs.
 - Before a shell on a curved/lofted body: shell_check(thickness_mm). A thickness above the smallest convex radius makes the shell fail, sometimes after a long computation.
 - New parts and assemblies are switched to MMGS (mm, g) at creation. Also: set_units, get/set_custom_properties, list/activate/add_configuration, export_face_dxf (flat part -> DXF 1:1 for milling), assembly_bom (BOM + mass budget, CSV).
 """
@@ -236,11 +237,14 @@ def register(server) -> None:
         return _local(build)
 
     @mcp.tool()
-    async def release_ui(dry_run: bool = False) -> dict:
+    async def release_ui(dry_run: bool = False, clear_quarantine: bool = False) -> dict:
         """Unfreeze SolidWorks: clear CommandInProgress and switch the view, feature tree and
         sketch display back on in every open document. Use when SolidWorks is idle but does not
-        redraw or respond after a failed call. dry_run only reports what is switched off."""
-        return await _timed(guard.release_ui, session, dry_run, timeout_s=30)
+        redraw or respond after a failed call. dry_run only reports what is switched off.
+        After a SolidWorks crash inside a call (RPC_E_SERVERFAULT) changes are quarantined until
+        SolidWorks restarts; clear_quarantine=True lifts that without a restart (only when the
+        user confirms SolidWorks is fine)."""
+        return await _timed(guard.release_ui, session, dry_run, True, clear_quarantine, timeout_s=30)
 
     @mcp.tool()
     async def release_document(title: str | None = None) -> dict:
@@ -290,13 +294,15 @@ def register(server) -> None:
         return await call(tools.add_configuration, session, name, description)
 
     @mcp.tool()
-    async def shell_check(thickness_mm: float, outward: bool = False, top: int = 15) -> dict:
+    async def shell_check(thickness_mm: float, outward: bool = False, top: int = 15,
+                          budget_s: float = 12.0, samples: int = 3000) -> dict:
         """Check BEFORE a shell (or before unsuppressing one) whether thickness_mm can work on the
         current part: the smallest convex radius (inward shell) or concave radius (outward) must
         exceed the thickness. Returns verdict ok/risk/fail, the limiting faces (index, radius, area,
-        centre) and max_thickness_mm. Read-only, a second or two; a failing shell on a lofted body
-        can block SolidWorks for a minute and leave the part without a body."""
-        return await call(tools.shell_check, session, thickness_mm, outward, top)
+        centre) and max_safe_thickness_mm. Read-only; stays within budget_s (default 12 s) using
+        `samples` rays (3000), and says `partial` when a big body did not fit the budget. A failing
+        shell on a lofted body can crash SolidWorks' shell computation and leave the part bodiless."""
+        return await call(tools.shell_check, session, thickness_mm, outward, top, budget_s, samples)
 
     # --- manufacturing ---------------------------------------------------------
 

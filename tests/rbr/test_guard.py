@@ -201,3 +201,37 @@ def test_shell_verdict_from_material_and_curvature():
     freeform = [{"radius_mm": 3.0, "surface_type": 4006}]
     verdict, reasons = tools.shell_verdict(4, 40, freeform)
     assert verdict == "risk" and "freeform" in reasons[0]
+
+
+class _Fault(Exception):
+    hresult = -2147417851  # RPC_E_SERVERFAULT
+
+
+def test_server_fault_quarantines_changes_until_restart(fake_session):
+    guard._set(quarantine=None)
+    def crash(self):
+        raise _Fault("server fault")
+    try:
+        with pytest.raises(SolidWorksError, match="its own crash"):
+            fake_session.run_guarded(_named(crash, "add_shell"), fake_session)
+        assert guard.state()["quarantine"]["tool"] == "add_shell"
+        ok = _named(lambda self: {"ok": True}, "open_part")
+        with pytest.raises(SolidWorksError, match="refused until SolidWorks is restarted"):
+            fake_session.run_guarded(ok, fake_session)
+        assert fake_session.run_guarded(_named(lambda self: {"ok": True}, "list_features"), fake_session)["ok"]
+        fake_session._sw.pid = 2222          # SolidWorks restarted: a new process
+        assert fake_session.run_guarded(ok, fake_session)["ok"]
+        assert guard.state()["quarantine"] is None
+    finally:
+        guard._set(quarantine=None)
+        fake_session._sw.pid = 1111
+
+
+def test_quarantine_can_be_cleared_by_hand(fake_session):
+    guard._set(quarantine={"tool": "add_shell", "at": "12:54:29", "sw_pid": 1111, "doc": "GAT"})
+    try:
+        rep = guard.release_ui(fake_session, clear_quarantine=True)
+        assert rep["quarantine"] is None
+        assert fake_session.run_guarded(_named(lambda self: {"ok": True}, "add_box"), fake_session)["ok"]
+    finally:
+        guard._set(quarantine=None)
