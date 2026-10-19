@@ -30,6 +30,21 @@ def _jsonable(value):
         return repr(value)
 
 
+def api(obj, contains: str = "") -> dict:
+    """What an early-bound SolidWorks object offers: its interface, methods and properties.
+
+    Use it before guessing a name (SW 2025 lacks some members the online help lists,
+    e.g. ILoftFeatureData.StartConstraint). A raw dispatch has no list: wrap() it first.
+    """
+    cls = type(obj)
+    props = set(getattr(cls, "_prop_map_get_", {}) or {}) | set(getattr(cls, "_prop_map_put_", {}) or {})
+    methods = {n for n in dir(cls) if not n.startswith("_") and callable(getattr(cls, n, None))} - props
+    needle = contains.lower()
+    pick = (lambda names: sorted(n for n in names if needle in n.lower()))
+    return {"interface": cls.__name__, "methods": pick(methods), "properties": pick(props),
+            "note": None if props or methods else "raw dispatch: wrap(obj, mod.IXxx) first"}
+
+
 def namespace(session, out: list, args: dict | None = None) -> dict:
     """The names a script sees (documented in the run_script tool)."""
     sw = session._ensure()
@@ -81,7 +96,17 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
                 return f
         raise SolidWorksError(f"No feature named '{name}'.")
 
-    ns.update(comp=comp, select=select, feature=feature)
+    def features(type_name: str | None = None):
+        """Top-level features of the current document (one COM call for the list), optionally of one type."""
+        out_ = list(session._iter_features())
+        return [f for f in out_ if type_name is None or f.GetTypeName2() == type_name]
+
+    ns.update(comp=comp, select=select, feature=feature, features=features, api=api, swapp=sw)
+    try:
+        import numpy as np  # optional: present when installed with `--with numpy`
+        ns["np"] = np
+    except ImportError:
+        pass
     return ns
 
 
