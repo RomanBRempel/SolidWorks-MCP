@@ -184,3 +184,9 @@ def test_lock_serialises_on_any_os():
             guard._lock.acquire("b", 0.05)
     finally:
         guard._lock.release()
+
+
+def test_release_inside_a_call_keeps_the_quiet_count(fake_session):
+    fake_session._quiet_depth = 1  # as inside upstream's _quiet_ui
+    guard.release_ui(fake_session)
+    assert fake_session._quiet_depth == 1

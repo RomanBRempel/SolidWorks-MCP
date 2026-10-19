@@ -284,8 +284,10 @@ def release_ui(session, dry_run: bool = False, _retry: bool = True) -> dict:
             report["errors"].append(f"{entry['title']}: {exc}")
         report["documents"].append(entry)
     if not dry_run:
-        session._quiet_depth = 0
-        session._to_wake = []
+        # Never touch _quiet_depth: when this runs inside a guarded call (a script, or
+        # connect() from _ensure) upstream's _quiet_ui still has to count itself out.
+        if not session._quiet_depth:
+            session._to_wake = []
         _set(releases=_state["releases"] + 1, last_release=time.strftime("%H:%M:%S"))
     report["dry_run"] = dry_run
     report["frozen"] = bool(report["command_in_progress"]) or any(d["switched_off"] for d in report["documents"])
