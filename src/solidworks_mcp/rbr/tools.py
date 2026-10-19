@@ -13,6 +13,7 @@ import os
 from .. import binding
 from ..errors import SolidWorksError
 from ..session import SolidWorksSession
+from . import meshwall
 
 SW_DOC_PART = 1
 SW_DOC_ASSEMBLY = 2
@@ -383,40 +384,56 @@ def face_radii(corners_mm, normals) -> tuple:
     return convex, concave
 
 
-FREEFORM_SURFACES = {4006, 4008, 4010}  # B-spline, offset, revolved spline: no exact offset to fall back on
+# B-spline, blend, offset, revolved spline: no exact offset to fall back on. Blends (4007) are the
+# rolling-ball fillets SolidWorks makes where fillets meet or vary; GAT-27 v5 had 57 of them, many
+# convex R2.3-2.5 under a 3 mm shell, and that shell crashed SolidWorks three times. Cylinder,
+# sphere and torus fillets (4002/4004/4005) under the thickness were trimmed fine (R3, 4 mm shell).
+FREEFORM_SURFACES = {4006, 4007, 4008, 4010}
 
 
-def shell_verdict(thickness_mm: float, thinnest_mm, radius_rows: list) -> tuple:
+def shell_verdict(thickness_mm: float, wall_faces: list, radius_rows: list) -> tuple:
     """(verdict, reasons) from the measured material and curvature. Pure, unit-tested.
 
+    wall_faces: meshwall.wall_survey faces measured up to 2.5 x thickness.
     Verified on SOLIDWORKS 2025: SolidWorks trims an offset that folds over on
-    analytic faces and extrusions (a 4 mm shell over R3 fillets and a 6.5 mm one
-    over a spline outline of R5.6 both built), but where the material is thinner
-    than twice the wall the cavity vanishes: a 10.5 mm shell on a 19.6 mm wide
-    part 'succeeded' and removed nothing. So the material decides; a freeform
-    convex radius under the thickness only adds risk.
+    analytic faces and extrusions (4 mm over R3 fillets, 6.5 mm over an R5.6
+    spline outline both built), but where the material is thinner than twice the
+    wall the cavity vanishes (10.5 mm on a 19.6 mm part removed nothing). A face
+    thin over a real share of it is a thin region; thin only at a few samples
+    near its edge is an acute (knife) edge, where the inner walls meet too.
     """
     reasons, verdict = [], "ok"
-    if thinnest_mm is not None and thinnest_mm < 2 * thickness_mm:
+    region = [f for f in wall_faces if f["median_thin_mm"] < 2 * thickness_mm and f["thin_share"] >= 0.1]
+    edges = [f for f in wall_faces if f["thinnest_mm"] < 2 * thickness_mm and f not in region]
+    near = [f for f in wall_faces if 2 * thickness_mm <= f["thinnest_mm"] < 2.5 * thickness_mm]
+    if region:
         verdict = "fail"
-        reasons.append(f"material only {thinnest_mm:.2f} mm thick somewhere: under 2 x {thickness_mm} mm the "
-                       "inner walls meet and that region gets no cavity (the shell may build and remove nothing)")
-    elif thinnest_mm is not None and thinnest_mm < 2.5 * thickness_mm:
+        f = min(region, key=lambda r: r["median_thin_mm"])
+        reasons.append(f"{len(region)} face(s) have material under 2 x {thickness_mm} mm over a real part of them "
+                       f"(face #{f['index']}: typically {f['median_thin_mm']} mm, {int(f['thin_share'] * 100)} % of it, "
+                       f"near {f['at_mm']}): the inner walls meet there")
+    if edges:
+        verdict = "fail" if verdict == "fail" else "risk"
+        f = edges[0]
+        reasons.append(f"{len(edges)} face(s) run into an acute edge thinner than 2 x {thickness_mm} mm "
+                       f"(face #{f['index']}, {f['thinnest_mm']} mm near {f['at_mm']}): a shell over a knife edge "
+                       "has no room; round or blunt it, or leave that face open")
+    if near and verdict == "ok":
         verdict = "risk"
-        reasons.append(f"material {thinnest_mm:.2f} mm thick somewhere: less than {2.5 * thickness_mm:.1f} mm "
-                       "leaves a slit-thin cavity")
+        reasons.append(f"{len(near)} face(s) have material between 2 and 2.5 x {thickness_mm} mm: a slit-thin cavity")
     freeform = [r for r in radius_rows if r.get("surface_type") in FREEFORM_SURFACES
                 and r["radius_mm"] < thickness_mm * 1.05]
     if freeform:
         verdict = "fail" if verdict == "fail" else "risk"
-        reasons.append(f"{len(freeform)} freeform face(s) bulge with a radius under the thickness "
-                       f"(smallest {freeform[0]['radius_mm']} mm): their offset folds over and SolidWorks may "
-                       "compute for long and fail")
+        reasons.append(f"{len(freeform)} blend/freeform face(s) bulge with a radius under the thickness "
+                       f"(smallest {freeform[0]['radius_mm']} mm, face {freeform[0]['face']}): their offset folds "
+                       "over and SolidWorks may compute for long and crash. Put the fillets that make them after "
+                       "the shell in the tree (reorder_feature), or make them at least 1.1 x the thickness")
     return verdict, reasons
 
 
 def shell_check(session, thickness_mm: float, outward: bool = False, top: int = 15,
-                budget_s: float = 12.0, samples: int = 3000) -> dict:
+                budget_s: float = 12.0, samples: int = 8000) -> dict:
     """Can a shell of thickness_mm be built on the current part? Checked before trying it.
 
     Measures (1) the material thickness straight through the part, by rays from
@@ -439,13 +456,17 @@ def shell_check(session, thickness_mm: float, outward: bool = False, top: int = 
     walls = None
     saved_cap = type(session)._MAX_WALL_SAMPLES
     try:
-        type(session)._MAX_WALL_SAMPLES = max(100, int(samples))  # upstream's 100 000 took > 60 s on a loft
+        type(session)._MAX_WALL_SAMPLES = max(100, int(samples))
         body0 = binding.wrap(bodies[0], mod.IBody2)
         triangles = [(index, *tri) for index, face in enumerate(session._body_faces(body0))
                      for tri in session._face_triangles(binding.wrap(face, mod.IFace2))]
-        walls = session._thin_walls(body0, triangles, 2.5 * thickness_mm)
+        picked, spacing = session._wall_samples(triangles, thickness_mm)
+        # rays against the tessellation here, not RayIntersections (29 s for 2560 rays on a loft)
+        walls = meshwall.wall_survey([(i, a, b, c) for i, a, b, c, _n in triangles], picked, 2.5 * thickness_mm)
+        walls["sample_spacing_mm"] = round(spacing, 2)
+        walls["triangles"] = len(triangles)
     except Exception as exc:  # noqa: BLE001 - the radius check still stands
-        walls = {"error": str(exc)}
+        walls = {"error": str(exc), "faces": []}
     finally:
         type(session)._MAX_WALL_SAMPLES = saved_cap
     walls_s = round(_time.perf_counter() - t0, 2)
@@ -471,21 +492,29 @@ def shell_check(session, thickness_mm: float, outward: bool = False, top: int = 
                 continue
             box = _tuple(face.GetBox())
             centre = [round((box[i] + box[i + 3]) / 2 * 1000, 2) for i in range(3)] if len(box) >= 6 else None
+            area = face.GetArea() * 1e6
             rows.append({"body": b_index, "face": f"#{f_index}", "radius_mm": round(radius, 3),
-                         "area_mm2": round(face.GetArea() * 1e6, 1), "centre_mm": centre,
+                         "area_mm2": round(area, 2), "centre_mm": centre,
                          "surface_type": int(surface.Identity()) if surface is not None else None})
     rows.sort(key=lambda r: r["radius_mm"])
-    thinnest = walls.get("thinnest_mm") if isinstance(walls, dict) else None
-    verdict, reasons = shell_verdict(thickness_mm, thinnest, rows)
+    thinnest = walls.get("thinnest_mm")
+    verdict, reasons = shell_verdict(thickness_mm, walls.get("faces", []), rows)
     min_r = rows[0]["radius_mm"] if rows else None
-    max_t = [v for v in (thinnest / 2.5 if thinnest else None,
+    region = [f["median_thin_mm"] for f in walls.get("faces", []) if f["thin_share"] >= 0.1]
+    max_t = [v for v in (min(region) / 2.5 if region else None,
                          min_r / 1.05 if min_r and any(r.get("surface_type") in FREEFORM_SURFACES for r in rows)
                          else None) if v]
     return {"ok": True, "thickness_mm": thickness_mm, "direction": "outward" if outward else "inward",
             "verdict": verdict, "reasons": reasons,
-            "thinnest_material_mm": thinnest, "thin_faces": (walls or {}).get("faces", [])[:max(1, int(top))],
+            "thinnest_material_mm": thinnest, "thin_faces": walls.get("faces", [])[:max(1, int(top))],
+            "material_check": {k: walls.get(k) for k in ("samples", "thin_samples", "sample_spacing_mm",
+                                                         "triangles", "error") if walls.get(k) is not None},
             f"min_{kind}_radius_mm": min_r, "max_safe_thickness_mm": round(min(max_t), 3) if max_t else None,
             "faces_checked": faces_seen, "curved_faces": curved, "partial": partial,
             "timing_s": {"material": walls_s, "total": round(_time.perf_counter() - t0, 2)},
             "radius_faces": rows[:max(1, int(top))],
+            "under_thickness_by_type": {str(k): sum(1 for r in rows if r["surface_type"] == k
+                                                    and r["radius_mm"] < thickness_mm * 1.05)
+                                        for k in sorted({r["surface_type"] for r in rows})},
+            "sliver_faces": sum(1 for r in rows if r["area_mm2"] < 1.0),
             "after_shell": "compare volume_mm3 before/after add_shell: unchanged means the shell did nothing"}

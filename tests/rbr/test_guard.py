@@ -192,15 +192,69 @@ def test_release_inside_a_call_keeps_the_quiet_count(fake_session):
     assert fake_session._quiet_depth == 1
 
 
+def _wf(index, thinnest, median, share):
+    return {"index": index, "thinnest_mm": thinnest, "median_thin_mm": median, "thin_share": share, "at_mm": [0, 0, 0]}
+
+
 def test_shell_verdict_from_material_and_curvature():
-    assert tools.shell_verdict(2, 19.6, [])[0] == "ok"
-    assert tools.shell_verdict(10.5, 19.6, [])[0] == "fail"          # walls meet (verified live)
-    assert tools.shell_verdict(8, 19.6, [])[0] == "risk"             # 16 < 19.6 < 20
-    analytic = [{"radius_mm": 3.0, "surface_type": 4002}]            # R3 fillets, 4 mm shell built
-    assert tools.shell_verdict(4, 40, analytic)[0] == "ok"
-    freeform = [{"radius_mm": 3.0, "surface_type": 4006}]
-    verdict, reasons = tools.shell_verdict(4, 40, freeform)
+    assert tools.shell_verdict(2, [], [])[0] == "ok"
+    assert tools.shell_verdict(10.5, [_wf(1, 15.0, 16.0, 0.9)], [])[0] == "fail"   # walls meet (verified live)
+    assert tools.shell_verdict(8, [_wf(1, 18.0, 19.0, 0.9)], [])[0] == "risk"      # 16..20 mm: slit cavity
+    verdict, reasons = tools.shell_verdict(3, [_wf(57, 0.002, 0.4, 0.02)], [])       # GAT-27: knife edge
+    assert verdict == "risk" and "acute edge" in reasons[0]
+    analytic = [{"radius_mm": 3.0, "surface_type": 4002}]                          # R3 fillets, 4 mm built
+    assert tools.shell_verdict(4, [], analytic)[0] == "ok"
+    verdict, reasons = tools.shell_verdict(4, [], [{"radius_mm": 3.0, "surface_type": 4006, "face": "#1"}])
     assert verdict == "risk" and "freeform" in reasons[0]
+    gat27 = [{"radius_mm": 2.32, "surface_type": 4007, "face": "#114"}]               # blends under a 3 mm shell
+    verdict, reasons = tools.shell_verdict(3, [], gat27)
+    assert verdict == "risk" and "#114" in reasons[0] and "reorder_feature" in reasons[0]
+
+
+def _box_tris(w, h, d):
+    """Closed box 0..w x 0..h x 0..d as (face, a, b, c) and its outward normals per face."""
+    v = lambda x, y, z: (float(x), float(y), float(z))  # noqa: E731
+    quads = {0: ([v(0, 0, 0), v(w, 0, 0), v(w, h, 0), v(0, h, 0)], (0, 0, -1)),
+             1: ([v(0, 0, d), v(w, 0, d), v(w, h, d), v(0, h, d)], (0, 0, 1)),
+             2: ([v(0, 0, 0), v(w, 0, 0), v(w, 0, d), v(0, 0, d)], (0, -1, 0)),
+             3: ([v(0, h, 0), v(w, h, 0), v(w, h, d), v(0, h, d)], (0, 1, 0)),
+             4: ([v(0, 0, 0), v(0, h, 0), v(0, h, d), v(0, 0, d)], (-1, 0, 0)),
+             5: ([v(w, 0, 0), v(w, h, 0), v(w, h, d), v(w, 0, d)], (1, 0, 0))}
+    tris, normals = [], {}
+    for f, (q, n) in quads.items():
+        tris += [(f, q[0], q[1], q[2]), (f, q[0], q[2], q[3])]
+        normals[f] = n
+    return tris, normals
+
+
+def test_mesh_thickness_of_a_plate():
+    from solidworks_mcp.rbr import meshwall
+    tris, normals = _box_tris(100, 80, 4)
+    samples = [(1, (50.0, 40.0, 4.0), normals[1]), (5, (100.0, 40.0, 2.0), normals[5])]
+    got = meshwall.wall_survey(tris, samples, 10.0)
+    by = {f["index"]: f for f in got["faces"]}
+    assert by[1]["thinnest_mm"] == pytest.approx(4.0, abs=1e-3)   # through the plate
+    assert 5 not in by                                             # 100 mm across: beyond the cap
+
+
+def test_mesh_thickness_runs_fast_enough():
+    """~4800 small triangles and 4000 rays, the size of GAT-27 v5: well under the budget."""
+    import time as _t
+    from solidworks_mcp.rbr import meshwall
+    tris, step, w, h, d = [], 4.0, 160.0, 60.0, 6.0
+    for z, face in ((0.0, 0), (d, 1)):
+        for i in range(int(w / step)):
+            for j in range(int(h / step)):
+                x0, y0 = i * step, j * step
+                a, b, c, e = (x0, y0, z), (x0 + step, y0, z), (x0 + step, y0 + step, z), (x0, y0 + step, z)
+                tris += [(face, a, b, c), (face, a, c, e)]
+    samples = [(1, (x * 2.0 + 1, y * 2.0 + 1, d), (0.0, 0.0, 1.0)) for x in range(80) for y in range(30)]
+    t0 = _t.perf_counter()
+    got = meshwall.wall_survey(tris, samples, 7.5)
+    elapsed = _t.perf_counter() - t0
+    assert len(tris) == 2400 and got["thin_samples"] == len(samples)
+    assert got["faces"][0]["thinnest_mm"] == pytest.approx(d, abs=1e-3)
+    assert elapsed < 5, elapsed
 
 
 class _Fault(Exception):
