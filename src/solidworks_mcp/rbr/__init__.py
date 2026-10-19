@@ -13,11 +13,11 @@ import functools
 import os
 
 from ..errors import SolidWorksError
-from . import fastpath, guard, journal, library, script_tool, tools
+from . import fastpath, guard, journal, library, script_tool, speed, tools
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.2.2"
+RBR_VERSION = "1.3.0"
 
 INSTRUCTIONS = """
 
@@ -28,7 +28,8 @@ RBR extension (solidworks-mcp-rbr)
 - Telemetry: get_journal(since='HH:MM', entries=False) gives per-tool stats from the journal file without touching SolidWorks; never read the journal through run_script. server_health shows what the server is doing right now, also while a call runs.
 - If SolidWorks looks frozen while idle (no redraw, tree greyed), call release_ui. A document another server process changed in the last minutes is read-only for you: release_document frees it.
 - An error saying SolidWorks failed inside a call (RPC_E_SERVERFAULT) means its own crash: changes are refused until SolidWorks is restarted. Tell the user, and do not retry the same operation on the same geometry with the same inputs.
-- Before a shell on a curved/lofted body: shell_check(thickness_mm). A thickness above the smallest convex radius makes the shell fail, sometimes after a long computation.
+- Before a shell on a curved/lofted body: shell_check(thickness_mm).
+- On a big part every modelling call rebuilds the whole tree (3-10 s each on 100+ features). Prefer one run_script doing several sketch/cut/dimension steps over many separate calls; rebuild_profile shows which features make rebuilds slow (suppress them while iterating). Use the library's tree_summary instead of writing your own feature walk. A refused fillet is diagnosed within 15 s; pass the edges it names, not the whole set again. A thickness above the smallest convex radius makes the shell fail, sometimes after a long computation.
 - New parts and assemblies are switched to MMGS (mm, g) at creation. Also: set_units, get/set_custom_properties, list/activate/add_configuration, export_face_dxf (flat part -> DXF 1:1 for milling), assembly_bom (BOM + mass budget, CSV).
 """
 
@@ -94,6 +95,7 @@ def _patch_shell_check_result():
 def register(server) -> None:
     """Patch the session and add the RBR tools to `server.mcp` (the upstream FastMCP)."""
     fastpath.apply()
+    speed.apply()
     guard.apply()    # before the journal, so the journal times the guard too
     journal.apply()
     _patch_new_documents()
@@ -303,6 +305,13 @@ def register(server) -> None:
         `samples` rays (8000) cast in Python against the tessellation, and says `partial` when a big body did not fit the budget. A failing
         shell on a lofted body can crash SolidWorks' shell computation and leave the part bodiless."""
         return await call(tools.shell_check, session, thickness_mm, outward, top, budget_s, samples)
+
+    @mcp.tool()
+    async def rebuild_profile(top: int = 15) -> dict:
+        """Rebuild the current part once and list the features that take the longest
+        (seconds and share of the total). Use it when modelling calls get slow: suppress or
+        move the slowest (fillets, shells, lofts) while iterating on the rest."""
+        return await _timed(speed.rebuild_profile, session, top, timeout_s=300)
 
     # --- manufacturing ---------------------------------------------------------
 
