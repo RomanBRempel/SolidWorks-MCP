@@ -14,5 +14,10 @@
   "_require_model": "c5099962a1d5",
   "_require_part": "16ab5e87ec55",
   "_require_assembly": "5262bc0b4cb1",
-  "_quiet": "939282471864"
+  "_quiet": "939282471864",
+  "connect": "a33aec220ab8",
+  "_reattach_if_gone": "059e6adae600",
+  "_command_in_progress": "c0051a467883",
+  "_quiet_ui": "ef1b186394a1",
+  "_wake_all": "404b0641f839"
 }

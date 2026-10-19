@@ -350,3 +350,88 @@ def tool_source(session, name: str) -> dict:
         except (OSError, TypeError):
             out[key] = {"source": None}
     return out
+
+
+# --- shell feasibility -------------------------------------------------------------------
+
+
+def face_radii(corners_mm, normals) -> tuple:
+    """(min convex radius, min concave radius) in mm of a tessellated face, None where flat.
+
+    Uses each triangle edge's two vertex normals: along an arc of radius R the
+    normals turn by |dn| = |dp| / R (exact for a circle), and dn . dp > 0 where
+    the surface bulges outward (convex), < 0 where it is hollow (concave).
+    corners_mm: flat [x, y, z] * 3 per triangle; normals: unit outward vertex normals, same layout.
+    """
+    convex = concave = None
+    n_tri = min(len(corners_mm), len(normals)) // 9
+    for t in range(n_tri):
+        pts = [corners_mm[9 * t + 3 * k:9 * t + 3 * k + 3] for k in range(3)]
+        nrm = [normals[9 * t + 3 * k:9 * t + 3 * k + 3] for k in range(3)]
+        for i, j in ((0, 1), (1, 2), (2, 0)):
+            dp = [b - a for a, b in zip(pts[i], pts[j])]
+            dn = [b - a for a, b in zip(nrm[i], nrm[j])]
+            len_dn = sum(c * c for c in dn) ** 0.5
+            if len_dn < 1e-6:
+                continue
+            len_dp = sum(c * c for c in dp) ** 0.5
+            radius = len_dp / len_dn
+            if sum(a * b for a, b in zip(dn, dp)) > 0:
+                convex = radius if convex is None else min(convex, radius)
+            else:
+                concave = radius if concave is None else min(concave, radius)
+    return convex, concave
+
+
+def shell_check(session, thickness_mm: float, outward: bool = False, top: int = 15) -> dict:
+    """Can a shell of thickness_mm be built on the current part? Checked before trying it.
+
+    An inward shell offsets every face inward by the thickness: where the part
+    bulges with a radius under the thickness the offset folds over itself and
+    the shell fails (on a lofted body SolidWorks may compute for a long time
+    first). Outward shells fail on hollows with a radius under the thickness.
+    Radii come from the display tessellation's vertex normals, so they are
+    accurate to the tessellation (a few %). Returns the critical faces, the
+    smallest radius and the largest thickness that keeps a 5 % margin.
+    """
+    if thickness_mm <= 0:
+        raise SolidWorksError("thickness_mm must be > 0.")
+    part = session._require_part()
+    bodies = _tuple(part.GetBodies2(0, True))
+    if not bodies:
+        raise SolidWorksError("No solid body.")
+    mod = session._mod
+    kind = "concave" if outward else "convex"
+    rows, faces_seen, curved = [], 0, 0
+    for b_index, raw_body in enumerate(bodies):
+        body = binding.wrap(raw_body, mod.IBody2)
+        for f_index, raw_face in enumerate(_tuple(body.GetFaces())):
+            faces_seen += 1
+            face = binding.wrap(raw_face, mod.IFace2)
+            surface = binding.wrap(face.GetSurface(), mod.ISurface)
+            if surface is not None and surface.IsPlane():
+                continue
+            curved += 1
+            corners = [v * 1000.0 for v in _tuple(face.GetTessTriangles(True))]
+            normals = list(_tuple(face.GetTessNorms()))
+            convex, concave = face_radii(corners, normals)
+            radius = concave if outward else convex
+            if radius is None:
+                continue
+            box = _tuple(face.GetBox())
+            centre = [round((box[i] + box[i + 3]) / 2 * 1000, 2) for i in range(3)] if len(box) >= 6 else None
+            rows.append({"body": b_index, "face": f"#{f_index}", "radius_mm": round(radius, 3),
+                         "area_mm2": round(face.GetArea() * 1e6, 1), "centre_mm": centre,
+                         "surface_type": int(surface.Identity()) if surface is not None else None})
+    rows.sort(key=lambda r: r["radius_mm"])
+    min_r = rows[0]["radius_mm"] if rows else None
+    fail = [r for r in rows if r["radius_mm"] < thickness_mm * 1.05]
+    risk = [r for r in rows if thickness_mm * 1.05 <= r["radius_mm"] < thickness_mm * 1.5]
+    verdict = "fail" if fail else ("risk" if risk else "ok")
+    return {"ok": True, "thickness_mm": thickness_mm, "direction": "outward" if outward else "inward",
+            "critical": f"{kind} radius", "verdict": verdict, "min_radius_mm": min_r,
+            "max_thickness_mm": round(min_r / 1.05, 3) if min_r else None,
+            "faces_checked": faces_seen, "curved_faces": curved, "fail": len(fail), "risk": len(risk),
+            "faces": rows[:max(1, int(top))],
+            "note": "Faces listed are the ones whose " + kind + " radius limits the shell; list_faces "
+                    "indices apply to body 0. Remove them from the shell (open faces) or thicken locally."}

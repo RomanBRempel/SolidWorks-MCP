@@ -16,13 +16,15 @@ CONTRACT = os.path.join(os.path.dirname(__file__), "upstream_contract.json")
 # patched by rbr, or relied on by it
 WATCHED = ["_iter_features", "_history_snapshot", "_roll_back", "_remove_features_since", "_history",
            "run_guarded", "new_part", "new_assembly", "_pick_planar_face", "_body_faces", "_solid_body",
-           "_component_by_name", "_require_model", "_require_part", "_require_assembly", "_quiet"]
+           "_component_by_name", "_require_model", "_require_part", "_require_assembly", "_quiet",
+           "connect", "_reattach_if_gone", "_command_in_progress", "_quiet_ui", "_wake_all"]
 
 
 def _original(name):
     from solidworks_mcp.session import SolidWorksSession
-    from solidworks_mcp.rbr import fastpath, journal
-    fn = fastpath._ORIGINAL.get(name) or journal._ORIGINAL.get(name) or getattr(SolidWorksSession, name, None)
+    from solidworks_mcp.rbr import fastpath, guard, journal
+    fn = (fastpath._ORIGINAL.get(name) or guard._ORIGINAL.get(name) or journal._ORIGINAL.get(name)
+          or getattr(SolidWorksSession, name, None))
     return getattr(fn, "__wrapped__", fn)  # new_part/new_assembly carry the original
 
 

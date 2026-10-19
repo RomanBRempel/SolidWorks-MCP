@@ -69,6 +69,8 @@ class FakeFeatureManager:
     def __init__(self, model):
         self.model = model
         self.get_features_calls = 0
+        self.EnableFeatureTree = True
+        self.EnableFeatureTreeWindow = True
 
     def GetFeatures(self, top):
         self.get_features_calls += 1
@@ -90,6 +92,12 @@ class FakeModel:
         self.selected = []
         self.Extension = types.SimpleNamespace(DeleteSelection2=self._delete)
         self.SelectionManager = types.SimpleNamespace(CreateSelectData=lambda: None)
+        self.ActiveView = types.SimpleNamespace(EnableGraphicsUpdate=True)
+        self.SketchManager = types.SimpleNamespace(DisplayWhenAdded=True)
+        self.redraws = 0
+
+    def GraphicsRedraw2(self):
+        self.redraws += 1
 
     def _delete(self, *a):
         for f in self.selected:
@@ -119,19 +127,35 @@ class FakeModel:
         self.features.append(FakeFeature(name, model=self))
 
 
+class FakeSw:
+    def __init__(self, *docs):
+        self.CommandInProgress = False
+        self.docs = list(docs)
+        self.ActiveDoc = docs[0] if docs else None
+
+    def GetDocuments(self):
+        return tuple(self.docs)
+
+
 @pytest.fixture
-def fake_session(monkeypatch):
+def fake_session(monkeypatch, swmcp_home):
     from solidworks_mcp.session import SolidWorksSession
-    from solidworks_mcp.rbr import fastpath, journal
+    from solidworks_mcp.rbr import fastpath, guard, journal
     fastpath.apply()
+    guard.apply()
     journal.apply()
     s = SolidWorksSession()
     s._mod = FakeMod()
     s._model = FakeModel(["Sketch1", "Boss1"])
+    s._sw = FakeSw(s._model)
     monkeypatch.setattr(SolidWorksSession, "_require_model", lambda self: self._model)
     monkeypatch.setattr(SolidWorksSession, "_require_part", lambda self: self._model)
     monkeypatch.setattr(SolidWorksSession, "_reattach_if_gone", lambda self: None)
-    monkeypatch.setattr(SolidWorksSession, "_command_in_progress", lambda self, flag: False)
+    def cip(self, flag):  # upstream contract: set it, return what it was
+        before = self._sw.CommandInProgress
+        self._sw.CommandInProgress = bool(flag)
+        return before
+    monkeypatch.setattr(SolidWorksSession, "_command_in_progress", cip)
     import contextlib
     monkeypatch.setattr(SolidWorksSession, "_quiet_ui", lambda self: contextlib.nullcontext())
     return s

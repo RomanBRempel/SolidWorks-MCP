@@ -115,7 +115,7 @@ def test_journal_read_filters_and_stats(fake_session, swmcp_home):
     for _ in range(3):
         fake_session.run_guarded(ok, fake_session)
     got = journal.read(last_n=2, tool="list_bodies")
-    assert got["total"] == 3 and got["count"] == 2 and got["stats"]["list_bodies"]["calls"] == 2
+    assert got["total"] == 3 and got["count"] == 2 and got["stats"]["list_bodies"]["calls"] == 3
 
 
 # --- run_script -------------------------------------------------------------------
@@ -178,7 +178,7 @@ def test_register_adds_tools_without_touching_upstream(swmcp_home):
     assert {"run_script", "run_saved_script", "list_scripts", "get_script", "save_script", "get_journal",
             "tool_source", "set_units", "get_custom_properties", "set_custom_properties",
             "list_configurations", "activate_configuration", "add_configuration", "export_face_dxf",
-            "assembly_bom"} <= new
+            "assembly_bom", "server_health", "release_ui", "release_document", "shell_check"} <= new
     assert before <= after  # every upstream tool still there
 
 

@@ -112,7 +112,7 @@ def write(entry: dict) -> None:
 
 def _run_guarded(self, fn, *args, **kwargs):
     t0 = time.perf_counter()
-    entry = {"ts": _dt.datetime.now().isoformat(timespec="milliseconds"), "tool": tool_name(fn),
+    entry = {"ts": _dt.datetime.now().isoformat(timespec="milliseconds"), "pid": os.getpid(), "tool": tool_name(fn),
              **describe_args(fn, args, kwargs)}
     before = tree_state(self)
     try:
@@ -141,36 +141,58 @@ def _run_guarded(self, fn, *args, **kwargs):
             pass
 
 
+def _pct(values, q):
+    v = sorted(values)
+    return round(v[min(len(v) - 1, int(q * len(v)))], 1) if v else None
+
+
 def read(last_n: int = 20, tool: str | None = None, date: str | None = None,
-         errors_only: bool = False) -> dict:
-    """The last entries of a day's journal (today by default), newest last."""
+         errors_only: bool = False, since: str | None = None, entries: bool = True) -> dict:
+    """Journal of a day (today by default), newest last; reads the file only, never SolidWorks.
+
+    since: 'HH:MM[:SS]' or an ISO time - only calls from then on. Stats (calls,
+    total s, p50/p95/max ms, errors per tool) cover every matching call; the
+    entries list is the last last_n of them (entries=False leaves it out).
+    """
     day = date or _dt.date.today().isoformat()
     path = os.path.join(journal_dir(), day + ".jsonl")
     if not os.path.isfile(path):
         days = sorted(f[:-6] for f in os.listdir(journal_dir()) if f.endswith(".jsonl"))
         return {"ok": True, "date": day, "count": 0, "entries": [], "days": days[-10:], "path": path}
-    entries = []
+    if since and "T" not in since:
+        since = f"{day}T{since}"
+    found = []
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             try:
                 e = json.loads(line)
             except ValueError:
                 continue
+            if since and e.get("ts", "") < since:
+                continue
             if tool and e.get("tool") != tool:
                 continue
             if errors_only and e.get("ok", True):
                 continue
-            entries.append(e)
-    total = len(entries)
-    entries = entries[-max(1, int(last_n)):]
+            found.append(e)
+    per = {}
+    for e in found:
+        per.setdefault(e.get("tool"), []).append(e)
     stats = {}
-    for e in entries:
-        s = stats.setdefault(e.get("tool"), {"calls": 0, "ms": 0.0, "errors": 0})
-        s["calls"] += 1
-        s["ms"] = round(s["ms"] + float(e.get("ms") or 0), 1)
-        s["errors"] += 0 if e.get("ok", True) else 1
-    return {"ok": True, "date": day, "path": path, "total": total, "count": len(entries),
-            "stats": stats, "entries": entries}
+    for name, items in sorted(per.items(), key=lambda kv: -sum(float(x.get("ms") or 0) for x in kv[1])):
+        ms = [float(x.get("ms") or 0) for x in items]
+        stats[name] = {"calls": len(items), "total_s": round(sum(ms) / 1000, 1), "p50_ms": _pct(ms, 0.5),
+                       "p95_ms": _pct(ms, 0.95), "max_ms": round(max(ms), 1),
+                       "errors": sum(1 for x in items if not x.get("ok", True))}
+    out = {"ok": True, "date": day, "path": path, "total": len(found), "stats": stats,
+           "pids": sorted({e.get("pid") for e in found if e.get("pid")})}
+    if found:
+        out["span"] = [found[0].get("ts"), found[-1].get("ts")]
+        out["busy_s"] = round(sum(float(e.get("ms") or 0) for e in found) / 1000, 1)
+    if entries:
+        out["entries"] = found[-max(1, int(last_n)):]
+        out["count"] = len(out["entries"])
+    return out
 
 
 def apply() -> None:

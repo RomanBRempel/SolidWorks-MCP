@@ -13,11 +13,11 @@ import functools
 import os
 
 from ..errors import SolidWorksError
-from . import fastpath, journal, library, script_tool, tools
+from . import fastpath, guard, journal, library, script_tool, tools
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.0.0"
+RBR_VERSION = "1.1.0"
 
 INSTRUCTIONS = """
 
@@ -25,6 +25,9 @@ RBR extension (solidworks-mcp-rbr)
 - Batch work goes in ONE run_script call (sw, model, ext, fm, asm/part, comp(), feature(), select(), args, MM, DEG; set `result`). Prefer it over many granular calls on big parts.
 - Proven scripts: list_scripts / get_script / save_script / run_saved_script(name, args).
 - Every call is journalled with its arguments and full script code: get_journal. tool_source(name) shows the code any tool runs.
+- Telemetry: get_journal(since='HH:MM', entries=False) gives per-tool stats from the journal file without touching SolidWorks; never read the journal through run_script. server_health shows what the server is doing right now, also while a call runs.
+- If SolidWorks looks frozen while idle (no redraw, tree greyed), call release_ui. A document another server process changed in the last minutes is read-only for you: release_document frees it.
+- Before a shell on a curved/lofted body: shell_check(thickness_mm). A thickness above the smallest convex radius makes the shell fail, sometimes after a long computation.
 - New parts and assemblies are switched to MMGS (mm, g) at creation. Also: set_units, get/set_custom_properties, list/activate/add_configuration, export_face_dxf (flat part -> DXF 1:1 for milling), assembly_bom (BOM + mass budget, CSV).
 """
 
@@ -57,6 +60,7 @@ def _patch_new_documents():
 def register(server) -> None:
     """Patch the session and add the RBR tools to `server.mcp` (the upstream FastMCP)."""
     fastpath.apply()
+    guard.apply()    # before the journal, so the journal times the guard too
     journal.apply()
     _patch_new_documents()
 
@@ -67,11 +71,26 @@ def register(server) -> None:
     except AttributeError:
         pass
 
+    if worker is not None and not getattr(worker, "_rbr_fail_fast", False):
+        original_call = worker.call
+
+        async def call_fail_fast(fn):
+            busy = guard.busy_error()  # no queueing behind a call that has run for long
+            if busy:
+                raise SolidWorksError(busy)
+            return await original_call(fn)
+
+        worker.call = call_fail_fast
+        worker._rbr_fail_fast = True
+
     async def _timed(fn, *args, timeout_s: float = 120.0):
         """Like server._call, with a per-call timeout (scripts may run long)."""
         if worker is None:
             return {"ok": False, "error": "SolidWorks tools only work on Windows with SolidWorks."}
         limit = max(5.0, min(float(timeout_s), 1800.0))
+        busy = None if fn is guard.release_ui else guard.busy_error()
+        if busy:
+            return {"ok": False, "error": busy}
         fut = worker.submit(lambda: session.run_guarded(fn, *args))
         try:
             return await asyncio.wait_for(asyncio.wrap_future(fut), limit)
@@ -157,10 +176,43 @@ def register(server) -> None:
 
     @mcp.tool()
     async def get_journal(last_n: int = 20, tool: str | None = None, date: str | None = None,
-                          errors_only: bool = False) -> dict:
-        """The journal of tool calls: time, tool, arguments (full script code), document, ms,
-        ok/error and the feature-tree change. date 'YYYY-MM-DD' (today by default)."""
-        return _local(journal.read, last_n, tool, date, errors_only)
+                          errors_only: bool = False, since: str | None = None, entries: bool = True) -> dict:
+        """Telemetry and history of tool calls, read from the journal file (never from SolidWorks).
+
+        Each entry: time, pid, tool, arguments (full script code), document, ms,
+        ok/error, feature-tree change. stats per tool: calls, total_s, p50/p95/max
+        ms, errors - over all matching calls. since 'HH:MM' limits to calls from
+        then; date 'YYYY-MM-DD' (today by default); entries=False for stats only.
+        """
+        return _local(journal.read, last_n, tool, date, errors_only, since, entries)
+
+    @mcp.tool()
+    async def server_health() -> dict:
+        """What the server is doing now, answered without waiting for SolidWorks: the running call
+        and its age, queued calls, the cross-process lock holder, document owners, the last faults
+        and errors. Use it when a call is slow or SolidWorks seems stuck."""
+        def build():
+            st = guard.state()
+            last = journal.read(last_n=5, errors_only=True, entries=True)
+            return {"ok": True, "version": RBR_VERSION, "server": st,
+                    "queued": worker._queue.qsize() if worker is not None else 0,
+                    "lock_holder": guard._lock.holder(), "owners": guard.owners(),
+                    "recent_errors": [{k: e.get(k) for k in ("ts", "pid", "tool", "doc", "error")}
+                                      for e in last.get("entries", [])]}
+        return _local(build)
+
+    @mcp.tool()
+    async def release_ui(dry_run: bool = False) -> dict:
+        """Unfreeze SolidWorks: clear CommandInProgress and switch the view, feature tree and
+        sketch display back on in every open document. Use when SolidWorks is idle but does not
+        redraw or respond after a failed call. dry_run only reports what is switched off."""
+        return await _timed(guard.release_ui, session, dry_run, timeout_s=30)
+
+    @mcp.tool()
+    async def release_document(title: str | None = None) -> dict:
+        """Free a document (or all, title=None) that another server process holds after changing it,
+        so this one may change it too. Only when you know the other session is done with it."""
+        return _local(guard.release_document, title)
 
     @mcp.tool()
     async def tool_source(name: str) -> dict:
@@ -202,6 +254,15 @@ def register(server) -> None:
     async def add_configuration(name: str, description: str = "") -> dict:
         """Add a configuration derived from the active one; it becomes active."""
         return await call(tools.add_configuration, session, name, description)
+
+    @mcp.tool()
+    async def shell_check(thickness_mm: float, outward: bool = False, top: int = 15) -> dict:
+        """Check BEFORE a shell (or before unsuppressing one) whether thickness_mm can work on the
+        current part: the smallest convex radius (inward shell) or concave radius (outward) must
+        exceed the thickness. Returns verdict ok/risk/fail, the limiting faces (index, radius, area,
+        centre) and max_thickness_mm. Read-only, a second or two; a failing shell on a lofted body
+        can block SolidWorks for a minute and leave the part without a body."""
+        return await call(tools.shell_check, session, thickness_mm, outward, top)
 
     # --- manufacturing ---------------------------------------------------------
 
