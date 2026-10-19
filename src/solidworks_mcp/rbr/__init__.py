@@ -17,7 +17,7 @@ from . import fastpath, guard, journal, library, script_tool, tools
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.2.0"
+RBR_VERSION = "1.2.2"
 
 INSTRUCTIONS = """
 
@@ -295,12 +295,12 @@ def register(server) -> None:
 
     @mcp.tool()
     async def shell_check(thickness_mm: float, outward: bool = False, top: int = 15,
-                          budget_s: float = 12.0, samples: int = 3000) -> dict:
+                          budget_s: float = 12.0, samples: int = 8000) -> dict:
         """Check BEFORE a shell (or before unsuppressing one) whether thickness_mm can work on the
         current part: the smallest convex radius (inward shell) or concave radius (outward) must
         exceed the thickness. Returns verdict ok/risk/fail, the limiting faces (index, radius, area,
         centre) and max_safe_thickness_mm. Read-only; stays within budget_s (default 12 s) using
-        `samples` rays (3000), and says `partial` when a big body did not fit the budget. A failing
+        `samples` rays (8000) cast in Python against the tessellation, and says `partial` when a big body did not fit the budget. A failing
         shell on a lofted body can crash SolidWorks' shell computation and leave the part bodiless."""
         return await call(tools.shell_check, session, thickness_mm, outward, top, budget_s, samples)
 
