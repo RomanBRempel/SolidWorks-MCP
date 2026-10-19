@@ -190,3 +190,14 @@ def test_release_inside_a_call_keeps_the_quiet_count(fake_session):
     fake_session._quiet_depth = 1  # as inside upstream's _quiet_ui
     guard.release_ui(fake_session)
     assert fake_session._quiet_depth == 1
+
+
+def test_shell_verdict_from_material_and_curvature():
+    assert tools.shell_verdict(2, 19.6, [])[0] == "ok"
+    assert tools.shell_verdict(10.5, 19.6, [])[0] == "fail"          # walls meet (verified live)
+    assert tools.shell_verdict(8, 19.6, [])[0] == "risk"             # 16 < 19.6 < 20
+    analytic = [{"radius_mm": 3.0, "surface_type": 4002}]            # R3 fillets, 4 mm shell built
+    assert tools.shell_verdict(4, 40, analytic)[0] == "ok"
+    freeform = [{"radius_mm": 3.0, "surface_type": 4006}]
+    verdict, reasons = tools.shell_verdict(4, 40, freeform)
+    assert verdict == "risk" and "freeform" in reasons[0]

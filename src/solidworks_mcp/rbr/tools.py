@@ -383,16 +383,46 @@ def face_radii(corners_mm, normals) -> tuple:
     return convex, concave
 
 
+FREEFORM_SURFACES = {4006, 4008, 4010}  # B-spline, offset, revolved spline: no exact offset to fall back on
+
+
+def shell_verdict(thickness_mm: float, thinnest_mm, radius_rows: list) -> tuple:
+    """(verdict, reasons) from the measured material and curvature. Pure, unit-tested.
+
+    Verified on SOLIDWORKS 2025: SolidWorks trims an offset that folds over on
+    analytic faces and extrusions (a 4 mm shell over R3 fillets and a 6.5 mm one
+    over a spline outline of R5.6 both built), but where the material is thinner
+    than twice the wall the cavity vanishes: a 10.5 mm shell on a 19.6 mm wide
+    part 'succeeded' and removed nothing. So the material decides; a freeform
+    convex radius under the thickness only adds risk.
+    """
+    reasons, verdict = [], "ok"
+    if thinnest_mm is not None and thinnest_mm < 2 * thickness_mm:
+        verdict = "fail"
+        reasons.append(f"material only {thinnest_mm:.2f} mm thick somewhere: under 2 x {thickness_mm} mm the "
+                       "inner walls meet and that region gets no cavity (the shell may build and remove nothing)")
+    elif thinnest_mm is not None and thinnest_mm < 2.5 * thickness_mm:
+        verdict = "risk"
+        reasons.append(f"material {thinnest_mm:.2f} mm thick somewhere: less than {2.5 * thickness_mm:.1f} mm "
+                       "leaves a slit-thin cavity")
+    freeform = [r for r in radius_rows if r.get("surface_type") in FREEFORM_SURFACES
+                and r["radius_mm"] < thickness_mm * 1.05]
+    if freeform:
+        verdict = "fail" if verdict == "fail" else "risk"
+        reasons.append(f"{len(freeform)} freeform face(s) bulge with a radius under the thickness "
+                       f"(smallest {freeform[0]['radius_mm']} mm): their offset folds over and SolidWorks may "
+                       "compute for long and fail")
+    return verdict, reasons
+
+
 def shell_check(session, thickness_mm: float, outward: bool = False, top: int = 15) -> dict:
     """Can a shell of thickness_mm be built on the current part? Checked before trying it.
 
-    An inward shell offsets every face inward by the thickness: where the part
-    bulges with a radius under the thickness the offset folds over itself and
-    the shell fails (on a lofted body SolidWorks may compute for a long time
-    first). Outward shells fail on hollows with a radius under the thickness.
-    Radii come from the display tessellation's vertex normals, so they are
-    accurate to the tessellation (a few %). Returns the critical faces, the
-    smallest radius and the largest thickness that keeps a 5 % margin.
+    Measures (1) the material thickness straight through the part, by rays from
+    points over every face: under 2 x thickness the walls meet; (2) the smallest
+    convex radius (concave for outward) of every curved face from its
+    tessellation: on freeform faces under the thickness the offset folds over.
+    After add_shell, also compare the volume: a shell that removed nothing failed.
     """
     if thickness_mm <= 0:
         raise SolidWorksError("thickness_mm must be > 0.")
@@ -424,14 +454,24 @@ def shell_check(session, thickness_mm: float, outward: bool = False, top: int = 
                          "area_mm2": round(face.GetArea() * 1e6, 1), "centre_mm": centre,
                          "surface_type": int(surface.Identity()) if surface is not None else None})
     rows.sort(key=lambda r: r["radius_mm"])
+    walls = None
+    try:
+        body0 = binding.wrap(bodies[0], mod.IBody2)
+        triangles = [(index, *tri) for index, face in enumerate(session._body_faces(body0))
+                     for tri in session._face_triangles(binding.wrap(face, mod.IFace2))]
+        walls = session._thin_walls(body0, triangles, 2.5 * thickness_mm)
+    except Exception as exc:  # noqa: BLE001 - the radius check still stands
+        walls = {"error": str(exc)}
+    thinnest = walls.get("thinnest_mm") if isinstance(walls, dict) else None
+    verdict, reasons = shell_verdict(thickness_mm, thinnest, rows)
     min_r = rows[0]["radius_mm"] if rows else None
-    fail = [r for r in rows if r["radius_mm"] < thickness_mm * 1.05]
-    risk = [r for r in rows if thickness_mm * 1.05 <= r["radius_mm"] < thickness_mm * 1.5]
-    verdict = "fail" if fail else ("risk" if risk else "ok")
+    max_t = [v for v in (thinnest / 2.5 if thinnest else None,
+                         min_r / 1.05 if min_r and any(r.get("surface_type") in FREEFORM_SURFACES for r in rows)
+                         else None) if v]
     return {"ok": True, "thickness_mm": thickness_mm, "direction": "outward" if outward else "inward",
-            "critical": f"{kind} radius", "verdict": verdict, "min_radius_mm": min_r,
-            "max_thickness_mm": round(min_r / 1.05, 3) if min_r else None,
-            "faces_checked": faces_seen, "curved_faces": curved, "fail": len(fail), "risk": len(risk),
-            "faces": rows[:max(1, int(top))],
-            "note": "Faces listed are the ones whose " + kind + " radius limits the shell; list_faces "
-                    "indices apply to body 0. Remove them from the shell (open faces) or thicken locally."}
+            "verdict": verdict, "reasons": reasons,
+            "thinnest_material_mm": thinnest, "thin_faces": (walls or {}).get("faces", [])[:max(1, int(top))],
+            f"min_{kind}_radius_mm": min_r, "max_safe_thickness_mm": round(min(max_t), 3) if max_t else None,
+            "faces_checked": faces_seen, "curved_faces": curved,
+            "radius_faces": rows[:max(1, int(top))],
+            "after_shell": "compare volume_mm3 before/after add_shell: unchanged means the shell did nothing"}

@@ -17,7 +17,7 @@ from . import fastpath, guard, journal, library, script_tool, tools
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.1.0"
+RBR_VERSION = "1.1.1"
 
 INSTRUCTIONS = """
 
@@ -57,12 +57,46 @@ def _patch_new_documents():
     SolidWorksSession._rbr_units_patched = True
 
 
+def _patch_shell_check_result():
+    """add_shell that removes no material failed (verified: a 10.5 mm shell on a 19.6 mm wide part
+    reported ok with the volume unchanged). Refuse it, so run_guarded rolls the feature back."""
+    from ..session import SolidWorksSession
+    original = SolidWorksSession.add_shell
+    if getattr(original, "_rbr_checked", False):
+        return
+
+    def add_shell(self, thickness_mm, open_face="+z", _orig=original):
+        before = None
+        try:
+            ext = self._require_model().Extension
+            from .. import binding as _b
+            mp = _b.wrap(_b.wrap(ext, self._mod.IModelDocExtension).CreateMassProperty(), self._mod.IMassProperty)
+            mp.UseSystemUnits = True
+            before = mp.Volume * 1e9
+        except Exception:  # noqa: BLE001 - no reference: keep upstream's behaviour
+            before = None
+        res = _orig(self, thickness_mm, open_face)
+        after = (res.get("mass_properties") or {}).get("volume_mm3") if isinstance(res, dict) else None
+        if before and after is not None and abs(after - before) <= 1e-6 * before:
+            raise SolidWorksError(
+                f"The shell removed no material (volume stays {after:.1f} mm^3): somewhere the part is "
+                f"thinner than 2 x {thickness_mm} mm, or the offset failed. Rolled back; run shell_check.")
+        if isinstance(res, dict) and before:
+            res["removed_mm3"] = round(before - (after or before), 3)
+        return res
+
+    functools.update_wrapper(add_shell, original)
+    add_shell._rbr_checked = True
+    SolidWorksSession.add_shell = add_shell
+
+
 def register(server) -> None:
     """Patch the session and add the RBR tools to `server.mcp` (the upstream FastMCP)."""
     fastpath.apply()
     guard.apply()    # before the journal, so the journal times the guard too
     journal.apply()
     _patch_new_documents()
+    _patch_shell_check_result()
 
     mcp, worker, session, call, com_error = (server.mcp, server._worker, server._session,
                                              server._call, server._COM_ERROR)
