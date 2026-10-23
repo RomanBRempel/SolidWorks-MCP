@@ -170,16 +170,30 @@ def test_builtin_scripts_parse():
 def test_register_adds_tools_without_touching_upstream(swmcp_home):
     import asyncio
     from solidworks_mcp import server
-    from solidworks_mcp.rbr import register
+    from solidworks_mcp.rbr import guard, register, speed
     before = {t.name for t in asyncio.run(server.mcp.list_tools())}
-    register(server)
-    after = {t.name for t in asyncio.run(server.mcp.list_tools())}
-    new = after - before
-    assert {"run_script", "run_saved_script", "list_scripts", "get_script", "save_script", "get_journal",
-            "tool_source", "set_units", "get_custom_properties", "set_custom_properties",
-            "list_configurations", "activate_configuration", "add_configuration", "export_face_dxf",
-            "assembly_bom", "server_health", "release_ui", "release_document", "shell_check"} <= new
-    assert before <= after  # every upstream tool still there
+    try:
+        register(server)
+        after = {t.name for t in asyncio.run(server.mcp.list_tools())}
+        new = after - before
+        assert {"run_script", "run_saved_script", "list_scripts", "get_script", "save_script", "get_journal",
+                "tool_source", "set_units", "get_custom_properties", "set_custom_properties",
+                "list_configurations", "activate_configuration", "add_configuration", "export_face_dxf",
+                "assembly_bom", "server_health", "release_ui", "release_document", "shell_check"} <= new
+        assert before <= after  # every upstream tool still there
+    finally:
+        # register() patches SolidWorksSession itself: undo, or the journal-wrapped
+        # run_guarded leaks into the upstream tests (and writes a real journal).
+        journal.unapply()
+        guard.unapply()
+        speed.unapply()
+        fastpath.unapply()
+        for name in ("new_part", "new_assembly", "add_shell"):  # each carries its original
+            fn = getattr(SolidWorksSession, name)
+            if hasattr(fn, "__wrapped__"):
+                setattr(SolidWorksSession, name, fn.__wrapped__)
+        if getattr(SolidWorksSession, "_rbr_units_patched", False):
+            del SolidWorksSession._rbr_units_patched
 
 
 def test_tool_source_shows_code():
@@ -187,3 +201,9 @@ def test_tool_source_shows_code():
     got = tools.tool_source(None, "add_box")
     assert "def add_box" in got["implementation"]["source"]
     assert "def add_box" in got["wrapper"]["source"]
+
+
+def test_set_units_rejects_foreign_mass_unit():
+    from solidworks_mcp.rbr import tools
+    with pytest.raises(SolidWorksError, match="IPS always uses lb"):
+        tools.set_units(None, "IPS", mass_unit="kg")  # refused, not silently dropped

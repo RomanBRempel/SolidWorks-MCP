@@ -17,7 +17,7 @@ from . import fastpath, guard, journal, library, script_tool, speed, tools
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.3.1"
+RBR_VERSION = "1.3.2"
 
 INSTRUCTIONS = """
 
