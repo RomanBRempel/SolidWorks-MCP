@@ -408,3 +408,11 @@ def apply() -> None:
         _ORIGINAL["connect"] = SolidWorksSession.connect
         SolidWorksSession.run_guarded = _run_guarded
         SolidWorksSession.connect = _connect
+
+
+def unapply() -> None:
+    """Restore the upstream methods (test teardown); apply() works again after."""
+    if _ORIGINAL:
+        SolidWorksSession.run_guarded = _ORIGINAL["run_guarded"]
+        SolidWorksSession.connect = _ORIGINAL["connect"]
+        _ORIGINAL.clear()

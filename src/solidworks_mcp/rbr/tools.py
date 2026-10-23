@@ -28,6 +28,7 @@ SW_UNITS_MASSPROP_DECIMALS = 261
 SW_NO_OPTION = 0
 SW_UNIT_SYSTEMS = {"CGS": 1, "MKS": 2, "IPS": 3, "CUSTOM": 4, "MMGS": 5}
 SW_MASS_UNITS = {"mg": 1, "g": 2, "kg": 3, "lb": 4}
+SYSTEM_MASS_UNIT = {"CGS": "g", "MKS": "kg", "IPS": "lb", "MMGS": "g"}
 SW_LENGTH_MM = 0
 
 SW_CUSTOM_TEXT = 30
@@ -79,20 +80,28 @@ def _read_props(session, model, config: str = "", only=None) -> dict:
 
 
 def set_units(session, system: str = "MMGS", decimals: int = 2, mass_unit: str = "g") -> dict:
-    """Set the current document's units; MMGS = mm, g, s. Read back after setting."""
+    """Set the current document's units; MMGS = mm, g, s. Read back after setting.
+
+    A mass_unit other than the system's own (CGS: g, MKS: kg, IPS: lb) is refused,
+    except for MMGS, which becomes the mm-based CUSTOM system with that mass unit.
+    """
     key = system.upper()
     if key not in SW_UNIT_SYSTEMS:
         raise SolidWorksError(f"Unknown unit system '{system}'; use one of {', '.join(SW_UNIT_SYSTEMS)}.")
     if mass_unit not in SW_MASS_UNITS:
         raise SolidWorksError(f"Unknown mass unit '{mass_unit}'; use one of {', '.join(SW_MASS_UNITS)}.")
+    if key == "MMGS" and mass_unit != "g":
+        key = "CUSTOM"
+    elif key != "CUSTOM" and mass_unit != SYSTEM_MASS_UNIT[key]:
+        raise SolidWorksError(
+            f"{key} always uses {SYSTEM_MASS_UNIT[key]} for mass; "
+            f"pass mass_unit='{SYSTEM_MASS_UNIT[key]}', or use MMGS/CUSTOM for '{mass_unit}'.")
     model = _model(session)
     ext = _ext(session, model)
     # Order matters: changing a single unit after the system turns it into Custom
     # (verified on SW 2025), so decimals go first and the system last.
     ext.SetUserPreferenceInteger(SW_UNITS_LINEAR_DECIMALS, SW_NO_OPTION, int(decimals))
     ext.SetUserPreferenceInteger(SW_UNITS_MASSPROP_DECIMALS, SW_NO_OPTION, int(decimals))
-    if key == "MMGS" and mass_unit != "g":
-        key = "CUSTOM"
     if key == "CUSTOM":
         ext.SetUserPreferenceInteger(SW_UNIT_SYSTEM, SW_NO_OPTION, SW_UNIT_SYSTEMS["CUSTOM"])
         ext.SetUserPreferenceInteger(SW_UNITS_LINEAR, SW_NO_OPTION, SW_LENGTH_MM)

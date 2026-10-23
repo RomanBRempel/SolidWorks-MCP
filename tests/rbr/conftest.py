@@ -163,7 +163,15 @@ def fake_session(monkeypatch, swmcp_home):
     monkeypatch.setattr(SolidWorksSession, "_command_in_progress", cip)
     import contextlib
     monkeypatch.setattr(SolidWorksSession, "_quiet_ui", lambda self: contextlib.nullcontext())
-    return s
+    yield s
+    # The applies above mutate SolidWorksSession itself; undo them in reverse,
+    # or the journal-wrapped run_guarded leaks into the upstream tests.
+    # monkeypatch first: a test's setattr captured the patched method as its
+    # "original", and undone after unapply() it would put the patch back.
+    monkeypatch.undo()
+    journal.unapply()
+    guard.unapply()
+    fastpath.unapply()
 
 
 @pytest.fixture
