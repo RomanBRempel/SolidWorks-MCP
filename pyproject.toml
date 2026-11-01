@@ -36,6 +36,7 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 solidworks-mcp = "solidworks_mcp.server:main"
+solidworks-mcp-rbr = "solidworks_mcp.rbr.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

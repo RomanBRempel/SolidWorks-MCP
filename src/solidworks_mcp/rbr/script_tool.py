@@ -8,13 +8,17 @@ Every run is written to the journal with its full code (rbr/journal.py), and
 the result carries the feature-tree change, so what the script did is visible.
 """
 
+import contextlib
 import json
 import time
 import traceback
 
+import pythoncom
+import win32com.client
+
 from .. import binding
 from ..errors import SolidWorksError
-from . import journal
+from . import geom, journal
 
 SW_DOC_PART = 1
 SW_DOC_ASSEMBLY = 2
@@ -101,7 +105,80 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         out_ = list(session._iter_features())
         return [f for f in out_ if type_name is None or f.GetTypeName2() == type_name]
 
-    ns.update(comp=comp, select=select, feature=feature, features=features, api=api, swapp=sw)
+    def vec(*values):
+        """A VARIANT(VT_ARRAY|VT_R8) for CreateSpline2, CreatePoint and friends.
+
+        A plain Python list reaches those APIs as None or garbage (1e-311);
+        this is the marshalling they actually need. Nested lists flatten.
+        """
+        flat = []
+        for v in values:
+            if isinstance(v, (list, tuple)):
+                flat.extend(float(x) for x in v)
+            else:
+                flat.append(float(v))
+        return win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, flat)
+
+    def pt(x, y, z):
+        """An IMathPoint at (x, y, z) metres, via MathUtility with the right VARIANT."""
+        mu = binding.wrap(sw.GetMathUtility(), mod.IMathUtility)
+        return binding.wrap(mu.CreatePoint(vec(x, y, z)), mod.IMathPoint)
+
+    @contextlib.contextmanager
+    def ui_unlocked():
+        """Temporarily lift CommandInProgress and the graphics freeze.
+
+        InsertSketch/EditSketch refuse to open a sketch while the script's UI
+        freeze is on; wrap just those calls, the freeze comes back after.
+        """
+        was_busy = bool(sw.CommandInProgress)
+        if was_busy:
+            sw.CommandInProgress = False
+        view = binding.wrap(model.ActiveView, mod.IModelView) if model is not None else None
+        was_still = view is not None and not view.EnableGraphicsUpdate
+        if was_still:
+            view.EnableGraphicsUpdate = True
+        try:
+            yield
+        finally:
+            if was_still:
+                view.EnableGraphicsUpdate = False
+            if was_busy:
+                sw.CommandInProgress = True
+
+    def tree_before():
+        """A snapshot for features_added / rename_new, taken before the risky call."""
+        return journal.tree_state(session)
+
+    def features_added(before):
+        """Names of the features appended since the tree_before() snapshot."""
+        return journal.tree_added(session, before, journal.tree_state(session))
+
+    def rename_new(before, name):
+        """Rename the newest feature added since `before` (a tree_before() snapshot).
+
+        Setting .Name on what InsertRefPlane itself returned fails with a type
+        mismatch; the feature re-fetched from the tree renames fine.
+        """
+        added = features_added(before)
+        if not added:
+            raise SolidWorksError("No feature was added since the snapshot; nothing to rename.")
+        feat = next((f for f in session._iter_features() if f.Name == added[-1]), None)
+        if feat is None:
+            raise SolidWorksError(f"The added feature '{added[-1]}' is not in the tree any more.")
+        feat.Name = name
+        return {"renamed": added[-1], "to": name}
+
+    def combine(operation, main, tools=None, name="Combine"):
+        """Join/subtract/intersect bodies through the proven combine_bodies path
+        ('add'/'subtract'/'common'); InsertCombineFeature called raw from a script fails."""
+        return session.combine_bodies(operation, main, tools, name)
+
+    ns.update(comp=comp, select=select, feature=feature, features=features, api=api, swapp=sw,
+              vec=vec, pt=pt, ui_unlocked=ui_unlocked, tree_before=tree_before,
+              features_added=features_added, rename_new=rename_new, combine=combine,
+              mirror_body=lambda body, plane, merge=True: geom.mirror_body(session, body, plane, merge),
+              whats_wrong=lambda: geom.whats_wrong(session))
     try:
         import numpy as np  # optional: present when installed with `--with numpy`
         ns["np"] = np
