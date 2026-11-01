@@ -13,11 +13,11 @@ import functools
 import os
 
 from ..errors import SolidWorksError
-from . import fastpath, guard, journal, library, script_tool, speed, tools
+from . import equations, fastpath, geom, guard, health, image, jobs, journal, library, script_tool, speed, tools
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.3.2"
+RBR_VERSION = "1.4.0"
 
 INSTRUCTIONS = """
 
@@ -31,6 +31,11 @@ RBR extension (solidworks-mcp-rbr)
 - Before a shell on a curved/lofted body: shell_check(thickness_mm).
 - On a big part every modelling call rebuilds the whole tree (3-10 s each on 100+ features). Prefer one run_script doing several sketch/cut/dimension steps over many separate calls; rebuild_profile shows which features make rebuilds slow (suppress them while iterating). Use the library's tree_summary instead of writing your own feature walk. A refused fillet is diagnosed within 15 s; pass the edges it names, not the whole set again. A thickness above the smallest convex radius makes the shell fail, sometimes after a long computation.
 - New parts and assemblies are switched to MMGS (mm, g) at creation. Also: set_units, get/set_custom_properties, list/activate/add_configuration, export_face_dxf (flat part -> DXF 1:1 for milling), assembly_bom (BOM + mass budget, CSV).
+- A script that may run long: run_script answers {job_id, state: running} after ~50 s instead of dying, run_script_async / run_saved_script_async answer {job_id} at once; the work keeps running and get_job(job_id) returns its result (kept 24 h), list_jobs the recent ones. Never resubmit a script because the reply detached.
+- After editing the linked global-variables file: sync_equation_file() adds the new names, updates the changed ones and names what the file no longer has, with a reason for every refused line.
+- server_health warns when open documents or SLDWORKS.exe memory run high; close_hidden_documents(keep=[...]) closes the invisible, saved, unowned ones.
+- check_containment(envelope, keepout) measures how much of each body sits inside another part's envelope body (master-model parts sharing an origin).
+- More script names: vec(*doubles) / pt(x,y,z) (COM-ready VARIANTs), ui_unlocked() (lift the UI freeze for InsertSketch/EditSketch), tree_before() + features_added(before) + rename_new(before, name), combine(op, main, tools), mirror_body(body, plane, merge=True), whats_wrong().
 """
 
 
@@ -92,6 +97,70 @@ def _patch_shell_check_result():
     SolidWorksSession.add_shell = add_shell
 
 
+def _patch_screenshot():
+    """SaveAs3 grabs the graphics buffer: a minimised or covered SolidWorks yields a solid
+    white frame that looks like a result. Front the document inside SolidWorks first, and
+    flag the capture with blank=true when every pixel still came out one colour."""
+    from ..session import SolidWorksSession
+    original = SolidWorksSession.screenshot
+    if getattr(original, "_rbr_blank_checked", False):
+        return
+
+    def screenshot(self, path: str, view: str = "iso", zoom_mm: list | None = None,
+                   show_planes: bool = False, from_dir: list | None = None, _orig=original):
+        try:
+            model = self._require_model()
+            self._sw.ActivateDoc3(model.GetTitle(), False, 2, 0)
+            model.GraphicsRedraw2()
+        except Exception:  # noqa: BLE001 - fronting is best-effort; the capture may still work
+            pass
+        result = _orig(self, path, view, zoom_mm, show_planes, from_dir)
+        blank = image.is_blank_file(path) if str(path).lower().endswith(".png") else None
+        if blank:
+            try:
+                self._require_model().GraphicsRedraw2()
+            except Exception:  # noqa: BLE001
+                pass
+            result = _orig(self, path, view, zoom_mm, show_planes, from_dir)
+            blank = image.is_blank_file(path)
+        if isinstance(result, dict) and blank is not None:
+            result["blank"] = bool(blank)
+            if blank:
+                result["hint"] = ("Every pixel is one colour: the SolidWorks window is probably "
+                                  "minimised or fully covered, so the graphics buffer was empty. "
+                                  "Restore/uncover the SolidWorks window and retake.")
+        return result
+
+    functools.update_wrapper(screenshot, original)
+    screenshot._rbr_blank_checked = True
+    SolidWorksSession.screenshot = screenshot
+
+
+def _patch_set_equations():
+    """A refused list names only the equation text; say which position failed too."""
+    from ..session import SolidWorksSession
+    original = SolidWorksSession.set_equations
+    if getattr(original, "_rbr_indexed", False):
+        return
+
+    def set_equations(self, equations: list, _orig=original) -> dict:
+        try:
+            return _orig(self, equations)
+        except SolidWorksError as exc:
+            text = str(exc)
+            if isinstance(equations, (list, tuple)):
+                for i, equation in enumerate(equations):
+                    if str(equation) and str(equation) in text:
+                        raise SolidWorksError(
+                            f"Equation {i + 1} of {len(equations)}: {text} "
+                            "(the whole list was rolled back)") from exc
+            raise
+
+    functools.update_wrapper(set_equations, original)
+    set_equations._rbr_indexed = True
+    SolidWorksSession.set_equations = set_equations
+
+
 def register(server) -> None:
     """Patch the session and add the RBR tools to `server.mcp` (the upstream FastMCP)."""
     fastpath.apply()
@@ -100,6 +169,8 @@ def register(server) -> None:
     journal.apply()
     _patch_new_documents()
     _patch_shell_check_result()
+    _patch_screenshot()
+    _patch_set_equations()
 
     mcp, worker, session, call, com_error = (server.mcp, server._worker, server._session,
                                              server._call, server._COM_ERROR)
@@ -176,6 +247,14 @@ def register(server) -> None:
         guessing names), session (the server's SolidWorksSession: its methods are the
         tools), MM = 0.001 (API lengths are metres), DEG, args (dict), np (numpy, if
         installed), print(...) -> stdout; set `result = ...` to return JSON data.
+        More helpers: vec(*doubles) and pt(x, y, z) build the VARIANTs CreateSpline2 /
+        CreatePoint really take (a plain list arrives as None or 1e-311); ui_unlocked()
+        lifts the UI freeze around InsertSketch/EditSketch; tree_before() then
+        features_added(before) / rename_new(before, name) name and rename what a call
+        added (renaming what InsertRefPlane returned fails with a type mismatch);
+        combine(op, main, tools) joins bodies the proven way; mirror_body(body, plane,
+        merge=True) mirrors without SolidWorks' broken Merge and welds afterwards;
+        whats_wrong() lists SolidWorks' rebuild errors when an Insert* returned None.
         COM rules: methods with out-parameters return a tuple (retval, out1, out2...):
         unpack it, do not call methods on it; objects from Get* calls are often raw
         dispatches: wrap(x, mod.IFeature) etc. before using them; lengths in metres.
@@ -183,18 +262,74 @@ def register(server) -> None:
         Example (delete 3 components with their mates in one step):
             n = select([comp(c) for c in ["Bolt-1", "Bolt-2", "Nut-1"]])
             result = {"selected": n, "deleted": ext.DeleteSelection2(1)}
-        timeout_s: answer after this many seconds at most (5..1800).
+        timeout_s: how long to wait for the reply (5..1800, capped by SWMCP_SYNC_WAIT_S,
+        50 s). The script is NOT killed at the timeout: the reply detaches as
+        {job_id, state: running} and get_job(job_id) returns the result when done -
+        never resubmit the script because the reply detached.
         """
-        return await _timed(script_tool.run_script, session, code, timeout_s=timeout_s)
+        return await _run_detachable(code, None, None, "run_script", timeout_s)
+
+    async def _run_detachable(code: str, args: dict | None, name: str | None,
+                              tool: str, timeout_s: float) -> dict:
+        """Submit as a job, answer within the client's window, detach when it runs longer."""
+        if worker is None:
+            return {"ok": False, "error": "SolidWorks tools only work on Windows with SolidWorks."}
+        busy = guard.busy_error()
+        if busy:
+            return {"ok": False, "error": busy}
+        try:
+            job = jobs.submit(worker, session, code, args, name, tool)
+        except SolidWorksError as exc:
+            return {"ok": False, "error": str(exc)}
+        wait_s = max(5.0, min(float(timeout_s), jobs.SYNC_WAIT_S))
+        return jobs.answer(await jobs.wait(job["job_id"], wait_s))
 
     @mcp.tool()
     async def run_saved_script(name: str, args: dict | None = None, timeout_s: float = 120.0) -> dict:
-        """Run a script from the library (list_scripts) by name; `args` reaches it as the dict `args`."""
+        """Run a script from the library (list_scripts) by name; `args` reaches it as the dict `args`.
+        Detaches like run_script: a long run answers {job_id, state: running}, get_job finishes it."""
         try:
             code = library.code_of(name)
         except SolidWorksError as exc:
             return {"ok": False, "error": str(exc)}
-        return await _timed(script_tool.run_script, session, code, args or {}, timeout_s=timeout_s)
+        return await _run_detachable(code, args or {}, name, "run_saved_script", timeout_s)
+
+    @mcp.tool()
+    async def run_script_async(code: str, args: dict | None = None) -> dict:
+        """Start a run_script job in the background and answer {job_id} at once.
+
+        Same namespace and guarantees as run_script; the job queues behind other
+        calls on the one COM thread and runs to completion whatever the client's
+        reply timeout. get_job(job_id) returns {state, elapsed_s, result, error};
+        the record is kept 24 h. Use this for anything expected to pass ~50 s.
+        """
+        def start():
+            job = jobs.submit(worker, session, code, args, None, "run_script_async")
+            return {"ok": True, "job_id": job["job_id"], "state": job["state"],
+                    "hint": f"get_job('{job['job_id']}') returns the result when done."}
+        return _local(start)
+
+    @mcp.tool()
+    async def run_saved_script_async(name: str, args: dict | None = None) -> dict:
+        """run_saved_script as a background job: {job_id} at once, get_job for the result."""
+        def start():
+            code = library.code_of(name)
+            job = jobs.submit(worker, session, code, args or {}, name, "run_saved_script_async")
+            return {"ok": True, "job_id": job["job_id"], "state": job["state"], "script": name,
+                    "hint": f"get_job('{job['job_id']}') returns the result when done."}
+        return _local(start)
+
+    @mcp.tool()
+    async def get_job(job_id: str) -> dict:
+        """A background job's record: state (queued|running|done|failed), elapsed_s, the
+        script's full result once done, error and traceback when failed, features_added.
+        Works across server processes and restarts; records live 24 h."""
+        return _local(jobs.get, job_id)
+
+    @mcp.tool()
+    async def list_jobs(last_n: int = 10) -> dict:
+        """The most recent background jobs (all server processes), oldest first."""
+        return _local(jobs.list_jobs, last_n)
 
     @mcp.tool()
     async def list_scripts() -> dict:
@@ -233,16 +368,58 @@ def register(server) -> None:
     async def server_health() -> dict:
         """What the server is doing now, answered without waiting for SolidWorks: the running call
         and its age, queued calls, the cross-process lock holder, document owners, the last faults
-        and errors. Use it when a call is slow or SolidWorks seems stuck."""
+        and errors; plus SLDWORKS.exe memory and (when the COM thread is free) the open document
+        count, with a warning past 30 documents or 70% of RAM. Use it when a call is slow or
+        SolidWorks seems stuck."""
         def build():
             st = guard.state()
             last = journal.read(last_n=5, errors_only=True, entries=True)
             return {"ok": True, "version": RBR_VERSION, "server": st,
                     "queued": worker._queue.qsize() if worker is not None else 0,
                     "lock_holder": guard._lock.holder(), "owners": guard.owners(),
+                    "sldworks_memory": health.sldworks_memory(),
                     "recent_errors": [{k: e.get(k) for k in ("ts", "pid", "tool", "doc", "error")}
                                       for e in last.get("entries", [])]}
-        return _local(build)
+        report = _local(build)
+        if not report.get("ok"):
+            return report
+        documents = None  # a quick COM probe, only while nothing runs; never waited on for long
+        if worker is not None and guard.state().get("tool") is None and session._sw is not None:
+            try:
+                fut = worker.submit(lambda: int(session._sw.GetDocumentCount()))
+                documents = await asyncio.wait_for(asyncio.wrap_future(fut), 3.0)
+            except Exception:  # noqa: BLE001 - health never hangs on SolidWorks
+                documents = None
+        report["documents_open"] = documents
+        warn = health.warnings_for(documents, report.get("sldworks_memory"))
+        if warn:
+            report["warnings"] = warn
+        return report
+
+    @mcp.tool()
+    async def close_hidden_documents(keep: list | None = None) -> dict:
+        """Close every open document that is invisible, saved and not owned by another server
+        process. Assemblies silently open their parts; past a few dozen documents every call
+        crawls (server_health warns). keep lists titles to spare; the active document, the
+        current model, visible and unsaved documents always stay."""
+        return await _timed(health.close_hidden_documents, session, keep, timeout_s=120)
+
+    @mcp.tool()
+    async def sync_equation_file(path: str | None = None) -> dict:
+        """Re-read the current document's linked equation file (or `path`): add the global
+        variables the file gained, update the changed ones, and name those the file no longer
+        has. Dimension equations ("D1@...") are left alone. Every refused line comes back with
+        its reason (duplicate name, a broken leftover equation - deleted and retried by itself -
+        or a reference nothing resolves). SolidWorks' own update only refreshes existing names."""
+        return await _timed(equations.sync, session, path, timeout_s=300)
+
+    @mcp.tool()
+    async def check_containment(envelope: str, keepout: str | None = None) -> dict:
+        """How much of each solid body of `keepout` (an open part's title; the current part by
+        default) sits inside the bodies of the open part `envelope`: per body its volume, %
+        inside and the mm^3 sticking out, via intersections of copies (the parts are untouched).
+        Both parts must share their origin, as master-model parts built from one skeleton do."""
+        return await _timed(geom.check_containment, session, envelope, keepout, timeout_s=600)
 
     @mcp.tool()
     async def release_ui(dry_run: bool = False, clear_quarantine: bool = False) -> dict:
