@@ -14,6 +14,8 @@ if "pythoncom" not in sys.modules:  # Linux/macOS: stub just enough for imports
         pc = types.ModuleType("pythoncom")
         pc.com_error = type("com_error", (Exception,), {})
         pc.VT_DISPATCH = 9
+        pc.VT_ARRAY = 8192
+        pc.VT_R8 = 5
         pc.CoInitialize = pc.CoUninitialize = lambda *a: None
         sys.modules["pythoncom"] = pc
         w = types.ModuleType("win32com")
