@@ -14,6 +14,8 @@ if "pythoncom" not in sys.modules:  # Linux/macOS: stub just enough for imports
         pc = types.ModuleType("pythoncom")
         pc.com_error = type("com_error", (Exception,), {})
         pc.VT_DISPATCH = 9
+        pc.VT_ARRAY = 8192
+        pc.VT_R8 = 5
         pc.CoInitialize = pc.CoUninitialize = lambda *a: None
         sys.modules["pythoncom"] = pc
         w = types.ModuleType("win32com")
@@ -163,7 +165,15 @@ def fake_session(monkeypatch, swmcp_home):
     monkeypatch.setattr(SolidWorksSession, "_command_in_progress", cip)
     import contextlib
     monkeypatch.setattr(SolidWorksSession, "_quiet_ui", lambda self: contextlib.nullcontext())
-    return s
+    yield s
+    # The applies above mutate SolidWorksSession itself; undo them in reverse,
+    # or the journal-wrapped run_guarded leaks into the upstream tests.
+    # monkeypatch first: a test's setattr captured the patched method as its
+    # "original", and undone after unapply() it would put the patch back.
+    monkeypatch.undo()
+    journal.unapply()
+    guard.unapply()
+    fastpath.unapply()
 
 
 @pytest.fixture

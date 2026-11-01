@@ -91,3 +91,10 @@ def apply() -> list:
         _ORIGINAL[name] = getattr(SolidWorksSession, name)
         setattr(SolidWorksSession, name, fn)
     return sorted(_ORIGINAL)
+
+
+def unapply() -> None:
+    """Restore the upstream methods (test teardown); apply() works again after."""
+    for name, fn in _ORIGINAL.items():
+        setattr(SolidWorksSession, name, fn)
+    _ORIGINAL.clear()

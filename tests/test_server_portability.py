@@ -53,7 +53,8 @@ def _exchange(requests, last_id, timeout=60):
     """Talk to the probe like a real client: keep stdin open until the reply to
     `last_id` arrives, then close it and wait for a clean exit."""
     proc = subprocess.Popen([sys.executable, "-c", _PROBE], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8")  # JSON-RPC is UTF-8; the locale codec is not
     replies, stderr, answered = {}, [], threading.Event()
 
     def read_replies():

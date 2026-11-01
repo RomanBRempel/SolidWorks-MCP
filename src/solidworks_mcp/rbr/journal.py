@@ -199,3 +199,10 @@ def apply() -> None:
     if not _ORIGINAL:
         _ORIGINAL["run_guarded"] = SolidWorksSession.run_guarded
         SolidWorksSession.run_guarded = _run_guarded
+
+
+def unapply() -> None:
+    """Restore run_guarded as it was before apply() (test teardown)."""
+    if _ORIGINAL:
+        SolidWorksSession.run_guarded = _ORIGINAL["run_guarded"]
+        _ORIGINAL.clear()

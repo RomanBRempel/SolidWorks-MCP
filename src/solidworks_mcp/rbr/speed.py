@@ -185,3 +185,10 @@ def apply() -> None:
         fn.__wrapped__ = _ORIGINAL[name]
         fn.__doc__ = _ORIGINAL[name].__doc__
         setattr(SolidWorksSession, name, fn)
+
+
+def unapply() -> None:
+    """Restore the upstream methods (test teardown); apply() works again after."""
+    for name, fn in _ORIGINAL.items():
+        setattr(SolidWorksSession, name, fn)
+    _ORIGINAL.clear()
