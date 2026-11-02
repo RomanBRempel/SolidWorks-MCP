@@ -3881,6 +3881,13 @@ class SolidWorksSession:
             if left:
                 raise SolidWorksError(f"{exc} Could not remove what the call added: {', '.join(left)}.") from exc
             raise
+        except pythoncom.com_error as exc:
+            if exc.hresult in self._GONE_HRESULTS:
+                lost = self._explain_lost_link()
+                if lost is not None:
+                    raise lost from exc
+            self._roll_back(snapshot)
+            raise
         except Exception:
             self._roll_back(snapshot)
             raise
@@ -3888,13 +3895,17 @@ class SolidWorksSession:
             self._command_in_progress(busy)
 
     # A link into a SolidWorks that is gone (restarted or closed): RPC server
-    # unavailable, RPC call failed, object disconnected from its clients
-    _GONE_HRESULTS = {-2147023174, -2147023170, -2147417848}
+    # unavailable, RPC call failed, object disconnected from its clients,
+    # no such interface (a proxy that outlived its marshaling data)
+    _GONE_HRESULTS = {-2147023174, -2147023170, -2147417848, -2147467262}
 
     def _reattach_if_gone(self) -> None:
         """Attach to the running SolidWorks when the one this server held was
         restarted: the old link answers every call with an RPC error. The
-        current document went with the old SolidWorks."""
+        current document went with the old SolidWorks. A current document that
+        was closed behind this server's back (in SolidWorks itself, or by a
+        script) is dropped the same way, so the next tool says 'no active
+        document' instead of a raw COM error."""
         if self._sw is None:
             return
         try:
@@ -3904,6 +3915,51 @@ class SolidWorksSession:
                 raise
             self._sw = self._model = None
             self.connect()
+            return
+        if self._model is not None:
+            try:
+                self._model.GetTitle()
+            except pythoncom.com_error as exc:
+                if exc.hresult not in self._GONE_HRESULTS:
+                    raise
+                self._model = None
+
+    def _explain_lost_link(self):
+        """What a mid-call RPC/disconnect error means, as a readable error.
+
+        The app link dead: SolidWorks closed or was restarted during the call —
+        reattach to the running instance (the document went with the old one).
+        The app alive but the current document dead: it was closed during the
+        call — drop it. Both alive: only a sub-object died (a face consumed by
+        a rebuild, a closed import's part), so None, and the caller's error
+        stands with the part rolled back as usual."""
+        if self._sw is None:
+            return None
+        try:
+            self._sw.CommandInProgress
+        except pythoncom.com_error:
+            self._sw = self._model = None
+            try:
+                self.connect()
+            except SolidWorksError:
+                return SolidWorksError(
+                    "SolidWorks closed during the call and is not running. The document that "
+                    "was being worked on is gone with it; start SolidWorks and retry."
+                )
+            return SolidWorksError(
+                "SolidWorks was restarted during the call; this server reattached to the new "
+                "instance. The previous document is gone: reopen or recreate it and retry."
+            )
+        if self._model is not None:
+            try:
+                self._model.GetTitle()
+            except pythoncom.com_error:
+                self._model = None
+                return SolidWorksError(
+                    "The current document was closed during the call. Open or create a "
+                    "document ('new_part', 'open_part', 'activate_document') and retry."
+                )
+        return None
 
     @contextlib.contextmanager
     def _quiet_ui(self):

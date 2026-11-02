@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- Losing SolidWorks no longer wedges the server until a restart. A current
+  document closed behind the server's back (in SolidWorks itself, or by a
+  script) is dropped, so the next tool says "no active document" instead of
+  answering every call with a raw COM error. A link that dies *during* a
+  call (SolidWorks closed or restarted) reattaches to the running instance
+  and says what happened and what to retry; "no such interface" now counts
+  as a dead link alongside the RPC errors. A dead sub-object (a face
+  consumed by a rebuild) with the link fine still rolls back as before.
+
 ## [0.16.1] — 2026-10-15
 
 ### Changed

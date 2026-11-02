@@ -13,11 +13,11 @@ import functools
 import os
 
 from ..errors import SolidWorksError
-from . import equations, fastpath, geom, guard, health, image, jobs, journal, library, script_tool, speed, tools
+from . import equations, fastpath, flow, geom, guard, health, image, jobs, journal, library, script_tool, speed, tools
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.4.0"
+RBR_VERSION = "1.5.0"
 
 INSTRUCTIONS = """
 
@@ -35,6 +35,7 @@ RBR extension (solidworks-mcp-rbr)
 - After editing the linked global-variables file: sync_equation_file() adds the new names, updates the changed ones and names what the file no longer has, with a reason for every refused line.
 - server_health warns when open documents or SLDWORKS.exe memory run high; close_hidden_documents(keep=[...]) closes the invisible, saved, unowned ones.
 - check_containment(envelope, keepout) measures how much of each body sits inside another part's envelope body (master-model parts sharing an origin).
+- Flow Simulation on a saved part: flow_create_project(name, template) -> flow_add_boundary_condition(kind, faces, value) (an internal flow needs an inlet and a pressure condition on the inner faces of its lids) -> flow_add_goal(kind, faces) -> optionally flow_set_conditions -> flow_solve (detaches like run_script; get_job) -> flow_goals. Check each goal against a hand estimate (pressure drop, drag) as you would a mass.
 - More script names: vec(*doubles) / pt(x,y,z) (COM-ready VARIANTs), ui_unlocked() (lift the UI freeze for InsertSketch/EditSketch), tree_before() + features_added(before) + rename_new(before, name), combine(op, main, tools), mirror_body(body, plane, merge=True), whats_wrong().
 """
 
@@ -420,6 +421,81 @@ def register(server) -> None:
         inside and the mm^3 sticking out, via intersections of copies (the parts are untouched).
         Both parts must share their origin, as master-model parts built from one skeleton do."""
         return await _timed(geom.check_containment, session, envelope, keepout, timeout_s=600)
+
+    # --- Flow Simulation ---------------------------------------------------------------
+
+    @mcp.tool()
+    async def flow_create_project(name: str, template: str = "internal_water") -> dict:
+        """Create a Flow Simulation project on the current SAVED part or assembly from a project
+        template (.fwp: a name in Flow's template folder, or a full path), and fit its
+        computational domain to the model. The template fixes the analysis type and the fluid:
+        'internal_water' ships with Flow; for external flow or air, make a template once in
+        Flow (Wizard, then Create Template). Then: flow_add_boundary_condition, flow_add_goal,
+        flow_set_conditions, flow_solve. Needs the Flow Simulation add-in and its API SDK."""
+        return await _timed(flow.flow_create_project, session, name, template, timeout_s=330)
+
+    @mcp.tool()
+    async def flow_add_boundary_condition(kind: str, faces: list | str, value: float | None = None,
+                                          name: str | None = None) -> dict:
+        """Add a boundary condition on faces that touch the fluid (for an internal flow: the
+        inner faces of the lids that close the openings, e.g. '+x:inner').
+        kind: inlet_velocity (m/s), inlet_mass_flow (kg/s), inlet_volume_flow (m^3/s),
+        inlet_mach, inlet_mass_flux, outlet_velocity / outlet_mass_flow / outlet_volume_flow /
+        outlet_mach, static_pressure / total_pressure / environment_pressure (Pa), or
+        real_wall / real_external_wall / ideal_wall (no value). Values are SI.
+        faces: '#5' (list_faces index), '+x' / '+x:inner', 'all', or ['selection'] for what is
+        selected in SolidWorks. An internal flow needs at least one pressure condition."""
+        return await _timed(flow.flow_add_boundary_condition, session, kind, faces, value, name, timeout_s=330)
+
+    @mcp.tool()
+    async def flow_add_goal(kind: str, faces: list | str, value: str = "average", name: str | None = None) -> dict:
+        """Add a surface goal on faces (same selectors as flow_add_boundary_condition; 'all' for
+        the whole body, e.g. the drag of an external flow). kind: static_pressure,
+        total_pressure, dynamic_pressure, temperature, density, velocity, velocity_x/y/z,
+        mass_flow, volume_flow, heat_flux, force, force_x/y/z, normal_force(_x/y/z),
+        shear_force(_x/y/z), moment_x/y/z, wall_temperature, total_temperature.
+        value: average (default), min, max, bulk_average. Goals are what flow_solve reports."""
+        return await _timed(flow.flow_add_goal, session, kind, faces, value, name, timeout_s=330)
+
+    @mcp.tool()
+    async def flow_set_conditions(velocity_mps: list | None = None, pressure_pa: float | None = None,
+                                  temperature_k: float | None = None, mesh_level: int | None = None) -> dict:
+        """Set the active project's initial/ambient conditions - for an external flow the free
+        stream: velocity_mps [vx, vy, vz], pressure_pa, temperature_k - and/or its automatic
+        mesh level 1 (coarse, fast) .. 7 (fine). Leave out what should stay."""
+        return await _timed(flow.flow_set_conditions, session, velocity_mps, pressure_pa, temperature_k,
+                            mesh_level, timeout_s=330)
+
+    @mcp.tool()
+    async def flow_solve(timeout_s: float = 120.0) -> dict:
+        """Save the document, mesh and solve the active Flow project, and return its goals
+        {name, value, unit} (SI). The results are then loaded into SolidWorks (Flow's Results
+        node, `results_loaded`), where the user can make cut or surface plots. A run that outlasts timeout_s (max 50 s of waiting) answers
+        {job_id, state: running}: get_job(job_id) returns the goals when it is done - never start
+        it again because the reply detached. A refused solve names Flow's reason (e.g. no
+        pressure condition on an internal flow)."""
+        if worker is None:
+            return {"ok": False, "error": "SolidWorks tools only work on Windows with SolidWorks."}
+        busy = guard.busy_error()
+        if busy:
+            return {"ok": False, "error": busy}
+        try:
+            job = jobs.submit(worker, session, None, None, None, "flow_solve", call=flow.flow_solve)
+        except SolidWorksError as exc:
+            return {"ok": False, "error": str(exc)}
+        wait_s = max(5.0, min(float(timeout_s), jobs.SYNC_WAIT_S))
+        return jobs.answer(await jobs.wait(job["job_id"], wait_s))
+
+    @mcp.tool()
+    async def flow_goals(service: bool = False) -> dict:
+        """The active Flow project's goal values from its last solve: {name, value, unit} (SI).
+        service=True adds Flow's own convergence goals."""
+        return await _timed(flow.flow_goals, session, service, timeout_s=330)
+
+    @mcp.tool()
+    async def flow_info() -> dict:
+        """The current document's Flow projects, the active one and its boundary conditions and goals."""
+        return await _timed(flow.flow_info, session, timeout_s=330)
 
     @mcp.tool()
     async def release_ui(dry_run: bool = False, clear_quarantine: bool = False) -> dict:
