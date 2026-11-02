@@ -37,7 +37,7 @@ READ_ONLY = frozenset({
     "get_status", "list_documents", "get_mass_properties", "get_bounding_box", "list_faces", "list_edges",
     "list_bodies", "list_features", "list_dimensions", "read_sketch", "list_equations", "list_components",
     "get_assembly_bounding_box", "get_custom_properties", "list_configurations", "shell_check",
-    "release_ui",
+    "release_ui", "flow_goals", "flow_info",
 })
 
 # Tools that switch the current document: ownership is checked on the document they act on, not before.
@@ -359,7 +359,8 @@ def _run_guarded(self, fn, *args, **kwargs):
         try:
             result = _ORIGINAL["run_guarded"](self, fn, *args, **kwargs)
         except Exception as exc:
-            hresult = getattr(exc, "hresult", None)
+            # a lost link arrives as a SolidWorksError raised from the COM error
+            hresult = getattr(exc, "hresult", None) or getattr(exc.__cause__, "hresult", None)
             if hresult in FAULTS:
                 _set(faults=_state["faults"] + 1, last_fault=f"{time.strftime('%H:%M:%S')} {tool}: {FAULTS[hresult]}")
             try:

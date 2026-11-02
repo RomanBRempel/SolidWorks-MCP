@@ -83,15 +83,18 @@ def cleanup() -> None:
             continue
 
 
-def submit(worker, session, code: str, args: dict | None = None,
-           name: str | None = None, tool: str = "run_script_async") -> dict:
-    """Queue `code` on the COM worker as a job; returns the job record at once."""
+def submit(worker, session, code: str | None, args: dict | None = None,
+           name: str | None = None, tool: str = "run_script_async", call=None) -> dict:
+    """Queue `code` on the COM worker as a job; returns the job record at once.
+
+    `call` (a function of the session, e.g. a Flow solve) runs instead of a
+    script, under the same guard, journal and job record."""
     if worker is None:
         raise SolidWorksError("SolidWorks tools only work on Windows with SolidWorks.")
     cleanup()
     job_id = uuid.uuid4().hex[:12]
     job = {"job_id": job_id, "state": "queued", "tool": tool, "script": name,
-           "pid": os.getpid(), "submitted": _now(), "code_chars": len(code)}
+           "pid": os.getpid(), "submitted": _now(), "code_chars": len(code or "")}
     with _lock:
         _jobs[job_id] = job
     _write(job)
@@ -101,7 +104,10 @@ def submit(worker, session, code: str, args: dict | None = None,
         _write(job)
         t0 = time.perf_counter()
         try:
-            result = session.run_guarded(script_tool.run_script, session, code, args or {})
+            if call is not None:
+                result = session.run_guarded(call, session)
+            else:
+                result = session.run_guarded(script_tool.run_script, session, code, args or {})
         except SolidWorksError as exc:
             job.update(state="failed", error=str(exc))
         except Exception as exc:  # noqa: BLE001 - the job must end in a readable record
