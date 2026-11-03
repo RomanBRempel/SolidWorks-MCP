@@ -146,8 +146,13 @@ class FakeSw:
 
 @pytest.fixture
 def fake_session(monkeypatch, swmcp_home):
+    import os
     from solidworks_mcp.session import SolidWorksSession
     from solidworks_mcp.rbr import fastpath, guard, journal
+    # Our own mutex, not the live server's: a test run during a long real call
+    # (an hour-long flow_solve) otherwise waits LOCK_WAIT_S per guarded test.
+    monkeypatch.setattr(guard, "MUTEX_NAME", f"Local\\solidworks-mcp-test-{os.getpid()}")
+    monkeypatch.setattr(guard, "_lock", guard._ProcessLock())
     fastpath.apply()
     guard.apply()
     journal.apply()

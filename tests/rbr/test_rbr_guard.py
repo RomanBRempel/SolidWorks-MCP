@@ -103,7 +103,19 @@ def test_read_only_tools_skip_freeze_and_snapshot(fake_session, monkeypatch):
         seen["cip"] = self._sw.CommandInProgress
         return {"ok": True}
     fake_session.run_guarded(_named(read, "get_mass_properties"), fake_session)
-    assert calls["snap"] == 0 and seen["cip"] is False
+    assert calls["snap"] == 0
+    # CommandInProgress IS set for the read (COM calls run ~100x faster with it;
+    # list_features spent 16-21 s walking the tree without it) and restored after.
+    assert seen["cip"] is True
+    assert fake_session._sw.CommandInProgress is False
+
+
+def test_read_only_call_restores_command_in_progress_after_a_failure(fake_session):
+    def read(self):
+        raise SolidWorksError("No active document.")
+    with pytest.raises(SolidWorksError):
+        fake_session.run_guarded(_named(read, "list_features"), fake_session)
+    assert fake_session._sw.CommandInProgress is False
 
 
 # --- ownership ---------------------------------------------------------------------------
@@ -203,15 +215,19 @@ def test_face_radii_flat_face_has_none():
     assert convex is None and concave is None
 
 
-def test_lock_serialises_on_any_os():
-    guard._lock.acquire("a", 1)
+def test_lock_serialises_on_any_os(monkeypatch, swmcp_home):
+    # Our own mutex: the real one is held by the live server for a whole
+    # flow_solve, and taking it would also overwrite the server's lock.json.
+    monkeypatch.setattr(guard, "MUTEX_NAME", f"Local\\solidworks-mcp-test-{os.getpid()}-lock")
+    lock = guard._ProcessLock()
+    lock.acquire("a", 1)
     try:
         with pytest.raises(SolidWorksError, match="in use"):
-            if guard._lock._win:  # same thread re-enters a Windows mutex; only check elsewhere
+            if lock._win:  # same thread re-enters a Windows mutex; only check elsewhere
                 raise SolidWorksError("in use")
-            guard._lock.acquire("b", 0.05)
+            lock.acquire("b", 0.05)
     finally:
-        guard._lock.release()
+        lock.release()
 
 
 def test_release_inside_a_call_keeps_the_quiet_count(fake_session):

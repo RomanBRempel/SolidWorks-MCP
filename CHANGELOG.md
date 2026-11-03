@@ -5,6 +5,17 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Changed
+- Read-only tools now run with CommandInProgress set (restored after), like
+  modifying calls always did. The flag makes out-of-process COM calls ~100x
+  faster, and the heavy reads make thousands of them per call: the journal
+  shows list_features at 16-21 s, read_sketch 12-19 s, list_equations up to
+  35 s with the flag skipped. The snapshot and UI freeze stay skipped.
+- The rbr tests take a mutex of their own instead of the live server's
+  `Local\solidworks-mcp-rbr`: a test run during a long real call (an
+  hour-long flow_solve) waited 30 s per guarded test and overwrote the
+  server's lock.json holder record.
+
 ### Fixed
 - Losing SolidWorks no longer wedges the server until a restart. A current
   document closed behind the server's back (in SolidWorks itself, or by a
