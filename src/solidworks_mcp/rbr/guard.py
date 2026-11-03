@@ -8,8 +8,10 @@ Wraps SolidWorksSession.run_guarded (inside the journal wrapper) on the COM thre
    fails too and SolidWorks stays frozen while idle. Every failed modifying call
    is followed by release_ui(): each flag reset on its own, every open document.
    A CommandInProgress left set by a dead call is cleared before the next one.
-2. Read-only tools (READ_ONLY) skip the snapshot, CommandInProgress and the UI
-   freeze/redraw: ~0.5 s less per call on a heavy surface part.
+2. Read-only tools (READ_ONLY) skip the snapshot and the UI freeze/redraw:
+   ~0.5 s less per call on a heavy surface part. CommandInProgress IS set for
+   them (restored after): it makes out-of-process COM calls ~100x faster, and
+   the heavy reads (list_features, read_sketch, list_equations) make thousands.
 3. One call at a time across processes: a named mutex (Local\\solidworks-mcp-rbr)
    around each call, so two servers never interleave in one SolidWorks.
 4. Document ownership: the process that last modified a document owns it for
@@ -34,7 +36,7 @@ from ..errors import SolidWorksError
 from ..session import SolidWorksSession
 from . import journal
 
-# Tools that only read: no snapshot, no CommandInProgress, no UI freeze or redraw.
+# Tools that only read: no snapshot, no UI freeze or redraw (CommandInProgress is still set).
 READ_ONLY = frozenset({
     "get_status", "list_documents", "get_mass_properties", "get_bounding_box", "list_faces", "list_edges",
     "list_bodies", "list_features", "list_dimensions", "read_sketch", "list_equations", "list_components",
@@ -355,7 +357,13 @@ def _run_guarded(self, fn, *args, **kwargs):
     try:
         if read_only:
             self._reattach_if_gone()
+            busy = None
             try:
+                # CommandInProgress makes out-of-process COM calls ~100x faster
+                # (upstream's pinned measurement), and a read that walks the tree
+                # makes thousands of them: list_features spent 16-21 s without it
+                # (journal through 2026-11-03). Snapshot and UI freeze stay skipped.
+                busy = self._command_in_progress(True)
                 return fn(*args, **kwargs)
             except pythoncom.com_error as exc:
                 # the link died during the read itself (the probe above had just passed)
@@ -366,6 +374,12 @@ def _run_guarded(self, fn, *args, **kwargs):
                     if lost is not None:
                         raise lost from exc
                 raise
+            finally:
+                if busy is not None:
+                    try:
+                        self._command_in_progress(busy)
+                    except Exception:  # noqa: BLE001 - the link died during the read: nothing to restore
+                        pass
         _check_quarantine(self, tool)
         if tool not in SWITCHERS:
             check_owner(_title(self), tool)
