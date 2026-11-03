@@ -27,6 +27,8 @@ import os
 import threading
 import time
 
+import pythoncom
+
 from .. import binding
 from ..errors import SolidWorksError
 from ..session import SolidWorksSession
@@ -49,6 +51,8 @@ FAULTS = {
     -2147417848: "RPC_E_DISCONNECTED",
     -2147023174: "RPC_S_SERVER_UNAVAILABLE",
     -2147023170: "RPC_S_CALL_FAILED",
+    -2147023169: "RPC_S_CALL_FAILED_DNE",
+    -2147023179: "RPC_S_UNKNOWN_IF",  # the stub went with a restarted SolidWorks (journal 2026-11-02/03)
     -2147418111: "RPC_E_CALL_REJECTED",
 }
 
@@ -351,7 +355,17 @@ def _run_guarded(self, fn, *args, **kwargs):
     try:
         if read_only:
             self._reattach_if_gone()
-            return fn(*args, **kwargs)
+            try:
+                return fn(*args, **kwargs)
+            except pythoncom.com_error as exc:
+                # the link died during the read itself (the probe above had just passed)
+                if getattr(exc, "hresult", None) in SolidWorksSession._GONE_HRESULTS:
+                    _set(faults=_state["faults"] + 1,
+                         last_fault=f"{time.strftime('%H:%M:%S')} {tool}: {FAULTS.get(exc.hresult, exc.hresult)}")
+                    lost = self._explain_lost_link()
+                    if lost is not None:
+                        raise lost from exc
+                raise
         _check_quarantine(self, tool)
         if tool not in SWITCHERS:
             check_owner(_title(self), tool)

@@ -17,7 +17,7 @@ from . import equations, fastpath, flow, geom, guard, health, image, jobs, journ
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.5.0"
+RBR_VERSION = "1.5.1"
 
 INSTRUCTIONS = """
 

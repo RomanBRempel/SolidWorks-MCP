@@ -17,6 +17,18 @@ from solidworks_mcp.session import SolidWorksSession
 RPC_E_DISCONNECTED = -2147417848   # "the object invoked has disconnected from its clients"
 E_NOINTERFACE = -2147467262        # "no such interface supported"
 
+# Every HRESULT a dead link has actually answered with; each must reattach, not
+# leak raw. RPC_S_UNKNOWN_IF arrived after SolidWorks restarts on 2026-11-02/03
+# and leaked raw until it was added to _GONE_HRESULTS.
+GONE_HRESULTS = [
+    (-2147023174, "RPC_S_SERVER_UNAVAILABLE"),
+    (-2147023170, "RPC_S_CALL_FAILED"),
+    (-2147023169, "RPC_S_CALL_FAILED_DNE"),
+    (-2147417848, "RPC_E_DISCONNECTED"),
+    (-2147467262, "E_NOINTERFACE"),
+    (-2147023179, "RPC_S_UNKNOWN_IF"),
+]
+
 
 def disconnected(hresult=RPC_E_DISCONNECTED):
     return pythoncom.com_error(hresult, "the object invoked has disconnected", None, None)
@@ -32,15 +44,16 @@ class StillApp:
 class FlakyApp:
     """An ISldWorks link that dies after `alive_reads` reads of CommandInProgress."""
 
-    def __init__(self, alive_reads):
+    def __init__(self, alive_reads, hresult=RPC_E_DISCONNECTED):
         self._alive = alive_reads
+        self._hresult = hresult
 
     @property
     def CommandInProgress(self):
         if self._alive > 0:
             self._alive -= 1
             return False
-        raise disconnected()
+        raise disconnected(self._hresult)
 
     @CommandInProgress.setter
     def CommandInProgress(self, value):
@@ -115,9 +128,10 @@ def test_what_could_not_be_removed_is_named_in_the_error():
 # consumed by a rebuild) with the link itself fine.
 
 
-def test_a_dead_link_found_before_the_call_reattaches():
+@pytest.mark.parametrize("hresult", [h for h, _ in GONE_HRESULTS], ids=[n for _, n in GONE_HRESULTS])
+def test_a_dead_link_found_before_the_call_reattaches(hresult):
     session = RecordingSession()
-    session._sw = FlakyApp(alive_reads=0)
+    session._sw = FlakyApp(alive_reads=0, hresult=hresult)
     reconnects = []
     session.connect = lambda: reconnects.append(True)
 

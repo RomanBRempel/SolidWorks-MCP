@@ -65,6 +65,34 @@ def test_stale_command_in_progress_is_cleared_before_a_call(fake_session):
     assert fake_session._sw.CommandInProgress is False  # and, cleared first, restores False
 
 
+def test_read_only_call_that_loses_the_link_answers_readably(fake_session, monkeypatch):
+    """SolidWorks restarted while a read ran: the read-only fast path must give the
+    same readable reattach message as a modifying call, not a raw COM error
+    (get_status/list_documents leaked raw RPC errors until it did)."""
+    import pythoncom
+    from solidworks_mcp.session import SolidWorksSession
+
+    exc = pythoncom.com_error(-2147023179, "RPC_S_UNKNOWN_IF", None, None)
+    exc.hresult = -2147023179  # the Linux stub's com_error carries no hresult of its own
+
+    class DeadSw:
+        @property
+        def CommandInProgress(self):
+            raise exc
+
+    reconnects = []
+    monkeypatch.setattr(SolidWorksSession, "connect", lambda self: reconnects.append(True))
+
+    def read(self):
+        self._sw = DeadSw()  # SolidWorks went away during the read
+        raise exc
+
+    with pytest.raises(SolidWorksError, match="restarted during the call"):
+        fake_session.run_guarded(_named(read, "get_mass_properties"), fake_session)
+    assert reconnects == [True]
+    assert "RPC_S_UNKNOWN_IF" in (guard.state()["last_fault"] or "")
+
+
 def test_read_only_tools_skip_freeze_and_snapshot(fake_session, monkeypatch):
     calls = {"snap": 0}
     monkeypatch.setattr(type(fake_session), "_history_snapshot",

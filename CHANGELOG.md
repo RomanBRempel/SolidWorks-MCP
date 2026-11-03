@@ -14,6 +14,12 @@ All notable changes to this project are documented here. This project follows
   and says what happened and what to retry; "no such interface" now counts
   as a dead link alongside the RPC errors. A dead sub-object (a face
   consumed by a rebuild) with the link fine still rolls back as before.
+- "The interface is unknown" (RPC_S_UNKNOWN_IF) counts as a dead link too:
+  after a SolidWorks restart the old link answered calls with that raw COM
+  error instead of reattaching (journal 2026-11-02/03), as does its
+  did-not-execute twin RPC_S_CALL_FAILED_DNE. And a read-only tool that
+  loses the link mid-call now answers with the same readable reattach
+  message as a modifying one, not a raw COM error.
 
 ## [0.16.1] — 2026-10-15
 
