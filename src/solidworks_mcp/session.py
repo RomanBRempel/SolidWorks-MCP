@@ -3895,9 +3895,11 @@ class SolidWorksSession:
             self._command_in_progress(busy)
 
     # A link into a SolidWorks that is gone (restarted or closed): RPC server
-    # unavailable, RPC call failed, object disconnected from its clients,
-    # no such interface (a proxy that outlived its marshaling data)
-    _GONE_HRESULTS = {-2147023174, -2147023170, -2147417848, -2147467262}
+    # unavailable, RPC call failed (and its did-not-execute twin), object
+    # disconnected from its clients, no such interface (a proxy that outlived
+    # its marshaling data), and the interface is unknown (RPC_S_UNKNOWN_IF: the
+    # stub went with the old SolidWorks; seen after restarts on 2026-11-02/03)
+    _GONE_HRESULTS = {-2147023174, -2147023170, -2147023169, -2147417848, -2147467262, -2147023179}
 
     def _reattach_if_gone(self) -> None:
         """Attach to the running SolidWorks when the one this server held was
