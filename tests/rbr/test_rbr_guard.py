@@ -65,6 +65,34 @@ def test_stale_command_in_progress_is_cleared_before_a_call(fake_session):
     assert fake_session._sw.CommandInProgress is False  # and, cleared first, restores False
 
 
+def test_read_only_call_that_loses_the_link_answers_readably(fake_session, monkeypatch):
+    """SolidWorks restarted while a read ran: the read-only fast path must give the
+    same readable reattach message as a modifying call, not a raw COM error
+    (get_status/list_documents leaked raw RPC errors until it did)."""
+    import pythoncom
+    from solidworks_mcp.session import SolidWorksSession
+
+    exc = pythoncom.com_error(-2147023179, "RPC_S_UNKNOWN_IF", None, None)
+    exc.hresult = -2147023179  # the Linux stub's com_error carries no hresult of its own
+
+    class DeadSw:
+        @property
+        def CommandInProgress(self):
+            raise exc
+
+    reconnects = []
+    monkeypatch.setattr(SolidWorksSession, "connect", lambda self: reconnects.append(True))
+
+    def read(self):
+        self._sw = DeadSw()  # SolidWorks went away during the read
+        raise exc
+
+    with pytest.raises(SolidWorksError, match="restarted during the call"):
+        fake_session.run_guarded(_named(read, "get_mass_properties"), fake_session)
+    assert reconnects == [True]
+    assert "RPC_S_UNKNOWN_IF" in (guard.state()["last_fault"] or "")
+
+
 def test_read_only_tools_skip_freeze_and_snapshot(fake_session, monkeypatch):
     calls = {"snap": 0}
     monkeypatch.setattr(type(fake_session), "_history_snapshot",
@@ -75,7 +103,19 @@ def test_read_only_tools_skip_freeze_and_snapshot(fake_session, monkeypatch):
         seen["cip"] = self._sw.CommandInProgress
         return {"ok": True}
     fake_session.run_guarded(_named(read, "get_mass_properties"), fake_session)
-    assert calls["snap"] == 0 and seen["cip"] is False
+    assert calls["snap"] == 0
+    # CommandInProgress IS set for the read (COM calls run ~100x faster with it;
+    # list_features spent 16-21 s walking the tree without it) and restored after.
+    assert seen["cip"] is True
+    assert fake_session._sw.CommandInProgress is False
+
+
+def test_read_only_call_restores_command_in_progress_after_a_failure(fake_session):
+    def read(self):
+        raise SolidWorksError("No active document.")
+    with pytest.raises(SolidWorksError):
+        fake_session.run_guarded(_named(read, "list_features"), fake_session)
+    assert fake_session._sw.CommandInProgress is False
 
 
 # --- ownership ---------------------------------------------------------------------------
@@ -175,15 +215,19 @@ def test_face_radii_flat_face_has_none():
     assert convex is None and concave is None
 
 
-def test_lock_serialises_on_any_os():
-    guard._lock.acquire("a", 1)
+def test_lock_serialises_on_any_os(monkeypatch, swmcp_home):
+    # Our own mutex: the real one is held by the live server for a whole
+    # flow_solve, and taking it would also overwrite the server's lock.json.
+    monkeypatch.setattr(guard, "MUTEX_NAME", f"Local\\solidworks-mcp-test-{os.getpid()}-lock")
+    lock = guard._ProcessLock()
+    lock.acquire("a", 1)
     try:
         with pytest.raises(SolidWorksError, match="in use"):
-            if guard._lock._win:  # same thread re-enters a Windows mutex; only check elsewhere
+            if lock._win:  # same thread re-enters a Windows mutex; only check elsewhere
                 raise SolidWorksError("in use")
-            guard._lock.acquire("b", 0.05)
+            lock.acquire("b", 0.05)
     finally:
-        guard._lock.release()
+        lock.release()
 
 
 def test_release_inside_a_call_keeps_the_quiet_count(fake_session):

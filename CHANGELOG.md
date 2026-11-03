@@ -5,6 +5,19 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Changed
+- Read-only tools now run with CommandInProgress set (restored after), like
+  modifying calls always did. The flag makes out-of-process COM calls ~100x
+  faster, and the heavy reads make thousands of them per call: the journal
+  shows list_features at 16-21 s, read_sketch 12-19 s, list_equations up to
+  35 s with the flag skipped. A live A/B on a 93-feature part: the same
+  per-feature walk took 4.1 s without the flag and 0.3 s with it. The
+  snapshot and UI freeze stay skipped.
+- The rbr tests take a mutex of their own instead of the live server's
+  `Local\solidworks-mcp-rbr`: a test run during a long real call (an
+  hour-long flow_solve) waited 30 s per guarded test and overwrote the
+  server's lock.json holder record.
+
 ### Fixed
 - Losing SolidWorks no longer wedges the server until a restart. A current
   document closed behind the server's back (in SolidWorks itself, or by a
@@ -14,6 +27,12 @@ All notable changes to this project are documented here. This project follows
   and says what happened and what to retry; "no such interface" now counts
   as a dead link alongside the RPC errors. A dead sub-object (a face
   consumed by a rebuild) with the link fine still rolls back as before.
+- "The interface is unknown" (RPC_S_UNKNOWN_IF) counts as a dead link too:
+  after a SolidWorks restart the old link answered calls with that raw COM
+  error instead of reattaching (journal 2026-11-02/03), as does its
+  did-not-execute twin RPC_S_CALL_FAILED_DNE. And a read-only tool that
+  loses the link mid-call now answers with the same readable reattach
+  message as a modifying one, not a raw COM error.
 
 ## [0.16.1] — 2026-10-15
 
