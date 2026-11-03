@@ -362,7 +362,8 @@ def _run_guarded(self, fn, *args, **kwargs):
                 # CommandInProgress makes out-of-process COM calls ~100x faster
                 # (upstream's pinned measurement), and a read that walks the tree
                 # makes thousands of them: list_features spent 16-21 s without it
-                # (journal through 2026-11-03). Snapshot and UI freeze stay skipped.
+                # (journal through 2026-11-03); a live A/B on a 93-feature part
+                # measured 4.1 s -> 0.3 s. Snapshot and UI freeze stay skipped.
                 busy = self._command_in_progress(True)
                 return fn(*args, **kwargs)
             except pythoncom.com_error as exc:

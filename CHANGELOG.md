@@ -10,7 +10,9 @@ All notable changes to this project are documented here. This project follows
   modifying calls always did. The flag makes out-of-process COM calls ~100x
   faster, and the heavy reads make thousands of them per call: the journal
   shows list_features at 16-21 s, read_sketch 12-19 s, list_equations up to
-  35 s with the flag skipped. The snapshot and UI freeze stay skipped.
+  35 s with the flag skipped. A live A/B on a 93-feature part: the same
+  per-feature walk took 4.1 s without the flag and 0.3 s with it. The
+  snapshot and UI freeze stay skipped.
 - The rbr tests take a mutex of their own instead of the live server's
   `Local\solidworks-mcp-rbr`: a test run during a long real call (an
   hour-long flow_solve) waited 30 s per guarded test and overwrote the
