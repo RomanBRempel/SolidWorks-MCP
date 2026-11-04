@@ -269,9 +269,15 @@ def _row(size: int, variables, f, values) -> list:
     return row
 
 
-def plan_chain(chain: Chain) -> ChainPlan:
-    """Relations and dimensions that remove every degree of freedom of the chain once."""
-    pts = chain.points
+def plan_chain(chain: Chain, origin_mm: tuple = (0.0, 0.0)) -> ChainPlan:
+    """Relations and dimensions that remove every degree of freedom of the chain once.
+
+    origin_mm is where the model origin lies in the sketch's coordinates — the
+    anchor relations and dimensions SolidWorks ties to it are decided relative
+    to that point, which sits away from the sketch's (0, 0) on a plane that
+    does not contain the model origin."""
+    u0, v0 = origin_mm
+    pts = [(p[0] - u0, p[1] - v0) for p in chain.points]
     size = 2 * len(pts)
     rank = _Rank()
 

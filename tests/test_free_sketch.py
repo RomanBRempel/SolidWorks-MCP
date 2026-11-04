@@ -128,6 +128,28 @@ def test_spline_points_are_dimensioned():
     assert plan.fully_defined
 
 
+def test_the_plan_anchors_to_where_the_model_origin_projects():
+    """SolidWorks ties origin relations and dimensions to the PROJECTED model
+    origin, which on a plane that does not contain it sits away from the
+    sketch's (0, 0): with origin_mm given, 'at zero' must mean 'at that
+    projection', or a u = 0 point gets tied to the projection and jumps."""
+    chain = build_chain([0, 20], [{"line": [15, 35]}])
+    plain = plan_chain(chain)
+    assert kinds(plain, "origin_x") == [("origin_x", 0)], "u = 0 anchors to the origin's vertical"
+    shifted = plan_chain(chain, origin_mm=(7.0, 0.0))
+    assert not kinds(shifted, "origin_x") and not kinds(shifted, "at_origin")
+    assert ("x", 0, pytest.approx(-7.0)) in [(d[0], d[1], d[2]) for d in shifted.dimensions]
+    assert shifted.fully_defined
+
+
+def test_a_point_on_the_projected_origin_is_tied_there():
+    chain = build_chain([5, 3], [{"line": [25, 3]}])
+    plan = plan_chain(chain, origin_mm=(5.0, 3.0))
+    assert kinds(plan, "at_origin") == [("at_origin", 0)]
+    assert kinds(plan, "horizontal") == [("horizontal", 0)]
+    assert plan.fully_defined
+
+
 def test_points_on_the_axes_get_relations_not_zero_dimensions():
     plan = plan_chain(build_chain([0, 10], [{"line": [30, 10]}, {"line": [30, 0]}, {"line": [0, 10]}]))
     assert ("origin_x", 0) in plan.relations and ("origin_y", 2) in plan.relations
