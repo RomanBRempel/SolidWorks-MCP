@@ -13,7 +13,8 @@ import functools
 import os
 
 from ..errors import SolidWorksError
-from . import equations, fastpath, flow, geom, guard, health, image, jobs, journal, library, script_tool, speed, tools
+from . import (equations, export_check, fastpath, flow, geom, guard, health, image, jobs, journal,
+               library, script_tool, speed, tools)
 
 __all__ = ["register"]
 
@@ -137,6 +138,44 @@ def _patch_screenshot():
     SolidWorksSession.screenshot = screenshot
 
 
+def _patch_export():
+    """A derived part saved to STEP right after its features were added gave an
+    EMPTY 4.5 KB file; ForceRebuild3 first, and the file is read back: a STEP
+    with no solid (while the part has bodies) or an STL with 0 triangles fails
+    loud instead of looking like a result."""
+    from ..session import SolidWorksSession
+    original = SolidWorksSession.export
+    if getattr(original, "_rbr_verified", False):
+        return
+
+    def export(self, path, file_format=None, quality: str = "fine", deviation_mm=None,
+               angle_deg=None, per_component: bool = False, _orig=original):
+        model = self._require_model()
+        try:
+            model.ForceRebuild3(False)
+        except Exception:  # noqa: BLE001 - a drawing refuses; the export may still be fine
+            pass
+        result = _orig(self, path, file_format, quality, deviation_mm, angle_deg, per_component)
+        fmt = (result or {}).get("format", "")
+        if fmt in ("step", "stp", "stl"):
+            try:
+                bodies = len(self._part_bodies()) if int(model.GetType()) == 1 else None
+            except Exception:  # noqa: BLE001
+                bodies = None
+            for file in result.get("files") or [result.get("path")]:
+                verdict = export_check.check(fmt, file, bodies)
+                if not verdict.get("ok"):
+                    raise SolidWorksError(f"{verdict['problem']} ({file})")
+                for key in ("solids_in_file", "triangles_in_file"):
+                    if key in verdict:
+                        result[key] = verdict[key]
+        return result
+
+    functools.update_wrapper(export, original)
+    export._rbr_verified = True
+    SolidWorksSession.export = export
+
+
 def _patch_set_equations():
     """A refused list names only the equation text; say which position failed too."""
     from ..session import SolidWorksSession
@@ -171,6 +210,7 @@ def register(server) -> None:
     _patch_new_documents()
     _patch_shell_check_result()
     _patch_screenshot()
+    _patch_export()
     _patch_set_equations()
 
     mcp, worker, session, call, com_error = (server.mcp, server._worker, server._session,
