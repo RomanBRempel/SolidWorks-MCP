@@ -184,10 +184,21 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         session.new_part()
         return session._model
 
+    def activate(title):
+        """Make an open document current by its title; returns its IModelDoc2.
+
+        Raw ActivateDoc3 answers a (doc, errors) tuple - calling methods on that
+        tuple fails - and does not update the server's current document; this
+        goes through session.activate_document (title with or without the
+        extension) and hands back the early-bound model.
+        """
+        session.activate_document(title)
+        return session._model
+
     ns.update(comp=comp, select=select, feature=feature, features=features, api=api, swapp=sw,
               vec=vec, pt=pt, ui_unlocked=ui_unlocked, tree_before=tree_before,
               features_added=features_added, rename_new=rename_new, combine=combine,
-              new_part=new_part,
+              new_part=new_part, activate=activate,
               mirror_body=lambda body, plane, merge=True: geom.mirror_body(session, body, plane, merge),
               whats_wrong=lambda: geom.whats_wrong(session))
     try:
