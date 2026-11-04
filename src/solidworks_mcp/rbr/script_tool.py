@@ -249,6 +249,7 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
               vec=vec, pt=pt, ui_unlocked=ui_unlocked, tree_before=tree_before,
               features_added=features_added, rename_new=rename_new, combine=combine,
               new_part=new_part, activate=activate, rays=rays,
+              export=lambda path, file_format=None, **kw: session.export(path, file_format, **kw),
               mirror_body=lambda body, plane, merge=True: geom.mirror_body(session, body, plane, merge),
               whats_wrong=lambda: geom.whats_wrong(session))
     try:
