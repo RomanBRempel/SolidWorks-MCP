@@ -13,12 +13,12 @@ import functools
 import os
 
 from ..errors import SolidWorksError
-from . import (equations, export_check, fastpath, features, flow, geom, guard, health, image, jobs, journal,
+from . import (cavity, equations, export_check, fastpath, features, flow, geom, guard, health, image, jobs, journal,
                library, offset_loop, param, script_tool, speed, tools)
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.6.0"
+RBR_VERSION = "1.7.0"
 
 INSTRUCTIONS = """
 
@@ -39,6 +39,7 @@ RBR extension (solidworks-mcp-rbr)
 - Flow Simulation on a saved part: flow_create_project(name, template) -> flow_add_boundary_condition(kind, faces, value) (an internal flow needs an inlet and a pressure condition on the inner faces of its lids) -> flow_add_goal(kind, faces) -> optionally flow_set_conditions -> flow_solve (detaches like run_script; get_job) -> flow_goals. Check each goal against a hand estimate (pressure drop, drag) as you would a mass.
 - More script names: vec(*doubles) / pt(x,y,z) (COM-ready VARIANTs), ui_unlocked() (lift the UI freeze for InsertSketch/EditSketch), tree_before() + features_added(before) + rename_new(before, name), combine(op, main, tools), mirror_body(body, plane, merge=True), whats_wrong(), new_part(), activate(title), rays(bodies, points, dirs), export(path, fmt), split_segment / trim_to_intersection (in the sketch being edited).
 - Parametric building on SolidWorks objects, no tool bodies: set_global / link_dimension / feature_dimensions; sketch_circles (also centred on a profile's mean line at a station) / sketch_rect; convert_entities, add_relation; offset_face_loop (a wall-thick contour inside a face, also where SolidWorks' own offset refuses); extrude_toward / cut_toward (explicit direction, depth / through_all / up_to, also one region of a sketch); plane_normal_to_line; mirror_features. Drive every size and position by a global variable.
+- A cavity following a curved skin, section by section: sketch_intersection(plane=..., body/faces) -> sketch_trim_region(sketch, keep_box) (one closed contour) -> sketch_offset_chain(sketch, wall_mm) (inside, original to construction) -> loft_cut([sections]) or cut_offset_from_surface(sketch, face, wall_mm, toward) ending a wall short of the skin; split_line_project(sketch, faces) cuts the skin patch such a cut ends on. Check region_area_mm2 and the removed volume against a hand estimate.
 """
 
 
@@ -626,6 +627,72 @@ def register(server) -> None:
         through combine_bodies (SolidWorks' own merge welded broken geometry) and warns when
         the volume did not roughly double."""
         return await call(geom.mirror_body, session, body, plane, merge)
+
+    # --- cavity along a skin (1.7.0) ---------------------------------------------------
+
+    @mcp.tool()
+    async def sketch_intersection(sketch: str | None = None, plane: str | None = None, faces: list | str | None = None,
+                                  body: str | None = None, name: str | None = None, detach: bool = True) -> dict:
+        """The curves where a sketch plane cuts faces or a body, as segments of a 2D sketch on that
+        plane: an existing sketch (sketch=) or a new one on plane= ('front', 'Plane5'). faces:
+        selectors ('#5', '+x', [x, y, z] mm on the face); default all faces of body (a list_bodies
+        name) or of every solid body. SolidWorks' 2D IntersectCurves creates nothing; this goes
+        through a 3D sketch (Sketch3DIntersections) and Convert Entities. detach=True frees the
+        curves for trimming (the helper 3D sketch is deleted, the curves stop following the skin);
+        detach=False keeps them linked (hidden helper) but untrimmable. Returns the segments, the
+        bounding box and region_area_mm2 of the largest closed contour."""
+        return await _timed(cavity.sketch_intersection, session, sketch, plane, faces, body, name, detach,
+                            timeout_s=300)
+
+    @mcp.tool()
+    async def sketch_trim_region(sketch: str, keep_box: dict | list, max_trims: int = 80) -> dict:
+        """Trim a sketch's curves (e.g. sketch_intersection's) to what lies inside keep_box and close
+        the cut with straight lines on its sides: ONE closed contour. keep_box in MODEL mm:
+        {'x': [-114, 114]} (any of x/y/z, None for an open side) or two corners [[x1, y1, z1],
+        [x2, y2, z2]]. The curve keeps its part inside the box, a side line its part inside the
+        curve. Refuses (ok=false) when the result is not one region. Returns region_area_mm2,
+        region_point_mm and the segments."""
+        return await _timed(cavity.sketch_trim_region, session, sketch, keep_box, max_trims, timeout_s=300)
+
+    @mcp.tool()
+    async def sketch_offset_chain(sketch: str, distance_mm: float, inward: bool = True,
+                                  original_to_construction: bool = True, link_to: str | None = None) -> dict:
+        """Offset a sketch's closed contour as one chain (SketchOffset2) distance_mm inside (inward)
+        or outside, the side checked against the contour (a wrong-side offset is redone the other
+        way), and make the original construction geometry. One offset dimension comes back;
+        link_to: a global variable to drive it. wall_mm gives the measured min/max distance."""
+        return await _timed(cavity.sketch_offset_chain, session, sketch, distance_mm, inward,
+                            original_to_construction, link_to, timeout_s=300)
+
+    @mcp.tool()
+    async def split_line_project(sketch: str, faces: list | str, directional: bool = False, flip: bool = False,
+                                 name: str | None = None) -> dict:
+        """Split faces along a sketch projected onto them (Split Line, projection), e.g. a cavity
+        contour onto the skin. faces: selectors ('#5', '+z', [x, y, z] mm on the face).
+        directional=True projects one way (flip: the other). The new feature and the face count
+        before/after prove it (SolidWorks answers None either way)."""
+        return await _timed(cavity.split_line_project, session, sketch, faces, directional, flip, name,
+                            timeout_s=300)
+
+    @mcp.tool()
+    async def loft_cut(sketches: list, guides: list | None = None, closed: bool = False,
+                       name: str = "Loft-Cut") -> dict:
+        """Cut a loft through existing sketches in the given order (each one closed contour, e.g.
+        sections from sketch_intersection -> sketch_trim_region -> sketch_offset_chain); guides:
+        guide-curve sketches. Returns removed_mm3; a loft that removes nothing is rolled back."""
+        return await _timed(cavity.loft_cut, session, sketches, guides, closed, name, timeout_s=300)
+
+    @mcp.tool()
+    async def cut_offset_from_surface(sketch: str, face: str | list, offset_mm: float, toward: list,
+                                      offset_reverse: bool = False, translate: bool = False,
+                                      region_point_mm: list | None = None, name: str | None = None) -> dict:
+        """Cut a sketch toward [x, y, z] ending offset_mm short of a face (end condition 'offset
+        from surface'): a pocket keeping a wall under a curved skin - also a patch a split line
+        cut out. face: '#5' / '+z' or [x, y, z] mm on it. offset_reverse: end beyond the face;
+        translate: a flat end parallel-shifted instead of the face's offset shape.
+        region_point_mm: one region of the sketch. The offset is dimensions.offset."""
+        return await _timed(cavity.cut_offset_from_surface, session, sketch, face, offset_mm, toward,
+                            offset_reverse, translate, region_point_mm, name, timeout_s=300)
 
     # --- Flow Simulation ---------------------------------------------------------------
 
