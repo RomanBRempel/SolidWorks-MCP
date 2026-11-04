@@ -19,6 +19,8 @@ from .. import binding
 from ..constants import (SW_END_COND_BLIND, SW_END_COND_THROUGH_ALL, SW_END_COND_UP_TO_SURFACE,
                          SW_START_SKETCH_PLANE)
 from ..errors import SolidWorksError
+
+SW_END_COND_OFFSET_FROM_SURFACE = 5  # swEndConditions_e: the face selected with mark 1, D1 short of it
 from ..units import m_to_mm, mm_to_m
 from . import offset_loop
 
@@ -54,8 +56,16 @@ def reverse_flag(toward, normal, cut: bool) -> bool:
     return along_normal if cut else not along_normal
 
 
-def end_condition(depth_mm, through_all: bool, up_to) -> tuple:
-    """(T1, D1 in m) for the end condition; pure, unit-tested. Exactly one given."""
+def end_condition(depth_mm, through_all: bool, up_to, offset_mm=None) -> tuple:
+    """(T1, D1 in m) for the end condition; pure, unit-tested. Exactly one given.
+
+    up_to with offset_mm: offset from that surface (end condition 5), the
+    feature stopping offset_mm short of the face (or past it, offset_reverse)."""
+    if offset_mm is not None:
+        if up_to is None:
+            raise SolidWorksError("offset_mm needs up_to: the face the offset is measured from.")
+        if offset_mm <= 0:
+            raise SolidWorksError(f"offset_mm must be > 0 (got {offset_mm}); offset_reverse picks the side.")
     given = sum(x is not None and x is not False for x in (depth_mm, through_all or None, up_to))
     if given != 1:
         raise SolidWorksError("Give exactly one of depth_mm, through_all=True or up_to (a face).")
@@ -65,6 +75,8 @@ def end_condition(depth_mm, through_all: bool, up_to) -> tuple:
         return SW_END_COND_BLIND, mm_to_m(depth_mm)
     if through_all:
         return SW_END_COND_THROUGH_ALL, 0.0
+    if offset_mm is not None:
+        return SW_END_COND_OFFSET_FROM_SURFACE, mm_to_m(offset_mm)
     return SW_END_COND_UP_TO_SURFACE, 0.0
 
 
@@ -107,13 +119,14 @@ def _select_profile(session, model, feature, frame, region_point_mm):
 
 
 def _make(session, sketch: str, cut: bool, toward, depth_mm, through_all, up_to,
-          merge: bool, region_point_mm, name: str | None) -> dict:
+          merge: bool, region_point_mm, name: str | None, offset_mm=None,
+          offset_reverse: bool = False, translate: bool = False) -> dict:
     model = session._require_model()
     session._require_part()
     feature = session._sketch_by_name(sketch)
     frame = sketch_frame(session, feature)
     reverse = reverse_flag(toward, frame["normal"], cut)
-    t1, d1 = end_condition(depth_mm, through_all, up_to)
+    t1, d1 = end_condition(depth_mm, through_all, up_to, offset_mm)
     face = _face_of(session, up_to) if up_to is not None else None
     bodies_before = {b.Name for b in session._part_bodies()}
     volume_before = _volume_mm3(session)
@@ -128,12 +141,13 @@ def _make(session, sketch: str, cut: bool, toward, depth_mm, through_all, up_to,
     if cut:
         made = fm.FeatureCut4(True, False, reverse, t1, 0, d1, 0.0,
                               False, False, False, False, 0.0, 0.0,
-                              False, False, False, False, False, True, True, False, False, False,
+                              bool(offset_reverse), False, bool(translate), False, False, True, True,
+                              False, False, False,
                               SW_START_SKETCH_PLANE, 0.0, False, False)
     else:
         made = fm.FeatureExtrusion3(True, False, reverse, t1, 0, d1, 0.0,
                                     False, False, False, False, 0.0, 0.0,
-                                    False, False, False, False, bool(merge), True, True,
+                                    bool(offset_reverse), False, bool(translate), False, bool(merge), True, True,
                                     SW_START_SKETCH_PLANE, 0.0, False)
     model.ClearSelection2(True)
     kind = "cut" if cut else "extrusion"
@@ -154,7 +168,8 @@ def _make(session, sketch: str, cut: bool, toward, depth_mm, through_all, up_to,
     if not cut and merge and changed <= 1e-6 and not new_bodies:
         raise SolidWorksError(f"The extrusion toward {list(toward)} added no material. Rolled back.")
     result["volume_change_mm3"] = round(-changed if cut else changed, 3)
-    result["dimensions"] = {"depth": f"D1@{result['feature']}"} if t1 == SW_END_COND_BLIND else {}
+    result["dimensions"] = ({"depth": f"D1@{result['feature']}"} if t1 == SW_END_COND_BLIND else
+                            {"offset": f"D1@{result['feature']}"} if t1 == SW_END_COND_OFFSET_FROM_SURFACE else {})
     if region is not None:
         result["region_area_mm2"] = round(offset_loop.polygon_area(region["polygon"]) * 1e6, 3)
     if not merge and new_bodies:
@@ -163,12 +178,16 @@ def _make(session, sketch: str, cut: bool, toward, depth_mm, through_all, up_to,
 
 
 def extrude(session, sketch: str, toward, depth_mm=None, through_all: bool = False, up_to=None,
-            merge: bool = True, region_point_mm=None, name: str | None = None) -> dict:
+            merge: bool = True, region_point_mm=None, name: str | None = None, offset_mm=None,
+            offset_reverse: bool = False, translate: bool = False) -> dict:
     """Boss-extrude a sketch (or the region of it around region_point_mm) toward a model direction."""
-    return _make(session, sketch, False, toward, depth_mm, through_all, up_to, merge, region_point_mm, name)
+    return _make(session, sketch, False, toward, depth_mm, through_all, up_to, merge, region_point_mm, name,
+                 offset_mm, offset_reverse, translate)
 
 
 def cut(session, sketch: str, toward, depth_mm=None, through_all: bool = False, up_to=None,
-        region_point_mm=None, name: str | None = None) -> dict:
+        region_point_mm=None, name: str | None = None, offset_mm=None,
+        offset_reverse: bool = False, translate: bool = False) -> dict:
     """Cut-extrude a sketch (or the region of it around region_point_mm) toward a model direction."""
-    return _make(session, sketch, True, toward, depth_mm, through_all, up_to, True, region_point_mm, name)
+    return _make(session, sketch, True, toward, depth_mm, through_all, up_to, True, region_point_mm, name,
+                 offset_mm, offset_reverse, translate)

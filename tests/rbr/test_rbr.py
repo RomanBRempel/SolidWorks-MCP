@@ -36,6 +36,35 @@ def test_rollback_removes_only_what_the_call_added(fake_session):
     assert [f.Name for f in fake_session._history()] == ["Sketch1", "Boss1"]
 
 
+def test_rollback_keeps_an_older_sketch_a_new_feature_absorbed(fake_session):
+    # a split line made from a person's sketch, then a failing step in the same call
+    snap = fake_session._history_snapshot()
+    fake_session._model.add("Split1")
+    fake_session._model.absorb("Split1", "Sketch1")
+    assert fake_session._roll_back(snap) == []
+    assert [f.Name for f in fake_session._history()] == ["Sketch1", "Boss1"]
+    assert fake_session._model.delete_options[0] == 0  # deleted alone, not with what it absorbed
+
+
+def test_rollback_takes_a_new_features_new_sketch_with_it(fake_session):
+    snap = fake_session._history_snapshot()
+    fake_session._model.add("Sketch2")
+    fake_session._model.add("Cut1")
+    fake_session._model.absorb("Cut1", "Sketch2")
+    assert fake_session._roll_back(snap) == []
+    assert [f.Name for f in fake_session._history()] == ["Sketch1", "Boss1"]
+    assert fastpath.SW_DELETE_ABSORBED in fake_session._model.delete_options
+
+
+def test_rollback_of_a_loft_over_old_and_new_sketches(fake_session):
+    snap = fake_session._history_snapshot()
+    fake_session._model.add("Sketch2")
+    fake_session._model.add("Loft1")
+    fake_session._model.absorb("Loft1", "Sketch1", "Sketch2")
+    assert fake_session._roll_back(snap) == []
+    assert [f.Name for f in fake_session._history()] == ["Sketch1", "Boss1"]
+
+
 def test_rollback_noop_when_nothing_added(fake_session):
     snap = fake_session._history_snapshot()
     assert fake_session._roll_back(snap) == []
@@ -182,7 +211,9 @@ def test_register_adds_tools_without_touching_upstream(swmcp_home):
                 "assembly_bom", "server_health", "release_ui", "release_document", "shell_check",
                 "set_global", "link_dimension", "feature_dimensions", "sketch_circles", "sketch_rect",
                 "convert_entities", "add_relation", "offset_face_loop", "extrude_toward", "cut_toward",
-                "plane_normal_to_line", "mirror_features", "mirror_body"} <= new
+                "plane_normal_to_line", "mirror_features", "mirror_body",
+                "sketch_intersection", "sketch_trim_region", "sketch_offset_chain", "split_line_project",
+                "loft_cut", "cut_offset_from_surface"} <= new
         assert before <= after  # every upstream tool still there
     finally:
         # register() patches SolidWorksSession itself: undo, or the journal-wrapped

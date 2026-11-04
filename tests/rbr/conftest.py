@@ -66,6 +66,18 @@ class FakeFeature:
         self.model.selected.append(self)
         return True
 
+    # absorbed features (a cut's sketch): GetFeatures(True) still lists them in place
+    absorbed = ()
+    parent = None
+
+    def GetFirstSubFeature(self):
+        return self.absorbed[0] if self.absorbed else None
+
+    def GetNextSubFeature(self):
+        siblings = list(self.parent.absorbed) if self.parent is not None else []
+        i = siblings.index(self) if self in siblings else -1
+        return siblings[i + 1] if 0 <= i < len(siblings) - 1 else None
+
 
 class FakeFeatureManager:
     def __init__(self, model):
@@ -101,11 +113,22 @@ class FakeModel:
     def GraphicsRedraw2(self):
         self.redraws += 1
 
-    def _delete(self, *a):
+    def _delete(self, option=0, *a):
+        self.delete_options = getattr(self, "delete_options", []) + [option]
         for f in self.selected:
             self.features.remove(f)
+            for sub in f.absorbed:
+                if option & 2 and sub in self.features:  # SW_DELETE_ABSORBED: the sketches go too
+                    self.features.remove(sub)
+                sub.parent = None
         self.selected = []
         return True
+
+    def absorb(self, owner: str, *subs: str) -> None:
+        by_name = {f.Name: f for f in self.features}
+        by_name[owner].absorbed = tuple(by_name[s] for s in subs)
+        for s in subs:
+            by_name[s].parent = by_name[owner]
 
     def GetType(self):
         return 1

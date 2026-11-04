@@ -5,6 +5,20 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Added
+- rbr 1.7.0, a cavity that follows a curved skin: sketch_intersection
+  (plane x faces/body -> sketch curves; SolidWorks' 2D IntersectCurves
+  creates nothing, so it goes through Sketch3DIntersections in a helper 3D
+  sketch and Convert Entities), sketch_trim_region (trim to a box, close
+  with lines on its sides: one contour), sketch_offset_chain (closed chain
+  offset with its side checked, original to construction), split_line_project
+  (InsertSplitLineProject wants the sketch at selection mark 4, the faces at
+  mark 1), loft_cut (InsertCutBlend over existing sketches, guides optional)
+  and cut_offset_from_surface (end condition 5, also on a split-line patch).
+  extrude_toward / cut_toward's functions take offset_mm with up_to too.
+  A refused offset-from-surface end names the faces the profile meets
+  (one face must cover it).
+
 ### Changed
 - Read-only tools now run with CommandInProgress set (restored after), like
   modifying calls always did. The flag makes out-of-process COM calls ~100x
@@ -19,6 +33,11 @@ All notable changes to this project are documented here. This project follows
   server's lock.json holder record.
 
 ### Fixed
+- A failed call's rollback deleted each new feature with what it absorbed,
+  so a sketch that existed before the call went too when the call's new
+  feature had consumed it (a split line made from a person's sketch, then a
+  refused cut in the same call). Such a feature is now deleted alone and the
+  sketch handed back; new absorbed features go in a second pass.
 - add_sketch, sketch_circles and sketch_rect anchored a zero coordinate to
   the sketch's (0, 0), but SolidWorks ties origin relations and dimensions
   to the projected model origin: on a plane that does not contain the model

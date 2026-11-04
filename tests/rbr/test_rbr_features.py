@@ -40,3 +40,12 @@ def test_end_condition_wants_exactly_one():
         features.end_condition(5, True, None)
     with pytest.raises(SolidWorksError, match="> 0"):
         features.end_condition(-1, False, None)
+
+
+def test_end_condition_offset_from_surface():
+    assert features.end_condition(None, False, "+z", 6.0) == (features.SW_END_COND_OFFSET_FROM_SURFACE,
+                                                               pytest.approx(0.006))
+    with pytest.raises(SolidWorksError, match="needs up_to"):
+        features.end_condition(None, False, None, 6.0)
+    with pytest.raises(SolidWorksError, match="> 0"):
+        features.end_condition(None, False, "+z", 0.0)
