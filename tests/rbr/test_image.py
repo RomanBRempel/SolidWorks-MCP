@@ -61,3 +61,25 @@ def test_is_blank_file_reads_from_disk(tmp_path):
     path.write_bytes(_png(4, 1, [white]))
     assert image.is_blank_file(str(path)) is True
     assert image.is_blank_file(str(tmp_path / "missing.png")) is None
+
+
+def test_one_bit_greyscale_blank_and_not():
+    # SolidWorks saves the empty graphics buffer as a 1-BIT greyscale PNG
+    # (1126 bytes, w 1305 x h 816, verified live on SW 2025): all-ones rows
+    all_white = bytes([0b11111111, 0b11100000])  # 11 pixels wide -> 5 padding bits
+    assert image.is_blank_png(_png(11, 3, [all_white] * 3, colour=0, depth=1)) is True
+    spot = bytes([0b11111011, 0b11100000])
+    assert image.is_blank_png(_png(11, 3, [all_white, spot, all_white], colour=0, depth=1)) is False
+
+
+def test_two_and_four_bit_palette():
+    row4 = bytes([0x22, 0x22])  # 4 pixels of palette index 2
+    assert image.is_blank_png(_png(4, 2, [row4, row4], colour=3, depth=4)) is True
+    row4b = bytes([0x22, 0x27])
+    assert image.is_blank_png(_png(4, 2, [row4, row4b], colour=3, depth=4)) is False
+
+
+def test_one_bit_rows_with_filters():
+    row = bytes([0b00000000, 0b00000000])
+    up = bytes([0, 0])  # Up filter: same as the row above
+    assert image.is_blank_png(_png(16, 2, [row, up], colour=0, depth=1, filters=[0, 2])) is True
