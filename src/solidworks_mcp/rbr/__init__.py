@@ -13,12 +13,12 @@ import functools
 import os
 
 from ..errors import SolidWorksError
-from . import (equations, export_check, fastpath, flow, geom, guard, health, image, jobs, journal,
-               library, script_tool, speed, tools)
+from . import (equations, export_check, fastpath, features, flow, geom, guard, health, image, jobs, journal,
+               library, offset_loop, param, script_tool, speed, tools)
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.5.1"
+RBR_VERSION = "1.6.0"
 
 INSTRUCTIONS = """
 
@@ -37,7 +37,8 @@ RBR extension (solidworks-mcp-rbr)
 - server_health warns when open documents or SLDWORKS.exe memory run high; close_hidden_documents(keep=[...]) closes the invisible, saved, unowned ones.
 - check_containment(envelope, keepout) measures how much of each body sits inside another part's envelope body (master-model parts sharing an origin).
 - Flow Simulation on a saved part: flow_create_project(name, template) -> flow_add_boundary_condition(kind, faces, value) (an internal flow needs an inlet and a pressure condition on the inner faces of its lids) -> flow_add_goal(kind, faces) -> optionally flow_set_conditions -> flow_solve (detaches like run_script; get_job) -> flow_goals. Check each goal against a hand estimate (pressure drop, drag) as you would a mass.
-- More script names: vec(*doubles) / pt(x,y,z) (COM-ready VARIANTs), ui_unlocked() (lift the UI freeze for InsertSketch/EditSketch), tree_before() + features_added(before) + rename_new(before, name), combine(op, main, tools), mirror_body(body, plane, merge=True), whats_wrong().
+- More script names: vec(*doubles) / pt(x,y,z) (COM-ready VARIANTs), ui_unlocked() (lift the UI freeze for InsertSketch/EditSketch), tree_before() + features_added(before) + rename_new(before, name), combine(op, main, tools), mirror_body(body, plane, merge=True), whats_wrong(), new_part(), activate(title), rays(bodies, points, dirs), export(path, fmt), split_segment / trim_to_intersection (in the sketch being edited).
+- Parametric building on SolidWorks objects, no tool bodies: set_global / link_dimension / feature_dimensions; sketch_circles (also centred on a profile's mean line at a station) / sketch_rect; convert_entities, add_relation; offset_face_loop (a wall-thick contour inside a face, also where SolidWorks' own offset refuses); extrude_toward / cut_toward (explicit direction, depth / through_all / up_to, also one region of a sketch); plane_normal_to_line; mirror_features. Drive every size and position by a global variable.
 """
 
 
@@ -334,6 +335,19 @@ def register(server) -> None:
         combine(op, main, tools) joins bodies the proven way; mirror_body(body, plane,
         merge=True) mirrors without SolidWorks' broken Merge and welds afterwards;
         whats_wrong() lists SolidWorks' rebuild errors when an Insert* returned None.
+        new_part() / activate(title) return the IModelDoc2 (raw NewDocument from a script gets
+        an empty template path; ActivateDoc3 answers a tuple); rays(bodies, points, dirs) casts
+        RayIntersections with the bodies as the VARIANT array it needs; export(path, fmt)
+        rebuilds first and checks the file; split_segment(seg, point_mm) and
+        trim_to_intersection(seg, pick_mm) edit the sketch being edited (not offset or
+        converted curves: SolidWorks keeps those whole). The parametric tools are here too:
+        set_global, link_dimension, feature_dimensions, sketch_circles, sketch_rect,
+        convert_entities, add_relation, offset_face_loop, extrude_toward, cut_toward,
+        plane_normal_to_line, mirror_features.
+        IModeler.CreateBodyFromBox3(data) - only for helper calculations, never as a tool body in
+        a part - reads data = [x, y, z, dx, dy, dz, width, length, height] (m): (x, y, z) is the
+        CENTRE OF THE BOTTOM FACE, (dx, dy, dz) the direction of the HEIGHT; then width runs
+        along Z, length along Y, height along that direction (verified on SW 2025).
         COM rules: methods with out-parameters return a tuple (retval, out1, out2...):
         unpack it, do not call methods on it; objects from Get* calls are often raw
         dispatches: wrap(x, mod.IFeature) etc. before using them; lengths in metres.
@@ -499,6 +513,119 @@ def register(server) -> None:
         inside and the mm^3 sticking out, via intersections of copies (the parts are untouched).
         Both parts must share their origin, as master-model parts built from one skeleton do."""
         return await _timed(geom.check_containment, session, envelope, keepout, timeout_s=600)
+
+    # --- parametric building on SolidWorks objects ---------------------------------
+
+    @mcp.tool()
+    async def set_global(name: str, value: float | str) -> dict:
+        """Add or change a global variable: a number (mm / deg) or an expression of other
+        variables ('TIP_WALL * 2'). Rebuilds; failing_features names what broke."""
+        return await call(param.set_global, session, name, value)
+
+    @mcp.tool()
+    async def link_dimension(dimension: str, expression: str) -> dict:
+        """Drive a dimension by global variables: dimension is its full name ('D1@PL_X550',
+        'diameter1@SK_BOSS' - feature_dimensions lists them), expression e.g. 'TIP_WALL',
+        'INS_DEPTH + 2', 'abs(INS_Z1)'; bare variable names are quoted for you."""
+        return await call(param.link_dimension, session, dimension, expression)
+
+    @mcp.tool()
+    async def feature_dimensions(feature: str | None = None) -> dict:
+        """Dimensions of a feature and of the sketches it absorbed (or of every feature):
+        full name for link_dimension, value, unit, driving, and the equation driving it."""
+        return await call(param.feature_dimensions, session, feature)
+
+    @mcp.tool()
+    async def sketch_circles(on: str, circles: list, name: str | None = None,
+                             profile_face: str | None = None) -> dict:
+        """A fully defined sketch of circles on a plane ('front'/'top'/'right' or a tree plane
+        such as 'PL_X550') or a face ('+x', '#5', '@x,y,z').
+
+        circles: [{"diameter_mm": 3.2, "center_mm": [x, y, z], "vars": {"diameter": "SCREW_D",
+        "X": "SCREW_X", "Z": "INS_Z1"}}] - or a centre on the profile's MEAN LINE:
+        {"diameter_mm": 10.7, "midline": {"axis": "Z", "station_mm": -382}, "vars":
+        {"diameter": "INS_BOSS_D", "station": "INS_Z1"}}: a construction chord across
+        profile_face's outer loop (converted) at that station, the centre at its midpoint, so
+        the hole follows the profile. vars keys: diameter, station, x / y (sketch axes) or X / Y /
+        Z (model axes); positions are linked as abs(expr). Then extrude_toward / cut_toward."""
+        return await call(param.sketch_circles, session, on, circles, name, profile_face)
+
+    @mcp.tool()
+    async def sketch_rect(on: str, corner_mm: list, width_mm: float, height_mm: float,
+                          name: str | None = None, vars: dict | None = None) -> dict:
+        """A fully defined rectangle on a plane or face: corner_mm (model space), width along
+        the sketch x, height along its y (negative: the other way). Dimensions width, height,
+        x, y (corner from the origin); vars links them, also by model axis ('X': 'SLOT_X')."""
+        return await call(param.sketch_rect, session, on, corner_mm, width_mm, height_mm, name, vars)
+
+    @mcp.tool()
+    async def convert_entities(sketch: str | None = None, on: str | None = None, face: str | None = None,
+                               edges: list | None = None, construction: bool = True) -> dict:
+        """Convert a face's outer loop (face='+x' / '#5' / '@x,y,z') or edges (list_edges
+        indices) into an existing sketch (sketch=) or a new one on a plane or face (on=).
+        construction=True keeps them as reference geometry. Returns their segment indices."""
+        return await call(param.convert_entities, session, sketch, on, face, edges, construction)
+
+    @mcp.tool()
+    async def add_relation(sketch: str, kind: str, entities: list) -> dict:
+        """Add a sketch relation: kind coincident / on_edge (point onto a curve) / midpoint
+        (point, line) / horizontal / vertical / tangent / parallel / perpendicular / concentric /
+        collinear / coradial / at_intersection / fixed. entities: '#3' (segment, read_sketch
+        order), '#3.start' / '#3.end' / '#3.center', 'origin'. Says whether it is fully defined."""
+        return await call(param.add_relation, session, sketch, kind, entities)
+
+    @mcp.tool()
+    async def offset_face_loop(face: str, distance_mm: float, inward: bool = True,
+                               link_to: str | None = None, name: str | None = None) -> dict:
+        """A closed contour distance_mm inside (or outside) a planar face's outer edge loop, as a
+        new sketch on the face - also where SolidWorks' own closed Offset Entities refuses
+        because the material is thinner than two offsets (a thin trailing edge). Each edge is
+        converted (construction) and offset on its own, a collapsed offset is dropped, and the
+        contour is the sketch REGION the offsets close: no trimming, so the offsets stay linked.
+        link_to: a global variable driving every offset dimension. Returns region_point_mm:
+        pass it to cut_toward(sketch, toward, depth_mm, region_point_mm=...)."""
+        return await call(offset_loop.offset_face_loop, session, face, distance_mm, inward, link_to, name)
+
+    @mcp.tool()
+    async def extrude_toward(sketch: str, toward: list, depth_mm: float | None = None,
+                             through_all: bool = False, up_to: str | list | None = None,
+                             merge: bool = True, region_point_mm: list | None = None,
+                             name: str | None = None) -> dict:
+        """Boss-extrude a sketch toward a model direction [x, y, z] (where the material goes; no
+        Dir/Flip guessing): depth_mm, through_all, or up_to a face ('+x', '#5', [x, y, z] on it).
+        region_point_mm extrudes only the closed region of the sketch around that point.
+        merge=False keeps a separate body. The depth comes back as dimensions.depth."""
+        return await call(features.extrude, session, sketch, toward, depth_mm, through_all, up_to, merge,
+                          region_point_mm, name)
+
+    @mcp.tool()
+    async def cut_toward(sketch: str, toward: list, depth_mm: float | None = None, through_all: bool = False,
+                         up_to: str | list | None = None, region_point_mm: list | None = None,
+                         name: str | None = None) -> dict:
+        """Cut-extrude a sketch toward a model direction [x, y, z] (into the material): depth_mm,
+        through_all, or up_to a face. region_point_mm cuts only the closed region around that
+        point (e.g. offset_face_loop's contour). A cut that removes nothing is rolled back."""
+        return await call(features.cut, session, sketch, toward, depth_mm, through_all, up_to,
+                          region_point_mm, name)
+
+    @mcp.tool()
+    async def plane_normal_to_line(sketch: str, segment: int, at: str = "start", name: str | None = None) -> dict:
+        """A reference plane perpendicular to line #segment of a sketch, through its start or
+        end point - to sketch a hole whose axis is that line (a hinge axis at an angle)."""
+        return await call(param.plane_normal_to_line, session, sketch, segment, at, name)
+
+    @mcp.tool()
+    async def mirror_features(features: list, plane: str, name: str = "Mirror") -> dict:
+        """Mirror features (list_features names, not bodies) about 'front' / 'top' / 'right' or
+        any plane of the part. The copies follow their seeds' dimensions."""
+        return await call(param.mirror_features, session, features, plane, name)
+
+    @mcp.tool()
+    async def mirror_body(body: str, plane: str, merge: bool = True) -> dict:
+        """Mirror one solid body (its list_bodies name) about a plane; merge joins the copy
+        through combine_bodies (SolidWorks' own merge welded broken geometry) and warns when
+        the volume did not roughly double."""
+        return await call(geom.mirror_body, session, body, plane, merge)
 
     # --- Flow Simulation ---------------------------------------------------------------
 
