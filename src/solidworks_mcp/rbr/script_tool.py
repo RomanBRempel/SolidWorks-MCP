@@ -19,7 +19,7 @@ import win32com.client
 from .. import binding
 from ..constants import RAY_HIT_WIDTH, SW_RAY_NORMALS_ENTRY_EXIT
 from ..errors import SolidWorksError
-from . import geom, journal
+from . import features, geom, journal, offset_loop, param, sketch_edit
 
 SW_DOC_PART = 1
 SW_DOC_ASSEMBLY = 2
@@ -250,6 +250,26 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
               features_added=features_added, rename_new=rename_new, combine=combine,
               new_part=new_part, activate=activate, rays=rays,
               export=lambda path, file_format=None, **kw: session.export(path, file_format, **kw),
+              split_segment=lambda segment, point_mm, space="model": sketch_edit.split_segment(
+                  session, segment, point_mm, space),
+              trim_to_intersection=lambda segment, pick_mm, space="model": sketch_edit.trim_to_intersection(
+                  session, segment, pick_mm, space),
+              set_global=lambda name, value: param.set_global(session, name, value),
+              link_dimension=lambda dimension, expression: param.link_dimension(session, dimension, expression),
+              feature_dimensions=lambda feature=None: param.feature_dimensions(session, feature),
+              sketch_circles=lambda on, circles, name=None, profile_face=None: param.sketch_circles(
+                  session, on, circles, name, profile_face),
+              sketch_rect=lambda on, corner_mm, width_mm, height_mm, name=None, vars=None: param.sketch_rect(
+                  session, on, corner_mm, width_mm, height_mm, name, vars),
+              convert_entities=lambda **kw: param.convert_entities(session, **kw),
+              add_relation=lambda sketch, kind, entities: param.add_relation(session, sketch, kind, entities),
+              offset_face_loop=lambda face, distance_mm, inward=True, link_to=None, name=None:
+                  offset_loop.offset_face_loop(session, face, distance_mm, inward, link_to, name),
+              extrude_toward=lambda sketch, toward, **kw: features.extrude(session, sketch, toward, **kw),
+              cut_toward=lambda sketch, toward, **kw: features.cut(session, sketch, toward, **kw),
+              plane_normal_to_line=lambda sketch, segment, at="start", name=None: param.plane_normal_to_line(
+                  session, sketch, segment, at, name),
+              mirror_features=lambda feats, plane, name="Mirror": param.mirror_features(session, feats, plane, name),
               mirror_body=lambda body, plane, merge=True: geom.mirror_body(session, body, plane, merge),
               whats_wrong=lambda: geom.whats_wrong(session))
     try:

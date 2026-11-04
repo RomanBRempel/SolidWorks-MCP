@@ -179,7 +179,10 @@ def test_register_adds_tools_without_touching_upstream(swmcp_home):
         assert {"run_script", "run_saved_script", "list_scripts", "get_script", "save_script", "get_journal",
                 "tool_source", "set_units", "get_custom_properties", "set_custom_properties",
                 "list_configurations", "activate_configuration", "add_configuration", "export_face_dxf",
-                "assembly_bom", "server_health", "release_ui", "release_document", "shell_check"} <= new
+                "assembly_bom", "server_health", "release_ui", "release_document", "shell_check",
+                "set_global", "link_dimension", "feature_dimensions", "sketch_circles", "sketch_rect",
+                "convert_entities", "add_relation", "offset_face_loop", "extrude_toward", "cut_toward",
+                "plane_normal_to_line", "mirror_features", "mirror_body"} <= new
         assert before <= after  # every upstream tool still there
     finally:
         # register() patches SolidWorksSession itself: undo, or the journal-wrapped
@@ -188,7 +191,7 @@ def test_register_adds_tools_without_touching_upstream(swmcp_home):
         guard.unapply()
         speed.unapply()
         fastpath.unapply()
-        for name in ("new_part", "new_assembly", "add_shell"):  # each carries its original
+        for name in ("new_part", "new_assembly", "add_shell", "export"):  # each carries its original
             fn = getattr(SolidWorksSession, name)
             if hasattr(fn, "__wrapped__"):
                 setattr(SolidWorksSession, name, fn.__wrapped__)
