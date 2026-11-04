@@ -99,38 +99,76 @@ def _patch_shell_check_result():
     SolidWorksSession.add_shell = add_shell
 
 
+SW_WINDOW_MAXIMIZED = 1  # swWindowState_e, read from swconst.tlb of SW 2025
+SW_WINDOW_MINIMIZED = 2
+SW_DONT_REBUILD_ON_ACTIVATE = 2  # swRebuildOnActivation_e
+
+
 def _patch_screenshot():
-    """SaveAs3 grabs the graphics buffer: a minimised or covered SolidWorks yields a solid
-    white frame that looks like a result. Front the document inside SolidWorks first, and
-    flag the capture with blank=true when every pixel still came out one colour."""
+    """SaveAs3 grabs the graphics buffer: a minimised SolidWorks, a minimised
+    document window or a never-shown document yields a solid one-colour frame
+    (1126 bytes) that looks like a result. Restore the windows, front the
+    document, redraw, retake once - and FAIL LOUD (file deleted) when the
+    picture still comes out blank, instead of handing the blank back."""
     from ..session import SolidWorksSession
     original = SolidWorksSession.screenshot
     if getattr(original, "_rbr_blank_checked", False):
         return
 
+    def _front_and_redraw(self) -> None:
+        model = self._require_model()
+        sw = self._sw
+        if not sw.Visible:
+            sw.Visible = True
+        if int(sw.FrameState) == SW_WINDOW_MINIMIZED:
+            sw.FrameState = SW_WINDOW_MAXIMIZED
+        sw.ActivateDoc3(model.GetTitle(), False, SW_DONT_REBUILD_ON_ACTIVATE, 0)
+        frame = binding_wrap(self, sw.Frame(), "IFrame")
+        if frame is not None:
+            try:
+                for window in frame.ModelWindows or ():
+                    win = binding_wrap(self, window, "IModelWindow")
+                    doc = binding_wrap(self, win.ModelDoc, "IModelDoc2")
+                    if doc is not None and doc.GetTitle() == model.GetTitle():
+                        win.RestoreFromMinimize()
+            except Exception:  # noqa: BLE001 - not every build exposes the model windows
+                pass
+        model.GraphicsRedraw2()
+
+    def binding_wrap(self, obj, interface):
+        from .. import binding
+        try:
+            return binding.wrap(obj, getattr(self._mod, interface))
+        except Exception:  # noqa: BLE001
+            return None
+
     def screenshot(self, path: str, view: str = "iso", zoom_mm: list | None = None,
                    show_planes: bool = False, from_dir: list | None = None, _orig=original):
         try:
-            model = self._require_model()
-            self._sw.ActivateDoc3(model.GetTitle(), False, 2, 0)
-            model.GraphicsRedraw2()
+            _front_and_redraw(self)
         except Exception:  # noqa: BLE001 - fronting is best-effort; the capture may still work
             pass
         result = _orig(self, path, view, zoom_mm, show_planes, from_dir)
         blank = image.is_blank_file(path) if str(path).lower().endswith(".png") else None
         if blank:
             try:
-                self._require_model().GraphicsRedraw2()
+                _front_and_redraw(self)
             except Exception:  # noqa: BLE001
                 pass
             result = _orig(self, path, view, zoom_mm, show_planes, from_dir)
             blank = image.is_blank_file(path)
+        if blank:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise SolidWorksError(
+                "The screenshot came out as one solid colour twice, although the SolidWorks "
+                "window was restored and the document fronted and redrawn: the graphics buffer "
+                "is empty (a covered/remote session, or the document never drew). Nothing was "
+                "written. Bring the SolidWorks window to the screen and retake.")
         if isinstance(result, dict) and blank is not None:
-            result["blank"] = bool(blank)
-            if blank:
-                result["hint"] = ("Every pixel is one colour: the SolidWorks window is probably "
-                                  "minimised or fully covered, so the graphics buffer was empty. "
-                                  "Restore/uncover the SolidWorks window and retake.")
+            result["blank"] = False
         return result
 
     functools.update_wrapper(screenshot, original)
