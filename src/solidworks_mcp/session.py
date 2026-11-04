@@ -3769,6 +3769,10 @@ class SolidWorksSession:
         try:
             drawn = self._draw_chain(sk, chain)
             sketch, definer = self._open_sketch_definer(sk)
+            u0, v0, _ = self._sketch_coords(sketch, 0.0, 0.0, 0.0)  # the origin, projected
+            plan = free_sketch.plan_chain(chain, (m_to_mm(u0), m_to_mm(v0)))
+            if not plan.fully_defined:
+                raise SolidWorksError("Could not work out the relations and dimensions for this sketch.")
             dimensions = definer.define_chain(plan, drawn, self._chain_sketch_points(drawn, chain))
             fully_defined = definer.fully_defined()
         finally:

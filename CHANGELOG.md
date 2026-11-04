@@ -19,6 +19,11 @@ All notable changes to this project are documented here. This project follows
   server's lock.json holder record.
 
 ### Fixed
+- add_sketch, sketch_circles and sketch_rect anchored a zero coordinate to
+  the sketch's (0, 0), but SolidWorks ties origin relations and dimensions
+  to the projected model origin: on a plane that does not contain the model
+  origin, a point given at u = 0 (or v = 0) was pulled to that projection.
+  "At zero" now means "at the projected origin" in all three.
 - Losing SolidWorks no longer wedges the server until a restart. A current
   document closed behind the server's back (in SolidWorks itself, or by a
   script) is dropped, so the next tool says "no active document" instead of

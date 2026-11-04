@@ -475,6 +475,7 @@ def sketch_circles(session, on: str, circles: list, name: str | None = None,
     try:
         origin, u_dir, v_dir = _sketch_axes(session, sketch)
         roles_axis = axis_role(u_dir, v_dir)
+        o_u, o_v, _ = session._sketch_coords(sketch, 0.0, 0.0, 0.0)  # the model origin, projected (m)
         for k, spec in enumerate(circles):
             d_mm = float(spec.get("diameter_mm") or 0)
             if d_mm <= 0:
@@ -503,8 +504,8 @@ def sketch_circles(session, on: str, circles: list, name: str | None = None,
                 circle = session._draw_circle(sk, u, v, mm_to_m(d_mm / 2))
                 centre = binding.wrap(binding.wrap(circle, session._mod.ISketchArc).GetCenterPoint2(),
                                       session._mod.ISketchPoint)
-                for axis_name, horizontal, coord in (("x", True, u), ("y", False, v)):
-                    if abs(coord) <= 1e-9:
+                for axis_name, horizontal, coord, through in (("x", True, u, o_u), ("y", False, v, o_v)):
+                    if abs(coord - through) <= 1e-9:
                         _relate(session, sketch, "vertical_points" if horizontal else "horizontal_points",
                                 centre, session._origin_point())
                         continue
@@ -550,6 +551,7 @@ def sketch_rect(session, on: str, corner_mm: list, width_mm: float, height_mm: f
     try:
         origin, u_dir, v_dir = _sketch_axes(session, sketch)
         roles_axis = axis_role(u_dir, v_dir)
+        o_u, o_v, _ = session._sketch_coords(sketch, 0.0, 0.0, 0.0)  # the model origin, projected (m)
         u, v, off = _uv(session, sketch, corner_mm)
         if abs(off) > 0.05:
             raise SolidWorksError(f"corner_mm is {off:.3f} mm off the sketch plane.")
@@ -586,8 +588,8 @@ def sketch_rect(session, on: str, corner_mm: list, width_mm: float, height_mm: f
             if display is None:
                 raise SolidWorksError(f"SolidWorks refused the {role} dimension.")
             roles[role] = _named(session, display, role)
-        for axis_name, horizontal, coord in (("x", True, u), ("y", False, v)):
-            if abs(coord) <= 1e-9:
+        for axis_name, horizontal, coord, through in (("x", True, u, o_u), ("y", False, v, o_v)):
+            if abs(coord - through) <= 1e-9:
                 _relate(session, sketch, "vertical_points" if horizontal else "horizontal_points",
                         corner, session._origin_point())
             else:
