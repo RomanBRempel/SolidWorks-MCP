@@ -25,6 +25,8 @@ from ..errors import SolidWorksError
 from ..units import m_to_mm, mm_to_m
 
 SW_SKETCH_TRIM_CLOSEST = 0  # swSketchTrimChoice_e, read from swconst.tlb of SW 2025
+_JOIN_TOL_M = 2e-6   # offset piece ends this close count as joined
+_TESS_TOL_M = 2e-4   # loop polygon sampling for the inside test
 
 
 def active_sketch(session):
@@ -111,6 +113,16 @@ def _on_curve(session, segment, u_m: float, v_m: float) -> tuple:
     return float(nearest[0]), float(nearest[1]), m_to_mm(math.dist((u_m, v_m), (nearest[0], nearest[1])))
 
 
+def _refuse_locked(session, segment, what: str) -> None:
+    reason = locked_by(session, segment)
+    if reason:
+        raise SolidWorksError(
+            f"SolidWorks will not {what} this segment: it is {reason}. Such a segment stays whole "
+            "so its relation can drive it. For an offset contour use offset_face_loop (it closes "
+            "the contour as a sketch region, no trimming); otherwise delete the relation first, "
+            "which unlinks the segment from its dimension.")
+
+
 def split_segment(session, segment, point_mm, space: str = "model") -> dict:
     """Split an open segment of the active sketch at the point of it nearest `point_mm`.
 
@@ -120,6 +132,7 @@ def split_segment(session, segment, point_mm, space: str = "model") -> dict:
     """
     model, sk, sketch = active_sketch(session)
     seg = resolve_segment(session, sketch, segment)
+    _refuse_locked(session, seg, "split")
     u, v, off_mm = _on_curve(session, seg, *_sketch_uv_m(session, sketch, point_mm, space))
     before = snapshot(session, sketch)
     model.ClearSelection2(True)
@@ -149,6 +162,7 @@ def trim_to_intersection(session, segment, pick_mm, space: str = "model") -> dic
     """
     model, sk, sketch = active_sketch(session)
     seg = resolve_segment(session, sketch, segment)
+    _refuse_locked(session, seg, "trim")
     target_key = _seg_key(seg)
     u, v, off_mm = _on_curve(session, seg, *_sketch_uv_m(session, sketch, pick_mm, space))
     before = snapshot(session, sketch)
@@ -169,3 +183,32 @@ def trim_to_intersection(session, segment, pick_mm, space: str = "model") -> dic
             "pick_off_curve_mm": round(off_mm, 4), "removed_mm": round(removed_mm, 4),
             "segment_deleted": target_key in change["removed"] and len(after) < len(before),
             "segments_before": len(before), "segments_after": len(after)}
+
+
+SW_CONSTRAINT_USEEDGE = 32       # swConstraintType_e: a converted edge (On Edge)
+SW_CONSTRAINT_SKETCHOFFSET = 47  # swConstraintType_e: an Offset Entities result
+_LOCKING = {SW_CONSTRAINT_USEEDGE: "converted from a model edge (On Edge)",
+            SW_CONSTRAINT_SKETCHOFFSET: "an Offset Entities result (offset relation)"}
+
+
+def locked_by(session, segment) -> str | None:
+    """Why SolidWorks will neither split nor trim this segment, or None.
+
+    Verified on SW 2025: a segment held by an offset relation or converted
+    from an edge refuses SplitOpenSegment and SketchTrim silently. This is the
+    'SplitOpenSegment returns None on offset splines' defect: it is
+    SolidWorks' rule, not a marshalling problem."""
+    try:
+        relations = segment.GetRelations() or ()
+    except Exception:  # noqa: BLE001 - older builds lack it; nothing to report then
+        return None
+    for raw in relations:
+        try:
+            kind = int(binding.wrap(raw, session._mod.ISketchRelation).GetRelationType())
+        except Exception:  # noqa: BLE001
+            continue
+        if kind in _LOCKING:
+            return _LOCKING[kind]
+    return None
+
+
