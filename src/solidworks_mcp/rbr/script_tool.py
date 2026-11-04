@@ -17,8 +17,9 @@ import pythoncom
 import win32com.client
 
 from .. import binding
+from ..constants import RAY_HIT_WIDTH, SW_RAY_NORMALS_ENTRY_EXIT
 from ..errors import SolidWorksError
-from . import geom, journal
+from . import features, geom, journal, offset_loop, param, sketch_edit
 
 SW_DOC_PART = 1
 SW_DOC_ASSEMBLY = 2
@@ -174,9 +175,101 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         ('add'/'subtract'/'common'); InsertCombineFeature called raw from a script fails."""
         return session.combine_bodies(operation, main, tools, name)
 
+    def new_part():
+        """A new part (MMGS) that becomes the current document; returns its IModelDoc2.
+
+        swApp.NewDocument(GetUserPreferenceStringValue(8), 0, 0, 0) from a script
+        answers None (the template path comes back empty); session.new_part reads
+        and checks the default template and falls back without a modal dialog.
+        """
+        session.new_part()
+        return session._model
+
+    def activate(title):
+        """Make an open document current by its title; returns its IModelDoc2.
+
+        Raw ActivateDoc3 answers a (doc, errors) tuple - calling methods on that
+        tuple fails - and does not update the server's current document; this
+        goes through session.activate_document (title with or without the
+        extension) and hands back the early-bound model.
+        """
+        session.activate_document(title)
+        return session._model
+
+    def rays(bodies, points, directions, options=SW_RAY_NORMALS_ENTRY_EXIT):
+        """Cast rays against solid bodies and return every hit.
+
+        bodies: IBody2 objects or body names; None = every solid body of the
+        current part. points / directions are METRES in model space, nested
+        [[x, y, z], ...] or flat, one direction per point. RayIntersections
+        wants the bodies as VARIANT(VT_ARRAY | VT_DISPATCH) - a plain Python
+        list dies with 'Memory is locked' - and the doubles as VT_ARRAY | VT_R8;
+        this does both. options: swRayPtsOpts_e (default: normals + entry/exit).
+        Returns [{ray, body, type, point_m, normal}]; type bit 32 = the ray
+        LEAVES the body there (SW_RAY_HIT_EXIT).
+        """
+        target = session._require_model()
+        if bodies is None:
+            chosen = geom._solid_bodies(session, target)
+        else:
+            chosen = [geom.resolve_body(session, target, b)
+                      for b in (bodies if isinstance(bodies, (list, tuple)) else [bodies])]
+        if not chosen:
+            raise SolidWorksError("No solid body to cast rays against.")
+
+        def _flat(values, what):
+            flat_ = []
+            for v in values:
+                if isinstance(v, (list, tuple)):
+                    flat_.extend(float(c) for c in v)
+                else:
+                    flat_.append(float(v))
+            if not flat_ or len(flat_) % 3:
+                raise SolidWorksError(f"{what} must be [x, y, z] triples in metres (got {len(flat_)} values).")
+            return flat_
+
+        pts, dirs = _flat(points, "points"), _flat(directions, "directions")
+        if len(pts) != len(dirs):
+            raise SolidWorksError(f"{len(pts) // 3} point(s) against {len(dirs) // 3} direction(s).")
+        dispatches = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH,
+                                             [b._oleobj_ for b in chosen])
+        count = int(target.RayIntersections(dispatches, vec(pts), vec(dirs), int(options), 0.0, 0.0) or 0)
+        rows = target.GetRayIntersectionsPoints() if count else ()
+        hits = []
+        for h in range(count):
+            row = rows[h * RAY_HIT_WIDTH:(h + 1) * RAY_HIT_WIDTH]
+            body_index = int(row[0])
+            hits.append({"ray": int(row[1]),
+                         "body": chosen[body_index].Name if 0 <= body_index < len(chosen) else body_index,
+                         "type": int(row[2]), "point_m": [float(c) for c in row[3:6]],
+                         "normal": [float(c) for c in row[6:9]]})
+        return hits
+
     ns.update(comp=comp, select=select, feature=feature, features=features, api=api, swapp=sw,
               vec=vec, pt=pt, ui_unlocked=ui_unlocked, tree_before=tree_before,
               features_added=features_added, rename_new=rename_new, combine=combine,
+              new_part=new_part, activate=activate, rays=rays,
+              export=lambda path, file_format=None, **kw: session.export(path, file_format, **kw),
+              split_segment=lambda segment, point_mm, space="model": sketch_edit.split_segment(
+                  session, segment, point_mm, space),
+              trim_to_intersection=lambda segment, pick_mm, space="model": sketch_edit.trim_to_intersection(
+                  session, segment, pick_mm, space),
+              set_global=lambda name, value: param.set_global(session, name, value),
+              link_dimension=lambda dimension, expression: param.link_dimension(session, dimension, expression),
+              feature_dimensions=lambda feature=None: param.feature_dimensions(session, feature),
+              sketch_circles=lambda on, circles, name=None, profile_face=None: param.sketch_circles(
+                  session, on, circles, name, profile_face),
+              sketch_rect=lambda on, corner_mm, width_mm, height_mm, name=None, vars=None: param.sketch_rect(
+                  session, on, corner_mm, width_mm, height_mm, name, vars),
+              convert_entities=lambda **kw: param.convert_entities(session, **kw),
+              add_relation=lambda sketch, kind, entities: param.add_relation(session, sketch, kind, entities),
+              offset_face_loop=lambda face, distance_mm, inward=True, link_to=None, name=None:
+                  offset_loop.offset_face_loop(session, face, distance_mm, inward, link_to, name),
+              extrude_toward=lambda sketch, toward, **kw: features.extrude(session, sketch, toward, **kw),
+              cut_toward=lambda sketch, toward, **kw: features.cut(session, sketch, toward, **kw),
+              plane_normal_to_line=lambda sketch, segment, at="start", name=None: param.plane_normal_to_line(
+                  session, sketch, segment, at, name),
+              mirror_features=lambda feats, plane, name="Mirror": param.mirror_features(session, feats, plane, name),
               mirror_body=lambda body, plane, merge=True: geom.mirror_body(session, body, plane, merge),
               whats_wrong=lambda: geom.whats_wrong(session))
     try:
