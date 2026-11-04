@@ -17,6 +17,7 @@ import pythoncom
 import win32com.client
 
 from .. import binding
+from ..constants import RAY_HIT_WIDTH, SW_RAY_NORMALS_ENTRY_EXIT
 from ..errors import SolidWorksError
 from . import geom, journal
 
@@ -195,10 +196,59 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         session.activate_document(title)
         return session._model
 
+    def rays(bodies, points, directions, options=SW_RAY_NORMALS_ENTRY_EXIT):
+        """Cast rays against solid bodies and return every hit.
+
+        bodies: IBody2 objects or body names; None = every solid body of the
+        current part. points / directions are METRES in model space, nested
+        [[x, y, z], ...] or flat, one direction per point. RayIntersections
+        wants the bodies as VARIANT(VT_ARRAY | VT_DISPATCH) - a plain Python
+        list dies with 'Memory is locked' - and the doubles as VT_ARRAY | VT_R8;
+        this does both. options: swRayPtsOpts_e (default: normals + entry/exit).
+        Returns [{ray, body, type, point_m, normal}]; type bit 32 = the ray
+        LEAVES the body there (SW_RAY_HIT_EXIT).
+        """
+        target = session._require_model()
+        if bodies is None:
+            chosen = geom._solid_bodies(session, target)
+        else:
+            chosen = [geom.resolve_body(session, target, b)
+                      for b in (bodies if isinstance(bodies, (list, tuple)) else [bodies])]
+        if not chosen:
+            raise SolidWorksError("No solid body to cast rays against.")
+
+        def _flat(values, what):
+            flat_ = []
+            for v in values:
+                if isinstance(v, (list, tuple)):
+                    flat_.extend(float(c) for c in v)
+                else:
+                    flat_.append(float(v))
+            if not flat_ or len(flat_) % 3:
+                raise SolidWorksError(f"{what} must be [x, y, z] triples in metres (got {len(flat_)} values).")
+            return flat_
+
+        pts, dirs = _flat(points, "points"), _flat(directions, "directions")
+        if len(pts) != len(dirs):
+            raise SolidWorksError(f"{len(pts) // 3} point(s) against {len(dirs) // 3} direction(s).")
+        dispatches = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH,
+                                             [b._oleobj_ for b in chosen])
+        count = int(target.RayIntersections(dispatches, vec(pts), vec(dirs), int(options), 0.0, 0.0) or 0)
+        rows = target.GetRayIntersectionsPoints() if count else ()
+        hits = []
+        for h in range(count):
+            row = rows[h * RAY_HIT_WIDTH:(h + 1) * RAY_HIT_WIDTH]
+            body_index = int(row[0])
+            hits.append({"ray": int(row[1]),
+                         "body": chosen[body_index].Name if 0 <= body_index < len(chosen) else body_index,
+                         "type": int(row[2]), "point_m": [float(c) for c in row[3:6]],
+                         "normal": [float(c) for c in row[6:9]]})
+        return hits
+
     ns.update(comp=comp, select=select, feature=feature, features=features, api=api, swapp=sw,
               vec=vec, pt=pt, ui_unlocked=ui_unlocked, tree_before=tree_before,
               features_added=features_added, rename_new=rename_new, combine=combine,
-              new_part=new_part, activate=activate,
+              new_part=new_part, activate=activate, rays=rays,
               mirror_body=lambda body, plane, merge=True: geom.mirror_body(session, body, plane, merge),
               whats_wrong=lambda: geom.whats_wrong(session))
     try:
