@@ -18,6 +18,8 @@ from .. import binding
 from ..errors import SolidWorksError
 from . import guard
 
+from ..constants import SW_FEATURE_SCOPE_ALL_BODIES
+
 SWBODY_INTERSECT = 15901  # swBodyOperationType_e, as session._BODY_OPERATIONS
 MARK_MIRROR_PLANE = 2
 MARK_MIRROR_BODY = 256
@@ -124,41 +126,62 @@ def feature_refusal(session, call: str) -> SolidWorksError:
     return SolidWorksError(f"SolidWorks refused {call} (returned None).{detail}{tail}")
 
 
-def mirror_body(session, body: str, plane: str, merge: bool = True, name: str = "MirrorBody") -> dict:
-    """Mirror one solid body about a plane; merge joins the copy back through
+def resolve_body(session, model, body):
+    """One of the part's solid bodies, by name or as the IBody2 (or raw dispatch)
+    itself. IBody2 is not hashable and two wrappers of one body do not compare
+    equal, so bodies are matched by NAME, never used as dict keys or with `in`."""
+    bodies = _solid_bodies(session, model)
+    if isinstance(body, str):
+        found = [b for b in bodies if b.Name == body]
+        if not found:
+            raise SolidWorksError(f"No body '{body}' (there are: {', '.join(b.Name for b in bodies) or 'none'}).")
+        return found[0]
+    wrapped = binding.wrap(body, session._mod.IBody2)
+    try:
+        name = wrapped.Name
+    except Exception as exc:  # noqa: BLE001
+        raise SolidWorksError(f"body must be a body name or an IBody2 (got {body!r}): {exc}") from None
+    if not any(b.Name == name for b in bodies):
+        raise SolidWorksError(f"The body '{name}' is not a solid body of the current part "
+                              f"(there are: {', '.join(b.Name for b in bodies) or 'none'}).")
+    return wrapped
+
+
+def mirror_body(session, body, plane: str, merge: bool = True, name: str = "MirrorBody") -> dict:
+    """Mirror one solid body (its name or the IBody2) about a plane ('front' /
+    'top' / 'right' or a plane of the part); merge joins the copy back through
     the combine_bodies path (InsertMirrorFeature2's own Merge gave broken geometry)."""
     model = session._require_model()
     session._require_part()
-    bodies = {b.Name: b for b in _solid_bodies(session, model)}
-    if body not in bodies:
-        raise SolidWorksError(f"No body '{body}' (there are: {', '.join(bodies) or 'none'}).")
-    plane_feat = None
-    for feat in session._iter_features():
-        if feat.Name == plane:
-            plane_feat = feat
-            break
-    if plane_feat is None:
-        raise SolidWorksError(f"No plane feature named '{plane}' (list_features shows them).")
+    target = resolve_body(session, model, body)
+    body_name = target.Name
+    plane_feat, plane_label = session._named_plane(plane)
     before = {b.Name for b in _solid_bodies(session, model)}
-    volume_before = _volume_mm3(bodies[body])
+    volume_before = _volume_mm3(target)
     model.ClearSelection2(True)
     if not plane_feat.Select2(True, MARK_MIRROR_PLANE):
-        raise SolidWorksError(f"Cannot select the plane '{plane}'.")
-    if not bodies[body].Select2(True, MARK_MIRROR_BODY):
-        raise SolidWorksError(f"Cannot select the body '{body}'.")
+        raise SolidWorksError(f"Cannot select the {plane_label}.")
+    # IBody2::Select2 takes an ISelectData (an integer mark raises "Python
+    # instance can not be converted to a COM object"): build one, as add_mirror does.
+    select_data = binding.wrap(binding.wrap(model.SelectionManager, session._mod.ISelectionMgr)
+                               .CreateSelectData(), session._mod.ISelectData)
+    select_data.Mark = MARK_MIRROR_BODY
+    if not target.Select2(True, select_data):
+        raise SolidWorksError(f"Cannot select the body '{body_name}'.")
     fm = binding.wrap(model.FeatureManager, session._mod.IFeatureManager)
-    # BMirrorBody=True, BGeometryPattern=False, BMerge=False (see module doc), BKnit=False
-    feat = fm.InsertMirrorFeature2(True, False, False, False)
+    # BMirrorBody=True, BGeometryPattern=False, BMerge=False (see module doc), BKnit=False;
+    # SW 2025's InsertMirrorFeature2 requires the ScopeOptions argument (type mismatch without it)
+    feat = fm.InsertMirrorFeature2(True, False, False, False, SW_FEATURE_SCOPE_ALL_BODIES)
     if feat is None:
-        raise feature_refusal(session, f"InsertMirrorFeature2 of '{body}' about '{plane}'")
+        raise feature_refusal(session, f"InsertMirrorFeature2 of '{body_name}' about '{plane}'")
     feat = binding.wrap(feat, session._mod.IFeature)
     new_names = [b.Name for b in _solid_bodies(session, model) if b.Name not in before]
-    out = {"ok": True, "feature": feat.Name, "mirrored": body, "plane": plane,
+    out = {"ok": True, "feature": feat.Name, "mirrored": body_name, "plane": plane,
            "new_bodies": new_names, "volume_before_mm3": round(volume_before, 3)}
     if merge:
         if not new_names:
             raise SolidWorksError("The mirror added no body to merge; the tree has the mirror feature.")
-        combined = session.combine_bodies("add", body, new_names)
+        combined = session.combine_bodies("add", body_name, new_names)
         out["merged"] = True
         out["mass_properties"] = combined.get("mass_properties")
         volume_after = (combined.get("mass_properties") or {}).get("volume_mm3")
