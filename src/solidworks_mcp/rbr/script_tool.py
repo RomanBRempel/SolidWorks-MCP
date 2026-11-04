@@ -174,9 +174,20 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         ('add'/'subtract'/'common'); InsertCombineFeature called raw from a script fails."""
         return session.combine_bodies(operation, main, tools, name)
 
+    def new_part():
+        """A new part (MMGS) that becomes the current document; returns its IModelDoc2.
+
+        swApp.NewDocument(GetUserPreferenceStringValue(8), 0, 0, 0) from a script
+        answers None (the template path comes back empty); session.new_part reads
+        and checks the default template and falls back without a modal dialog.
+        """
+        session.new_part()
+        return session._model
+
     ns.update(comp=comp, select=select, feature=feature, features=features, api=api, swapp=sw,
               vec=vec, pt=pt, ui_unlocked=ui_unlocked, tree_before=tree_before,
               features_added=features_added, rename_new=rename_new, combine=combine,
+              new_part=new_part,
               mirror_body=lambda body, plane, merge=True: geom.mirror_body(session, body, plane, merge),
               whats_wrong=lambda: geom.whats_wrong(session))
     try:
