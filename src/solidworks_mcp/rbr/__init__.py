@@ -18,12 +18,12 @@ from . import (bodies as bodies_mod, cavity, equations, export_check, fastpath, 
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.8.0"
+RBR_VERSION = "1.9.0"
 
 INSTRUCTIONS = """
 
 RBR extension (solidworks-mcp-rbr)
-- Batch work goes in ONE run_script call (sw, model, ext, fm, asm/part, comp(), feature(), select(), args, MM, DEG; set `result`). Prefer it over many granular calls on big parts.
+- Batch work goes in ONE run_script call (sw, model, ext, fm, asm/part, comp(), feature(), select(), segments(), W(), args, MM, DEG; set `result`). Prefer it over many granular calls on big parts. Items from Get* collections are late-bound and misbehave (GetType() -> "'int' object is not callable", Select4 type mismatch): take them from segments()/relations() or W() them first.
 - Proven scripts: list_scripts / get_script / save_script / run_saved_script(name, args).
 - Every call is journalled with its arguments and full script code: get_journal. tool_source(name) shows the code any tool runs.
 - Telemetry: get_journal(since='HH:MM', entries=False) gives per-tool stats from the journal file without touching SolidWorks; never read the journal through run_script. server_health shows what the server is doing right now, also while a call runs.
@@ -325,7 +325,8 @@ def register(server) -> None:
         (IAssemblyDoc) or part (IPartDoc), comp(name) -> IComponent2 by
         list_components name, feature(name) -> IFeature, features(type=None) ->
         all top-level IFeature in one call (do not walk FirstFeature/GetNextFeature),
-        select(objs, append=False) -> count selected, api(obj, contains='') -> the
+        select(objs, append=False) -> count selected (components, entities and sketch
+        segments alike, raw or wrapped), api(obj, contains='') -> the
         methods and properties an object really has in this SolidWorks (check before
         guessing names), session (the server's SolidWorksSession: its methods are the
         tools), MM = 0.001 (API lengths are metres), DEG, args (dict), np (numpy, if
@@ -351,9 +352,18 @@ def register(server) -> None:
         a part - reads data = [x, y, z, dx, dy, dz, width, length, height] (m): (x, y, z) is the
         CENTRE OF THE BOTTOM FACE, (dx, dy, dz) the direction of the HEIGHT; then width runs
         along Z, length along Y, height along that direction (verified on SW 2025).
+        Sketch geometry comes early-bound through segments(sketch=None, construction=False)
+        -> ISketchSegment list of the active or named sketch, and relations(sketch=None)
+        -> its ISketchRelation list: use them instead of raw GetSketchSegments()/
+        GetRelations(), whose late-bound items resolve methods as properties
+        (seg.GetType() dies with "'int' object is not callable") and reject Select4's
+        arguments. Any other Get* collection item: W(x, 'IFace2') re-binds it (name the
+        interface - this SolidWorks exposes no type info on them); call(obj, 'Name',
+        *args) reads or invokes a member of a still-raw dispatch either way it is exposed.
         COM rules: methods with out-parameters return a tuple (retval, out1, out2...):
         unpack it, do not call methods on it; objects from Get* calls are often raw
-        dispatches: wrap(x, mod.IFeature) etc. before using them; lengths in metres.
+        dispatches: W(x) / segments() / wrap(x, mod.IFeature) before using them;
+        lengths in metres.
         The result also gives `features` {before, after, added} when the tree changed.
         Example (delete 3 components with their mates in one step):
             n = select([comp(c) for c in ["Bolt-1", "Bolt-2", "Nut-1"]])
