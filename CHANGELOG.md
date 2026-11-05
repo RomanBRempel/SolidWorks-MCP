@@ -6,6 +6,25 @@ All notable changes to this project are documented here. This project follows
 ## [Unreleased]
 
 ### Added
+- rbr 1.8.0, multibody parts: body_properties (mass, volume, area, centre, box,
+  material per body), rename_body, show_bodies, delete_bodies (delete/keep),
+  move_copy_body (InsertMoveCopyBody2's angles turn about Z, Y, X in that
+  order, and a turn drops the shift of the same feature: turn and shift are
+  two features; moved bodies get their names back), set_feature_scope (a cut
+  or boss acting on some bodies only), save_bodies (SaveToFile3) and
+  insert_part (InsertPart3, new bodies renamed apart). A material per body
+  cannot be set through the API: SetMaterialProperty answers NoError and
+  changes nothing.
+- rbr 1.8.0, SolidCAM through its automation API 2.0 (scautom2.dll), in the
+  user's one SolidWorks: solidcam_status, solidcam_zero (coordinate system on
+  the top face at the bottom-left corner), solidcam_new_part (SolidCAM's Part
+  Data panel then waits for the user to pick that zero), solidcam_open,
+  solidcam_add_zero, solidcam_stock, solidcam_add_operation (from operation
+  templates), solidcam_calculate, solidcam_gcode (reads the program back and
+  warns when it does not cut), solidcam_save, solidcam_close. The old
+  scautom.dll API crashed the server process and is not used.
+
+### Added (1.7.0)
 - rbr 1.7.0, a cavity that follows a curved skin: sketch_intersection
   (plane x faces/body -> sketch curves; SolidWorks' 2D IntersectCurves
   creates nothing, so it goes through Sketch3DIntersections in a helper 3D

@@ -13,12 +13,12 @@ import functools
 import os
 
 from ..errors import SolidWorksError
-from . import (cavity, equations, export_check, fastpath, features, flow, geom, guard, health, image, jobs, journal,
-               library, offset_loop, param, script_tool, speed, tools)
+from . import (bodies as bodies_mod, cavity, equations, export_check, fastpath, features, flow, geom, guard, health, image, jobs, journal,
+               library, offset_loop, param, script_tool, solidcam, speed, tools)
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.7.0"
+RBR_VERSION = "1.8.0"
 
 INSTRUCTIONS = """
 
@@ -40,6 +40,8 @@ RBR extension (solidworks-mcp-rbr)
 - More script names: vec(*doubles) / pt(x,y,z) (COM-ready VARIANTs), ui_unlocked() (lift the UI freeze for InsertSketch/EditSketch), tree_before() + features_added(before) + rename_new(before, name), combine(op, main, tools), mirror_body(body, plane, merge=True), whats_wrong(), new_part(), activate(title), rays(bodies, points, dirs), export(path, fmt), split_segment / trim_to_intersection (in the sketch being edited).
 - Parametric building on SolidWorks objects, no tool bodies: set_global / link_dimension / feature_dimensions; sketch_circles (also centred on a profile's mean line at a station) / sketch_rect; convert_entities, add_relation; offset_face_loop (a wall-thick contour inside a face, also where SolidWorks' own offset refuses); extrude_toward / cut_toward (explicit direction, depth / through_all / up_to, also one region of a sketch); plane_normal_to_line; mirror_features. Drive every size and position by a global variable.
 - A cavity following a curved skin, section by section: sketch_intersection(plane=..., body/faces) -> sketch_trim_region(sketch, keep_box) (one closed contour) -> sketch_offset_chain(sketch, wall_mm) (inside, original to construction) -> loft_cut([sections]) or cut_offset_from_surface(sketch, face, wall_mm, toward) ending a wall short of the skin; split_line_project(sketch, faces) cuts the skin patch such a cut ends on. Check region_area_mm2 and the removed volume against a hand estimate.
+- Multibody parts: body_properties (mass, volume, area, centre, box, material per body), rename_body, show_bodies(visible), delete_bodies(keep=False), move_copy_body(translate_mm, rotate, copies), set_feature_scope(feature, bodies) (a cut or boss acting on some bodies only), save_bodies(bodies, path) (to a new part), insert_part(path) (another part as bodies). A material per body is not settable through the API (SolidWorks ignores it): bodies carry the part's material.
+- SolidCAM (in the same SolidWorks; never start another SolidWorks or SolidCAM): solidcam_status -> solidcam_new_part(path, machine) (makes the zero SolidCAM_Zero on the top face at the bottom-left corner, then SolidCAM's Part Data panel waits for the user to pick it) or solidcam_open(path) -> solidcam_stock -> solidcam_add_operation(template, geometry) -> solidcam_calculate -> solidcam_gcode (says whether the program cuts) -> solidcam_save / solidcam_close. The API cannot define job geometry (chains, faces): a template job on the target alone posts no moves.
 """
 
 
@@ -627,6 +629,122 @@ def register(server) -> None:
         through combine_bodies (SolidWorks' own merge welded broken geometry) and warns when
         the volume did not roughly double."""
         return await call(geom.mirror_body, session, body, plane, merge)
+
+    # --- solid bodies (1.8.0) ---------------------------------------------------------
+
+    @mcp.tool()
+    async def body_properties(bodies: list | str | None = None) -> dict:
+        """Per solid body of the current part (all, or the named ones): volume, surface area,
+        mass and centre of mass (by the material), bounding box, faces, visibility and material."""
+        return await call(bodies_mod.body_properties, session, bodies)
+
+    @mcp.tool()
+    async def rename_body(body: str, new_name: str) -> dict:
+        """Rename a solid body (its list_bodies name); the name survives rebuilds."""
+        return await call(bodies_mod.rename_body, session, body, new_name)
+
+    @mcp.tool()
+    async def show_bodies(bodies: list | str, visible: bool = True) -> dict:
+        """Show (visible=True) or hide solid bodies by name."""
+        return await call(bodies_mod.show_bodies, session, bodies, visible)
+
+    @mcp.tool()
+    async def delete_bodies(bodies: list | str, keep: bool = False, name: str | None = None) -> dict:
+        """Body-Delete/Keep feature: delete the named bodies, or with keep=True keep only them.
+        Undo with delete_feature."""
+        return await call(bodies_mod.delete_bodies, session, bodies, keep, name)
+
+    @mcp.tool()
+    async def move_copy_body(bodies: list | str, translate_mm: list | None = None, rotate: dict | None = None,
+                             copies: int = 0, name: str | None = None) -> dict:
+        """Body-Move/Copy feature: translate_mm [dx, dy, dz] and/or rotate {axis: 'x'|'y'|'z',
+        angle_deg, about_mm: [x, y, z]}; copies > 0 keeps the originals and adds that many
+        copies, each a step further. Returns the new bodies."""
+        return await call(bodies_mod.move_copy_body, session, bodies, translate_mm, rotate, copies, name)
+
+    @mcp.tool()
+    async def set_feature_scope(feature: str, bodies: list | str | None = None) -> dict:
+        """Limit an existing cut / boss / revolve / hole (a list_features name) to the named
+        bodies (Feature Scope); bodies=None makes it act on all bodies again. Returns each
+        body's volume before and after."""
+        return await call(bodies_mod.set_feature_scope, session, feature, bodies)
+
+    @mcp.tool()
+    async def save_bodies(bodies: list | str, path: str, close: bool = True) -> dict:
+        """Save solid bodies to a new part file (linked to this one). Save this part first."""
+        return await call(bodies_mod.save_bodies, session, bodies, path, close)
+
+    @mcp.tool()
+    async def insert_part(path: str, config: str = "", name: str | None = None, material: bool = False) -> dict:
+        """Insert another part's solid bodies into the current part (linked Insert Part feature);
+        the new bodies get unique names (name, name_2, ...). Position them with move_copy_body."""
+        return await call(bodies_mod.insert_part, session, path, config, name, material)
+
+    # --- SolidCAM (1.8.0) -------------------------------------------------------------
+
+    @mcp.tool()
+    async def solidcam_status() -> dict:
+        """SolidCAM running in this SolidWorks: version, machines, operation templates and the
+        open CAM part (machine, zeros, geometries, stock, operations, tools)."""
+        return await _timed(solidcam.status, session, timeout_s=60)
+
+    @mcp.tool()
+    async def solidcam_new_part(path: str, machine: str, up: str = "+z", inch: bool = False) -> dict:
+        """Start a SolidCAM milling part (.prz) for the current saved part on a machine
+        (solidcam_status lists them). Makes the zero first: coordinate system SolidCAM_Zero on
+        the top face (`up`) at the bottom-left corner. SolidCAM then shows its Part Data panel,
+        which the user confirms (the result says how); afterwards solidcam_status shows the part."""
+        return await _timed(solidcam.new_part, session, path, machine, up, inch, timeout_s=120)
+
+    @mcp.tool()
+    async def solidcam_zero(up: str = "+z") -> dict:
+        """Make (or remake) the SolidWorks coordinate system SolidCAM_Zero in the current part:
+        on the top face (`up`) at the bottom-left corner of the part's box."""
+        return await call(solidcam.make_zero, session, up)
+
+    @mcp.tool()
+    async def solidcam_open(path: str) -> dict:
+        """Open an existing SolidCAM part (.prz)."""
+        return await _timed(solidcam.open_part, session, path, timeout_s=180)
+
+    @mcp.tool()
+    async def solidcam_add_zero(position: str = "top_corner", coordinate_system: str | None = None) -> dict:
+        """Add a machine zero to the open CAM part: 'top_corner', 'top_center', 'cad_origin',
+        or a SolidWorks coordinate system by name."""
+        return await _timed(solidcam.add_zero, session, position, coordinate_system, timeout_s=60)
+
+    @mcp.tool()
+    async def solidcam_stock(offsets_mm: list | None = None, name: str = "Stock") -> dict:
+        """Box stock around the model: offsets_mm [x+, y+, z+, x-, y-, z-], or SolidCAM's defaults."""
+        return await _timed(solidcam.stock_box, session, offsets_mm, name, timeout_s=120)
+
+    @mcp.tool()
+    async def solidcam_add_operation(template: str, geometry: str | None = None, home: str | None = None) -> dict:
+        """Add a job from an operation template (solidcam_status lists them) on a geometry of the
+        CAM part (default the first) at a zero (default the first). The API cannot create job
+        geometry: define chains / faces in SolidCAM, then name them here."""
+        return await _timed(solidcam.add_operation, session, template, geometry, home, timeout_s=120)
+
+    @mcp.tool()
+    async def solidcam_calculate(operations: list | None = None, force: bool = False) -> dict:
+        """Calculate toolpaths of all operations or the named ones; lists any left uncalculated."""
+        return await _timed(solidcam.calculate, session, operations, force, timeout_s=1200)
+
+    @mcp.tool()
+    async def solidcam_gcode(operation: str | None = None, path: str | None = None) -> dict:
+        """Post-process to G-code (whole part into its G-codes folder, or one operation into path)
+        and read it back: lines, cutting moves, and a warning when a program does not cut."""
+        return await _timed(solidcam.gcode, session, operation, path, timeout_s=600)
+
+    @mcp.tool()
+    async def solidcam_save(path: str | None = None) -> dict:
+        """Save the open CAM part (or save it as path)."""
+        return await _timed(solidcam.save, session, path, timeout_s=120)
+
+    @mcp.tool()
+    async def solidcam_close(close_model: bool = True) -> dict:
+        """Close the open CAM part (and its model)."""
+        return await _timed(solidcam.close, session, close_model, timeout_s=120)
 
     # --- cavity along a skin (1.7.0) ---------------------------------------------------
 
