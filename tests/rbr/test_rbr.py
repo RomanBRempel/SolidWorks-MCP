@@ -169,6 +169,122 @@ def test_script_error_is_readable_and_rolled_back(fake_session, swmcp_home):
     assert fake_session._history()[-1].Name == "Boss1"
 
 
+# --- script namespace: early binding of Get* collection items -----------------------
+
+class _Seg:
+    """A sketch segment: Select4 takes TWO arguments, like ISketchSegment's."""
+
+    def __init__(self, construction=False):
+        self.ConstructionGeometry = construction
+        self.selected = 0
+
+    def Select4(self, append, data):
+        self.selected += 1
+        return True
+
+
+class _Comp:
+    """A component: Select4 takes THREE arguments, like IComponent2's."""
+
+    def __init__(self):
+        self.selected = 0
+
+    def Select4(self, append, data, popup):
+        self.selected += 1
+        return True
+
+
+class _Sketch:
+    def __init__(self, segments=(), relations=()):
+        self._segments = list(segments)
+        self.RelationManager = type("RM", (), {"GetRelations": lambda self_, kind: tuple(relations)})()
+
+    def GetSketchSegments(self):
+        return tuple(self._segments)
+
+
+def _ns(fake_session):
+    fake_session._ensure = lambda: _FakeSw(fake_session._model)
+    return script_tool.namespace(fake_session, [])
+
+
+def test_w_wraps_none_lists_and_named_interfaces(fake_session):
+    ns = _ns(fake_session)
+    seg = _Seg()
+    assert ns["W"](None) is None
+    assert ns["W"]([seg, None], "ISketchSegment") == [seg, None]  # FakeMod's Ident: wrap(x) is x
+    assert ns["W"](seg, "ISketchSegment") is seg
+
+
+def test_w_reads_type_info_and_is_loud_without_it(fake_session):
+    ns = _ns(fake_session)
+
+    class _Info:
+        def GetDocumentation(self, index):
+            return ("SketchLine", None, None, None)
+
+    class _Raw:
+        class _oleobj_:  # noqa: N801 - mimics pywin32's attribute
+            GetTypeInfo = staticmethod(lambda: _Info())
+
+    raw = _Raw()
+    # 'SketchLine' resolved via mod (Ident in the fakes): wrap re-wraps the _oleobj_
+    assert ns["W"](raw) is _Raw._oleobj_
+    with pytest.raises(SolidWorksError, match="type info"):
+        ns["W"](object())
+
+
+def test_call_reads_properties_and_invokes_methods(fake_session):
+    ns = _ns(fake_session)
+    late = type("Late", (), {"GetType": 3, "GetName": lambda self: "Line1"})()
+    assert ns["call"](late, "GetType") == 3  # late binding left it as a bare int
+    assert ns["call"](late, "GetName") == "Line1"
+
+
+def test_segments_come_from_active_or_named_sketch_filtered(fake_session):
+    ns = _ns(fake_session)
+    real, helper = _Seg(), _Seg(construction=True)
+    sketch = _Sketch([real, helper])
+    fake_session._model.GetActiveSketch2 = lambda: sketch
+    assert ns["segments"]() == [real]
+    assert ns["segments"](construction=True) == [helper]
+    assert ns["segments"](construction=None) == [real, helper]
+    named = next(f for f in fake_session._model.features if f.Name == "Sketch1")
+    named.GetSpecificFeature2 = lambda: _Sketch([real])
+    assert ns["segments"]("Sketch1") == [real]
+
+
+def test_segments_loud_when_no_sketch_is_edited(fake_session):
+    ns = _ns(fake_session)
+    fake_session._model.GetActiveSketch2 = lambda: None
+    with pytest.raises(SolidWorksError, match="No sketch is being edited"):
+        ns["segments"]()
+
+
+def test_relations_come_early_bound(fake_session):
+    ns = _ns(fake_session)
+    rel = object()
+    fake_session._model.GetActiveSketch2 = lambda: _Sketch(relations=[rel])
+    assert ns["relations"]() == [rel]
+
+
+def test_extrude_toward_reaches_the_features_module(fake_session, monkeypatch):
+    """The local features() helper used to shadow the module inside the lambdas."""
+    from solidworks_mcp.rbr import features as features_tools
+    seen = {}
+    monkeypatch.setattr(features_tools, "extrude", lambda s, sk, toward, **kw: seen.update(sk=sk) or {"ok": True})
+    ns = _ns(fake_session)
+    assert ns["extrude_toward"]("Sketch1", [0, 0, 1])["ok"] and seen["sk"] == "Sketch1"
+
+
+def test_select_handles_both_select4_signatures(fake_session):
+    ns = _ns(fake_session)
+    seg, comp = _Seg(), _Comp()
+    assert ns["select"]([comp, seg]) == 2
+    assert seg.selected == 1 and comp.selected == 1
+    assert fake_session._model.selected == []  # ClearSelection2 ran (fakes do not record Select4)
+
+
 # --- library ----------------------------------------------------------------------
 
 def test_library_save_list_get_and_override(swmcp_home):

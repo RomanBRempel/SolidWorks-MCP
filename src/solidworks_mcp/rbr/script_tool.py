@@ -17,9 +17,15 @@ import pythoncom
 import win32com.client
 
 from .. import binding
-from ..constants import RAY_HIT_WIDTH, SW_RAY_NORMALS_ENTRY_EXIT
+from ..constants import RAY_HIT_WIDTH, SW_RAY_NORMALS_ENTRY_EXIT, SW_RELATIONS_ALL
 from ..errors import SolidWorksError
-from . import features, geom, journal, offset_loop, param, sketch_edit
+# `features` is aliased: namespace() has a local helper of the same name, which
+# would shadow the module inside the lambdas that need features_tools.extrude/cut.
+from . import features as features_tools
+from . import geom, journal, offset_loop, param, sketch_edit
+
+# Base class of every makepy-generated wrapper; absent in the test stubs of win32com.
+_DISPATCH_BASE = getattr(win32com.client, "DispatchBaseClass", None)
 
 SW_DOC_PART = 1
 SW_DOC_ASSEMBLY = 2
@@ -87,12 +93,110 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
             raise SolidWorksError("comp() needs an assembly as the current document.")
         return session._component_by_name(ns["asm"], name)
 
+    def W(obj, iface=None):
+        """Early-bind a raw or late-bound dispatch (or a list of them) so the API behaves.
+
+        Items out of Get* collections (GetSketchSegments, GetRelations, GetFaces,
+        GetEdges, ...) come back late-bound: on those, methods resolve as
+        properties (seg.GetType() dies with "'int' object is not callable") and
+        Select4 rejects its arguments with a type mismatch. W(x, 'ISketchSegment')
+        (or W(x, mod.ISketchSegment)) re-wraps them as the generated class. Name
+        the interface: SolidWorks 2025 exposes no type info on these objects, so
+        bare W(x) can only pass through what is already bound, and is loud
+        otherwise. api(obj) lists what a wrapped object really offers.
+        """
+        if obj is None:
+            return None
+        if isinstance(obj, (list, tuple)):
+            return [W(x, iface) for x in obj]
+        if isinstance(iface, str):
+            cls = getattr(mod, iface, None)
+            if cls is None:
+                raise SolidWorksError(f"The type library has no interface named '{iface}' (see mod).")
+            iface = cls
+        if iface is not None:
+            return binding.wrap(obj, iface)
+        if _DISPATCH_BASE is not None and isinstance(obj, _DISPATCH_BASE):
+            return obj  # already early-bound
+        oleobj = getattr(obj, "_oleobj_", obj)
+        name = None
+        try:
+            name = oleobj.GetTypeInfo().GetDocumentation(-1)[0]
+        except Exception:  # noqa: BLE001 - some SW objects expose no type info
+            pass
+        cls = getattr(mod, name, None) or getattr(mod, f"I{name}", None) if name else None
+        if cls is None:
+            raise SolidWorksError(
+                "The object exposes no usable type info"
+                + (f" ('{name}' is not in the type library)" if name else "")
+                + ": name the interface, W(x, 'ISketchSegment') or wrap(x, mod.ISketchSegment).")
+        return binding.wrap(obj, cls)
+
+    def call(obj, name, *call_args):
+        """Read or invoke a member of a still-raw dispatch, method or property alike.
+
+        Late binding resolves some methods as properties (obj.GetType is already
+        the int); call(obj, 'GetType') works either way. Prefer W(obj) and the
+        documented API when the interface is known.
+        """
+        attr = getattr(obj, name)
+        return attr(*call_args) if callable(attr) else attr
+
+    def _sketch_of(which):
+        """An early-bound ISketch: None = the sketch being edited, a name, or the object."""
+        if which is None:
+            return sketch_edit.active_sketch(session)[2]
+        if isinstance(which, str):
+            sk = binding.wrap(feature(which).GetSpecificFeature2(), mod.ISketch)
+            if sk is None:
+                raise SolidWorksError(f"'{which}' is not a sketch.")
+            return sk
+        return binding.wrap(which, mod.ISketch)
+
+    def segments(sketch=None, construction=False):
+        """Early-bound ISketchSegment list of a sketch (default: the one being edited).
+
+        sketch: None = the active sketch (loud when none is being edited); a
+        sketch's tree name (works without editing it); or an ISketch. By default
+        construction geometry is left out; construction=True returns only it,
+        construction=None everything. Unlike raw GetSketchSegments() items these
+        behave as documented: GetType(), GetID(), Select4(append, data).
+        """
+        segs = [binding.wrap(s, mod.ISketchSegment)
+                for s in (_sketch_of(sketch).GetSketchSegments() or ())]
+        if construction is None:
+            return segs
+        return [s for s in segs if bool(s.ConstructionGeometry) == bool(construction)]
+
+    def relations(sketch=None):
+        """Early-bound ISketchRelation list of a sketch (default: the one being edited)."""
+        manager = binding.wrap(_sketch_of(sketch).RelationManager, mod.ISketchRelationManager)
+        return [binding.wrap(r, mod.ISketchRelation)
+                for r in (manager.GetRelations(SW_RELATIONS_ALL) or ())]
+
     def select(objs, append=False):
-        """Select components/entities (Select4 with the doc's SelectData); returns the count."""
+        """Select components, entities or sketch segments; returns the count.
+
+        Uses Select4 with the document's SelectData and either signature
+        (components take three arguments, entities and segments two); raw
+        dispatches are early-bound first, so items straight out of a Get*
+        collection select fine.
+        """
         if not append:
             model.ClearSelection2(True)
         data = ns["selmgr"].CreateSelectData()
-        return sum(1 for o in objs if o.Select4(True, data, False))
+        count = 0
+        for o in objs:
+            try:
+                o = W(o)
+            except SolidWorksError:
+                pass  # no type info: try it as it came
+            try:
+                ok = o.Select4(True, data, False)
+            except TypeError:
+                ok = o.Select4(True, data)
+            count += 1 if ok else 0
+        return count
 
     def feature(name):
         """A feature of the current document by its tree name (early-bound IFeature)."""
@@ -246,6 +350,7 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         return hits
 
     ns.update(comp=comp, select=select, feature=feature, features=features, api=api, swapp=sw,
+              W=W, call=call, segments=segments, relations=relations,
               vec=vec, pt=pt, ui_unlocked=ui_unlocked, tree_before=tree_before,
               features_added=features_added, rename_new=rename_new, combine=combine,
               new_part=new_part, activate=activate, rays=rays,
@@ -265,8 +370,8 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
               add_relation=lambda sketch, kind, entities: param.add_relation(session, sketch, kind, entities),
               offset_face_loop=lambda face, distance_mm, inward=True, link_to=None, name=None:
                   offset_loop.offset_face_loop(session, face, distance_mm, inward, link_to, name),
-              extrude_toward=lambda sketch, toward, **kw: features.extrude(session, sketch, toward, **kw),
-              cut_toward=lambda sketch, toward, **kw: features.cut(session, sketch, toward, **kw),
+              extrude_toward=lambda sketch, toward, **kw: features_tools.extrude(session, sketch, toward, **kw),
+              cut_toward=lambda sketch, toward, **kw: features_tools.cut(session, sketch, toward, **kw),
               plane_normal_to_line=lambda sketch, segment, at="start", name=None: param.plane_normal_to_line(
                   session, sketch, segment, at, name),
               mirror_features=lambda feats, plane, name="Mirror": param.mirror_features(session, feats, plane, name),
