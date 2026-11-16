@@ -41,7 +41,8 @@ READ_ONLY = frozenset({
     "get_status", "list_documents", "get_mass_properties", "get_bounding_box", "list_faces", "list_edges",
     "list_bodies", "list_features", "list_dimensions", "read_sketch", "list_equations", "list_components",
     "get_assembly_bounding_box", "get_custom_properties", "list_configurations", "shell_check",
-    "release_ui", "flow_goals", "flow_info",
+    "release_ui", "flow_goals", "flow_info", "render_view", "section_view", "section_profile",
+    "read_sketches", "find_faces", "find_edges", "list_external_refs", "dialog_list", "api_search",
 })
 
 # Tools that switch the current document: ownership is checked on the document they act on, not before.
@@ -303,6 +304,28 @@ def release_ui(session, dry_run: bool = False, _retry: bool = True, clear_quaran
     return report
 
 
+def _left_frozen(session) -> bool:
+    """After a refused call: is CommandInProgress or the current document's
+    drawing still switched off? Unknown counts as yes."""
+    try:
+        if session._sw is None:
+            return False
+        if session._sw.CommandInProgress or session._to_wake:
+            return True
+        doc = session._model
+        if doc is None:
+            return False
+        mod = session._mod
+        view = binding.wrap(doc.ActiveView, mod.IModelView)
+        fm = binding.wrap(doc.FeatureManager, mod.IFeatureManager)
+        sk = binding.wrap(doc.SketchManager, mod.ISketchManager)
+        return not all(getattr(target, prop) for target, prop in (
+            (view, "EnableGraphicsUpdate"), (fm, "EnableFeatureTree"), (fm, "EnableFeatureTreeWindow"),
+            (sk, "DisplayWhenAdded")) if target is not None)
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _clear_stale_flag(session) -> None:
     """A CommandInProgress still set while we hold the lock was left by a dead call."""
     try:
@@ -365,7 +388,11 @@ def _run_guarded(self, fn, *args, **kwargs):
                 # (journal through 2026-11-03); a live A/B on a 93-feature part
                 # measured 4.1 s -> 0.3 s. Snapshot and UI freeze stay skipped.
                 busy = self._command_in_progress(True)
-                return fn(*args, **kwargs)
+                journal.note(self, "before")
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    journal.note(self, "after")
             except pythoncom.com_error as exc:
                 # the link died during the read itself (the probe above had just passed)
                 if getattr(exc, "hresult", None) in SolidWorksSession._GONE_HRESULTS:
@@ -385,15 +412,34 @@ def _run_guarded(self, fn, *args, **kwargs):
         if tool not in SWITCHERS:
             check_owner(_title(self), tool)
         _clear_stale_flag(self)
+        # CommandInProgress BEFORE upstream's snapshot: with the rollback bar inside the
+        # tree that snapshot reads every feature name, 20.7 s without the flag on a
+        # 205-feature part against 0.3 s with it (measured 2026-11-16).
         try:
-            result = _ORIGINAL["run_guarded"](self, fn, *args, **kwargs)
+            flagged = self._command_in_progress(True)
+        except Exception:  # noqa: BLE001 - a dead link: upstream reattaches and sets it itself
+            flagged = None
+        try:
+            journal.note(self, "before")
+            try:
+                result = _ORIGINAL["run_guarded"](self, fn, *args, **kwargs)
+            finally:
+                journal.note(self, "after")
+                try:
+                    self._command_in_progress(flagged)
+                except Exception:  # noqa: BLE001 - the link died in the call
+                    pass
         except Exception as exc:
             # a lost link arrives as a SolidWorksError raised from the COM error
             hresult = getattr(exc, "hresult", None) or getattr(exc.__cause__, "hresult", None)
             if hresult in FAULTS:
                 _set(faults=_state["faults"] + 1, last_fault=f"{time.strftime('%H:%M:%S')} {tool}: {FAULTS[hresult]}")
             try:
-                release_ui(self)
+                # A refusal (a tool's own SolidWorksError) leaves upstream's restore intact:
+                # the full release walks every open document, 5-7 s with 48 of them open,
+                # so it runs only when something really is still switched off.
+                if not isinstance(exc, SolidWorksError) or hresult in FAULTS or _left_frozen(self):
+                    release_ui(self)
             except Exception:  # noqa: BLE001 - the original error is what the caller needs
                 pass
             if hresult in QUARANTINE_FAULTS:
@@ -438,6 +484,7 @@ def apply() -> None:
         _ORIGINAL["connect"] = SolidWorksSession.connect
         SolidWorksSession.run_guarded = _run_guarded
         SolidWorksSession.connect = _connect
+        journal.GUARDED = True
 
 
 def unapply() -> None:
@@ -446,3 +493,4 @@ def unapply() -> None:
         SolidWorksSession.run_guarded = _ORIGINAL["run_guarded"]
         SolidWorksSession.connect = _ORIGINAL["connect"]
         _ORIGINAL.clear()
+        journal.GUARDED = False

@@ -60,7 +60,14 @@ class FakeFeature:
         return (False,)
 
     def IsRolledBack(self):
+        bar = getattr(self.model, "bar", None)  # index of the first rolled-back feature
+        if bar is not None:
+            return self.model.features.index(self) >= bar
         return bool(getattr(self.model, "rolled_back", False)) and self is self.model.features[-1]
+
+    def IsFrozen(self):
+        lock = next((i for i, f in enumerate(self.model.features) if f.type_name == "LockFeature"), None)
+        return lock is not None and self.model.features.index(self) < lock
 
     def Select2(self, *a):
         self.model.selected.append(self)
@@ -92,6 +99,44 @@ class FakeFeatureManager:
 
     def GetFeatureCount(self, top):
         return len(self.model.features)
+
+    # freeze and rollback bars, as SolidWorks 2025 answers them
+    def GetFreezeLocation(self):
+        feats = self.model.features
+        lock = next((i for i, f in enumerate(feats) if f.type_name == "LockFeature"), None)
+        return feats[lock - 1] if lock else None
+
+    def EditFreeze(self, location, name, update_all):
+        feats = self.model.features
+        self.freeze_calls = getattr(self, "freeze_calls", []) + [(location, name)]
+        if not self.model.sw.toggles.get(461):
+            return 1  # no freeze bar while the option is off
+        old = next((f for f in feats if f.type_name == "LockFeature"), None)
+        if old is not None:
+            if getattr(self.model, "bar", None) is not None and feats.index(old) < self.model.bar:
+                self.model.bar -= 1
+            feats.remove(old)
+        if location == 4:  # to the top: nothing frozen
+            return 0
+        at = next((i for i, f in enumerate(feats) if f.Name == name), None)
+        if at is None:
+            return 1
+        feats.insert(at + 1, FakeFeature("Freeze***", "LockFeature", self.model))
+        if getattr(self.model, "bar", None) is not None and at + 1 <= self.model.bar:
+            self.model.bar += 1
+        return 0
+
+    def EditRollback(self, location, name):
+        feats = self.model.features
+        self.rollback_calls = getattr(self, "rollback_calls", []) + [(location, name)]
+        if location == 1:
+            self.model.bar = None
+            return True
+        at = next((i for i, f in enumerate(feats) if f.Name == name), None)
+        if at is None:
+            return False
+        self.model.bar = at
+        return True
 
 
 class FakeModel:
@@ -148,8 +193,14 @@ class FakeModel:
     def ForceRebuild3(self, *a):
         return True
 
-    def add(self, name):
-        self.features.append(FakeFeature(name, model=self))
+    def add(self, name, type_name="Extrusion"):
+        feat = FakeFeature(name, type_name, model=self)
+        if getattr(self, "bar", None) is not None:  # rolled back: new features land above the bar
+            self.features.insert(self.bar, feat)
+            self.bar += 1
+        else:
+            self.features.append(feat)
+        return feat
 
 
 class FakeSw:
@@ -157,6 +208,15 @@ class FakeSw:
         self.CommandInProgress = False
         self.docs = list(docs)
         self.ActiveDoc = docs[0] if docs else None
+        self.toggles = {}
+        for doc in docs:
+            doc.sw = self
+
+    def GetUserPreferenceToggle(self, key):
+        return bool(self.toggles.get(key, False))
+
+    def SetUserPreferenceToggle(self, key, value):
+        self.toggles[key] = bool(value)
 
     def GetDocuments(self):
         return tuple(self.docs)

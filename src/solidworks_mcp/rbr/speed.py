@@ -19,9 +19,12 @@ import os
 import time
 
 from .. import binding
+from ..constants import (SW_HOR_LINEAR_DIMENSION, SW_SEL_EXT_SKETCH_POINTS, SW_SEL_SKETCH_POINTS,
+                         SW_VERT_LINEAR_DIMENSION)
 from ..errors import SolidWorksError
 from ..session import SolidWorksSession
 
+SW_DOC_PART = 1
 FILLET_DIAG_S = float(os.environ.get("SWMCP_FILLET_DIAG_S", "15"))
 SW_DELETE_ABSORBED = 1
 
@@ -155,6 +158,43 @@ def list_edges(self, face=None, feature: str | None = None, within_mm=None,
     return {"ok": True, "count": len(out), "edges": out}
 
 
+def _coordinate_of(self, dimension_name: str):
+    """Upstream's _coordinate_of, finding the sketch with one FeatureByName call.
+
+    Upstream walks every feature and its sub-features to find the sketch a
+    dimension belongs to - on every set_dimension, also for a plane's or a
+    cut's dimension, where the walk finds nothing: 1.2-2.7 s on a 205-feature
+    part. A name FeatureByName does not resolve to that very sketch falls back
+    to upstream's walk.
+    """
+    dim_name, _, rest = dimension_name.partition("@")
+    if not rest or int(self._model.GetType()) != SW_DOC_PART:
+        return None
+    sketch_name = rest.split("@")[0]
+    mod = self._mod
+    try:
+        feature = binding.wrap(binding.wrap(self._model, mod.IPartDoc).FeatureByName(sketch_name), mod.IFeature)
+        if feature is None or feature.Name != sketch_name:
+            return _ORIGINAL["_coordinate_of"](self, dimension_name)
+        if feature.GetTypeName2() != "ProfileFeature":
+            return None
+    except Exception:  # noqa: BLE001 - anything odd: upstream's way
+        return _ORIGINAL["_coordinate_of"](self, dimension_name)
+    display = binding.wrap(feature.GetFirstDisplayDimension(), mod.IDisplayDimension)
+    while display is not None and binding.wrap(display.GetDimension2(0), mod.IDimension).Name != dim_name:
+        display = binding.wrap(feature.GetNextDisplayDimension(display), mod.IDisplayDimension)
+    if display is None or display.Type2 not in (SW_HOR_LINEAR_DIMENSION, SW_VERT_LINEAR_DIMENSION):
+        return None
+    annotation = binding.wrap(display.GetAnnotation(), mod.IAnnotation)
+    attached = list(zip(annotation.GetAttachedEntities3() or (), annotation.GetAttachedEntityTypes() or ()))
+    points = [binding.wrap(e, mod.ISketchPoint) for e, t in attached if t == SW_SEL_SKETCH_POINTS]
+    origins = [binding.wrap(e, mod.ISketchPoint) for e, t in attached if t == SW_SEL_EXT_SKETCH_POINTS]
+    if len(points) != 1 or len(origins) != 1:
+        return None
+    axis = "X" if display.Type2 == SW_HOR_LINEAR_DIMENSION else "Y"
+    return lambda: (getattr(points[0], axis) - getattr(origins[0], axis)) * 1000.0
+
+
 def rebuild_profile(session, top: int = 15) -> dict:
     """Rebuild the current part once and report how long each feature takes."""
     model = session._require_model()
@@ -180,7 +220,8 @@ def rebuild_profile(session, top: int = 15) -> dict:
 def apply() -> None:
     if _ORIGINAL:
         return
-    for name, fn in (("_fillet_refusal", _fillet_refusal), ("list_edges", list_edges)):
+    for name, fn in (("_fillet_refusal", _fillet_refusal), ("list_edges", list_edges),
+                     ("_coordinate_of", _coordinate_of)):
         _ORIGINAL[name] = getattr(SolidWorksSession, name)
         fn.__wrapped__ = _ORIGINAL[name]
         fn.__doc__ = _ORIGINAL[name].__doc__

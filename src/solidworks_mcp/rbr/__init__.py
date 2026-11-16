@@ -13,8 +13,9 @@ import functools
 import os
 
 from ..errors import SolidWorksError
-from . import (bodies as bodies_mod, cavity, equations, export_check, fastpath, features, flow, geom, guard, health, image, jobs, journal,
-               library, offset_loop, param, script_tool, solidcam, speed, tools)
+from . import (apiref, batch, bodies as bodies_mod, cavity, context, equations, export_check, fastpath, features, flow, geom, guard, health,
+               image, jobs, journal, library, offset_loop, param, render, scope, script_tool, section, solidcam,
+               speed, sweep, tools)
 
 __all__ = ["register"]
 
@@ -249,6 +250,7 @@ def register(server) -> None:
     speed.apply()
     guard.apply()    # before the journal, so the journal times the guard too
     journal.apply()
+    context.apply()
     _patch_new_documents()
     _patch_shell_check_result()
     _patch_screenshot()
@@ -261,6 +263,20 @@ def register(server) -> None:
         mcp._mcp_server.instructions = (mcp._mcp_server.instructions or "") + INSTRUCTIONS
     except AttributeError:
         pass
+
+    upstream_call = call
+
+    def _in_request(fn):
+        """`fn` with the change report / body scope / expectations of the tool call in progress."""
+        request = scope.REQUEST.get()
+        if request is None:
+            return fn
+        return scope.runner(session, fn, request["tool"], request.get("bodies"), request.get("expect"))
+
+    async def call(fn, *args, **kwargs):  # noqa: F811 - replaces server._call for upstream's tools too
+        return await upstream_call(_in_request(fn), *args, **kwargs)
+
+    server._call = call
 
     if worker is not None and not getattr(worker, "_rbr_fail_fast", False):
         original_call = worker.call
@@ -282,6 +298,7 @@ def register(server) -> None:
         busy = None if fn is guard.release_ui else guard.busy_error()
         if busy:
             return {"ok": False, "error": busy}
+        fn = _in_request(fn)
         fut = worker.submit(lambda: session.run_guarded(fn, *args))
         try:
             return await asyncio.wait_for(asyncio.wrap_future(fut), limit)
@@ -483,6 +500,7 @@ def register(server) -> None:
             return {"ok": True, "version": RBR_VERSION, "server": st,
                     "queued": worker._queue.qsize() if worker is not None else 0,
                     "lock_holder": guard._lock.holder(), "owners": guard.owners(),
+                    "edit_context": context.seen(),
                     "sldworks_memory": health.sldworks_memory(),
                     "recent_errors": [{k: e.get(k) for k in ("ts", "pid", "tool", "doc", "error")}
                                       for e in last.get("entries", [])]}
@@ -526,6 +544,169 @@ def register(server) -> None:
         inside and the mm^3 sticking out, via intersections of copies (the parts are untouched).
         Both parts must share their origin, as master-model parts built from one skeleton do."""
         return await _timed(geom.check_containment, session, envelope, keepout, timeout_s=600)
+
+    # --- working mid-tree (1.10.0) ---------------------------------------------------
+
+    @mcp.tool()
+    async def edit_context(freeze_to: str | None = None, rollback_before: str | None = None,
+                           end: bool = False) -> dict:
+        """Work in the middle of a big part without rebuilding all of it: freeze the tree
+        down to and including `freeze_to` (SolidWorks' freeze bar) and/or roll it back to just
+        before `rollback_before` (both list_features names). Rebuilds then cover only the
+        features in between: on a 205-feature part set_dimension took 10 s, 3-4 s inside such
+        a context. New features land above the rollback bar and are named correctly there.
+        While rolled back, mass properties describe the rolled-back part and save_part is
+        refused. end=True moves both bars back (the rolled-back features rebuild once) and
+        reports failing_features. With no arguments: where the bars are now. The state also
+        shows in get_status and server_health."""
+        return await _timed(context.edit_context, session, freeze_to, rollback_before, end, timeout_s=600)
+
+    # --- pictures (1.10.0): rendered off-screen, and returned in the reply ------------------
+
+    def _with_image(result: dict, inline: bool):
+        """The result, followed by the picture itself as MCP image content."""
+        if not (inline and isinstance(result, dict) and result.get("ok") and result.get("path")):
+            return result
+        try:
+            from mcp.server.fastmcp import Image
+            data = image.inline_png(result["path"])
+            if data is None:
+                result["inline"] = "left out: the file is too large to send inline; read it from `path`"
+                return result
+            return [result, Image(data=data, format="png")]
+        except Exception as exc:  # noqa: BLE001 - the file is there: the picture is a convenience
+            result["inline"] = f"left out: {type(exc).__name__}: {exc}"
+            return result
+
+    try:
+        mcp.remove_tool("screenshot")  # upstream's: window capture only, answers a path
+    except Exception:  # noqa: BLE001 - an mcp without remove_tool: ours is registered under its own name
+        pass
+
+    @mcp.tool(structured_output=False)
+    async def screenshot(path: str | None = None, view: str = "iso", zoom_mm: list | None = None,
+                         show_planes: bool = False, from_dir: list | None = None, mode: str = "auto",
+                         width: int = 1200, height: int = 800, inline: bool = True,
+                         document: str | None = None, bodies: list | str | None = None):
+        """A picture of the current part or assembly, returned in the reply (and saved as PNG).
+
+        view: 'iso' (default), 'front', 'back', 'left', 'right', 'top', 'bottom'; or from_dir =
+        [x, y, z], the direction to look from (the model's +y stays up). zoom_mm = [[x1, y1, z1],
+        [x2, y2, z2]]: the region to fill the image (model mm).
+        mode 'render' (the default 'auto' picks it when numpy is installed) draws the solids
+        off-screen from SolidWorks' display tessellation: it needs no window, so it also works
+        for a document that is not active or not visible (document='title' renders any open
+        document without making it current), does not change the user's view and does not hang
+        on big assemblies; bodies limits a part to the named bodies. Smooth shading, one colour
+        per body or component, outlines; no sketches, planes or appearances.
+        mode 'window' captures the SolidWorks window instead (true appearances; show_planes
+        keeps planes and axes): it fronts the document and changes its view; jpg/tif paths too.
+        path: where to save (default: a file under the server's home folder). inline=False
+        answers the path only. width, height: the picture's size in pixels (render)."""
+        want = str(mode).lower()
+        if want not in ("auto", "render", "window"):
+            return {"ok": False, "error": f"Unknown mode '{mode}': use 'auto', 'render' or 'window'."}
+        if want == "auto":
+            wants_window = show_planes or (path is not None and not str(path).lower().endswith(".png"))
+            want = "window" if (wants_window or not render.available()) else "render"
+        if want == "render":
+            result = await _timed(render.render_view, session, path, view, zoom_mm, from_dir, width, height,
+                                  document, bodies, timeout_s=120)
+        else:
+            if document is not None or bodies is not None:
+                return {"ok": False, "error": "document= and bodies= need mode='render'; the window capture "
+                                              "shows the current document as it is on screen."}
+            target = path or render.default_path("window", "shot")
+            result = await _timed(session.screenshot, target, view, zoom_mm, show_planes, from_dir, timeout_s=120)
+            if isinstance(result, dict) and result.get("ok"):
+                result["mode"] = "window"
+        return _with_image(result, inline)
+
+    server._rbr_screenshot = screenshot
+
+    @mcp.tool(structured_output=False)
+    async def section_screenshot(point_mm: list, normal: str | list = "z", zoom_mm: list | None = None,
+                                 path: str | None = None, from_dir: list | None = None, width: int = 1200,
+                                 height: int = 800, inline: bool = True, document: str | None = None,
+                                 bodies: list | str | None = None):
+        """A picture of the part or assembly cut by a plane, returned in the reply: the plane
+        through point_mm [x, y, z] with `normal` ('x', '-y', 'z' or [nx, ny, nz]); what lies
+        on the normal's side is left out and the cut faces are painted red. Looks straight at
+        the cut (the picture's right and up are the plane's u_axis and v_axis, the same frame
+        as section_profile); from_dir = [x, y, z] looks from elsewhere on the normal's side,
+        e.g. [1, 1, 1]. zoom_mm = [[x1, y1, z1], [x2, y2, z2]] fills the image with a detail.
+        Rendered off-screen (see screenshot): nothing changes in SolidWorks, no section view is
+        switched on, and document='title' cuts any open document. For measuring, use
+        section_profile."""
+        result = await _timed(section.section_view, session, point_mm, normal, zoom_mm, path, from_dir, width,
+                              height, document, bodies, timeout_s=120)
+        return _with_image(result, inline)
+
+    @mcp.tool()
+    async def section_profile(point_mm: list, normal: str | list = "z", bodies: list | str | None = None,
+                              document: str | None = None) -> dict:
+        """The exact contours of a part's section by the plane through point_mm with `normal`
+        ('x', '-y', 'z' or [nx, ny, nz]), in mm - for measuring walls. Per body and region:
+        area, and each contour (outer / inner) as its segments in order: line, arc or circle
+        (centre, radius), spline (points), with start and end both in model mm and in the
+        plane's own (u, v). wall_mm on a segment is the thickness of the material there,
+        across it from the segment's middle; min_wall_mm the thinnest. Taken from copies of
+        the bodies cut by SolidWorks itself: exact geometry, and the part is not touched (no
+        feature, no rebuild). bodies: body names (default all visible); document: an open part
+        by title without making it current."""
+        return await _timed(section.section_profile, session, point_mm, normal, bodies, document, timeout_s=300)
+
+    # --- many at once (1.10.0) ---------------------------------------------------------
+
+    @mcp.tool()
+    async def read_sketches(names: list | str | None = None, dimensions: bool = True) -> dict:
+        """Read several sketches of the current part in ONE call (names: list_features names,
+        2D or 3D, also sketches a feature absorbed; None = every sketch): per sketch its
+        lines, arcs, circles and splines in MODEL mm (construction marked), its dimensions and
+        whether it is fully defined - read_sketch's content, without opening a sketch and
+        without a rebuild. 15 sketches of a 205-feature part take about a second
+        (read_sketch: ~14 s each). A name that is no sketch comes back in `missing`."""
+        return await call(batch.read_sketches, session, names, dimensions)
+
+    @mcp.tool()
+    async def set_dimensions(values: dict) -> dict:
+        """Set several driving dimensions, then rebuild ONCE: values = {'D1@Boss': 12,
+        'x@SK_A': -3.5, 'D1@Angle1': 30} (mm; degrees for angles; a point's coordinate takes a
+        sign, as in set_dimension). Every value is read back after the rebuild; when SolidWorks
+        did not take one (an equation drives it, a size of 0) all of them are put back and the
+        error names it. Returns old and new values, failing_features and mass properties."""
+        return await call(batch.set_dimensions, session, values)
+
+    # --- a channel or a rod along a route (1.10.0) ---------------------------------------
+
+    @mcp.tool()
+    async def add_sketch3d(points_mm: list, bend_radius_mm: float | None = None, fillets: list | None = None,
+                           name: str | None = None, vars: dict | None = None) -> dict:
+        """A 3D sketch of straight runs through points_mm = [[x, y, z], ...] (model mm) in the
+        current part - a route for sweep_cut / sweep_boss. bend_radius_mm rounds every corner,
+        or fillets = one radius per interior corner (0 = sharp). The rounding is a real sketch
+        fillet: its radius is a dimension (`radius`, or `r<corner>` when they differ) that
+        set_dimension changes, the runs staying where they are; vars links it to a global
+        variable ({'radius': 'HOSE_R'}). Refuses a radius that does not fit between two
+        corners. Returns the sketch's name, its dimensions and the route's length."""
+        return await call(sweep.add_sketch3d, session, points_mm, bend_radius_mm, fillets, name, vars)
+
+    @mcp.tool()
+    async def sweep_cut(path: str, diameter_mm: float | None = None, profile: str | None = None,
+                        name: str | None = None) -> dict:
+        """Cut a channel along a sketch of the current part (2D or 3D, e.g. add_sketch3d's): a
+        round profile of diameter_mm, perpendicular to the path - its diameter comes back as
+        dimensions.diameter - or a closed profile sketch that crosses the path. One feature in
+        the existing body. A cut that removes nothing is rolled back; removed_mm3 is to check
+        against pi d^2 / 4 x length."""
+        return await call(sweep.sweep_cut, session, path, diameter_mm, profile, name)
+
+    @mcp.tool()
+    async def sweep_boss(path: str, diameter_mm: float | None = None, profile: str | None = None,
+                         name: str | None = None, merge: bool = True) -> dict:
+        """Add material along a sketch of the current part: a round rod of diameter_mm or a
+        profile sketch swept along the path; merge=False keeps it a separate body."""
+        return await call(sweep.sweep_boss, session, path, diameter_mm, profile, name, merge)
 
     # --- parametric building on SolidWorks objects ---------------------------------
 
@@ -914,6 +1095,17 @@ def register(server) -> None:
         return _local(guard.release_document, title)
 
     @mcp.tool()
+    async def api_search(query: str, kind: str = "any", interface: str | None = None, limit: int = 30) -> dict:
+        """Find a method, property or constant of the INSTALLED SolidWorks API by name or words
+        (case-blind): api_search('InsertCutSwept') gives each method's parameters in call
+        order and its help line; 'IFeatureManager.EditFreeze' or interface= narrows to one
+        interface; kind 'method' / 'property' / 'constant' - constants are the swconst enum
+        values (api_search('freeze', kind='constant') -> swMoveFreezeBarTo_e.swMoveFreezeBarToTop
+        = 4). Use it before writing a run_script call you are not sure of; api(obj) inside a
+        script lists one object's members."""
+        return await call(apiref.api_search, session, query, kind, interface, limit)
+
+    @mcp.tool()
     async def tool_source(name: str) -> dict:
         """The Python code a tool runs (its MCP wrapper and the session method), to see exactly
         which SolidWorks API calls it makes."""
@@ -999,3 +1191,65 @@ def register(server) -> None:
 
     # The upstream run_script is not upstream; keep tool_source able to find ours.
     server._rbr_run_script = run_script
+
+    _extend_builders(mcp)
+
+
+BODIES_DOC = (" bodies=[names]: the feature acts on these bodies only (list_bodies names), the others "
+              "stay as they are.")
+EXPECT_DOC = (" expect={'volume': 'decrease', 'bodies': 'same', ...}: the call fails and what it added is "
+              "removed when it does otherwise (keys: volume, volume_mm3 [low, high], bodies, changed_bodies, "
+              "no_errors, fully_defined). The result's `change` gives each body's volume before and after.")
+
+
+def _extend_builders(mcp) -> None:
+    """Give every building tool expect= (and the cuts, bosses and holes bodies=): the tool is
+    registered again under its name with those parameters added; scope.runner does the work."""
+    import inspect
+    try:
+        registered = list(mcp._tool_manager.list_tools())
+    except Exception:  # noqa: BLE001 - an mcp without a tool manager: the tools stay as they are
+        return
+    for tool in registered:
+        name, original = tool.name, tool.fn
+        if not scope.is_builder(name) or getattr(original, "_rbr_extended", False):
+            continue
+        signature = inspect.signature(original)
+        extra = []
+        if name in scope.SCOPED and "bodies" not in signature.parameters:
+            extra.append(inspect.Parameter("bodies", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None,
+                                           annotation=list | str | None))
+        if "expect" not in signature.parameters:
+            extra.append(inspect.Parameter("expect", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None,
+                                           annotation=dict | None))
+        extended = signature.replace(parameters=[*signature.parameters.values(), *extra])
+        added = {p.name for p in extra}
+
+        def make(tool_name, fn, sig, own):
+            async def wrapper(*args, **kwargs):
+                bound = sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+                request = {"tool": tool_name,
+                           "bodies": bound.arguments.pop("bodies") if "bodies" in own else None,
+                           "expect": bound.arguments.pop("expect") if "expect" in own else None}
+                token = scope.REQUEST.set(request)
+                try:
+                    return await fn(*bound.args, **bound.kwargs)
+                finally:
+                    scope.REQUEST.reset(token)
+
+            wrapper.__name__ = tool_name
+            wrapper.__qualname__ = tool_name
+            wrapper.__doc__ = fn.__doc__
+            wrapper.__signature__ = sig
+            wrapper.__wrapped_tool__ = fn
+            wrapper._rbr_extended = True
+            return wrapper
+
+        description = (tool.description or "") + (BODIES_DOC if "bodies" in added else "") + EXPECT_DOC
+        try:
+            mcp.remove_tool(name)
+            mcp.add_tool(make(name, original, extended, added), name=name, description=description)
+        except Exception:  # noqa: BLE001 - keep the tool as it was rather than lose it
+            if name not in {t.name for t in mcp._tool_manager.list_tools()}:
+                mcp.add_tool(original, name=name, description=tool.description)

@@ -253,11 +253,12 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
 
     def tree_before():
         """A snapshot for features_added / rename_new, taken before the risky call."""
-        return journal.tree_state(session)
+        return journal.tree_state(session, names=True)
 
     def features_added(before):
-        """Names of the features appended since the tree_before() snapshot."""
-        return journal.tree_added(session, before, journal.tree_state(session))
+        """Names of the features added since the tree_before() snapshot, in tree order -
+        also when they landed mid-tree, above the rollback bar."""
+        return journal.tree_added(session, before, journal.tree_state(session, names=True))
 
     def rename_new(before, name):
         """Rename the newest feature added since `before` (a tree_before() snapshot).
@@ -388,7 +389,7 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
 def run_script(session, code: str, args: dict | None = None) -> dict:
     out = []
     ns = namespace(session, out, args)
-    before = journal.tree_state(session)
+    before = journal.tree_state(session, names=True)
     t0 = time.perf_counter()
     try:
         exec(compile(code, "<run_script>", "exec"), ns)  # noqa: S102 - the point of the tool
@@ -399,7 +400,7 @@ def run_script(session, code: str, args: dict | None = None) -> dict:
         stdout = "".join(out)[-4000:]
         raise SolidWorksError(f"Script failed: {type(exc).__name__}: {exc}\n{tb}\nstdout:\n{stdout}")
     elapsed = round(time.perf_counter() - t0, 3)
-    after = journal.tree_state(session)
+    after = journal.tree_state(session, names=True)
     stdout = "".join(out)
     res = {
         "ok": True,
@@ -408,7 +409,12 @@ def run_script(session, code: str, args: dict | None = None) -> dict:
         "stdout": stdout[-MAX_OUT:],
         "stdout_truncated": len(stdout) > MAX_OUT,
     }
-    if before and after and before["title"] == after["title"] and before["count"] != after["count"]:
-        res["features"] = {"before": before["count"], "after": after["count"],
-                           "added": journal.tree_added(session, before, after)}
+    if before and after and before["title"] == after["title"]:
+        added = journal.tree_added(session, before, after)
+        if added or before["count"] != after["count"]:
+            res["features"] = {"before": before["count"], "after": after["count"], "added": added}
+            gone = set(after.get("names") or ())
+            removed = [n for n in before.get("names") or () if n not in gone]
+            if removed:
+                res["features"]["removed"] = removed[:50]
     return res

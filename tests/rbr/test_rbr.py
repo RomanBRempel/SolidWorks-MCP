@@ -71,13 +71,33 @@ def test_rollback_noop_when_nothing_added(fake_session):
     assert len(fake_session._history()) == 2
 
 
-def test_rollback_bar_mid_tree_uses_upstream_snapshot(fake_session):
-    fake_session._model.rolled_back = True
+def test_rollback_bar_mid_tree_snapshot_names_the_bar(fake_session):
+    fake_session._model.bar = 4  # Boss1 is rolled back
     snap = fake_session._history_snapshot()
-    assert snap[0] == "P.SLDPRT" and snap[1] == {"Sketch1", "Boss1"}  # the upstream shape
-    fake_session._model.add("Extra")
-    fake_session._roll_back(snap)
+    assert snap == ("bar", "P.SLDPRT", "Sketch1", "Boss1", 5)  # between which two features the bar lies
+    fake_session._model.add("Extra")  # lands above the bar, not at the end
+    assert [f.Name for f in fake_session._history()] == ["Sketch1", "Extra", "Boss1"]
+    assert fake_session._roll_back(snap) == []
     assert [f.Name for f in fake_session._history()] == ["Sketch1", "Boss1"]
+
+
+def test_rollback_leaves_the_tree_alone_when_the_call_moved_the_bar(fake_session):
+    fake_session._model.bar = 4
+    snap = fake_session._history_snapshot()
+    fake_session._model.bar = None  # the call rolled forward: Boss1 is live again
+    fake_session._model.add("Extra")
+    assert fake_session._roll_back(snap) == []
+    assert [f.Name for f in fake_session._history()] == ["Sketch1", "Boss1", "Extra"]  # nothing guessed
+
+
+def test_refused_call_that_added_nothing_does_not_rebuild(fake_session):
+    rebuilds = []
+    fake_session._model.ForceRebuild3 = lambda *a: rebuilds.append(a) or True
+    assert fake_session._remove_features_since({"Sketch1", "Boss1"}) == []
+    assert rebuilds == []
+    fake_session._model.add("Extra")
+    assert fake_session._remove_features_since({"Sketch1", "Boss1"}) == []
+    assert len(rebuilds) == 1
 
 
 def test_rollback_other_document_does_nothing(fake_session):
