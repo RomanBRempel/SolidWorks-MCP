@@ -18,16 +18,29 @@ WATCHED = ["_iter_features", "_history_snapshot", "_roll_back", "_remove_feature
            "run_guarded", "new_part", "new_assembly", "_pick_planar_face", "_body_faces", "_solid_body",
            "_component_by_name", "_require_model", "_require_part", "_require_assembly", "_quiet",
            "connect", "add_shell", "_fillet_refusal", "list_edges", "_edge_entry", "_largest_rounds", "_persist_refs", "_uniform_fillet", "_face_edges", "_feature_edges", "_box_corners", "_MAX_FILLET_TRIALS", "_thin_walls", "_face_triangles", "_reattach_if_gone", "_command_in_progress", "_quiet_ui", "_wake_all",
-           "_face_index", "_parse_face_selector", "_planar_face_by_normal"]  # flow.py picks faces with these
+           "_face_index", "_parse_face_selector", "_planar_face_by_normal",  # flow.py picks faces with these
+           # 1.10.0 - patched: context.py (the newest feature stops at the rollback bar, status, save),
+           "_last_ref_plane", "_last_feature_name", "_model_axis", "cut_offset_pocket", "get_status", "save_part",
+           # speed.py / batch.py (a dimension's coordinate), query.py (selectors take references),
+           "_coordinate_of", "_parse_edge_indices", "_select_face_through", "_select_planar_face",
+           # __init__.py (screenshot, export, equations) -
+           "screenshot", "export", "set_equations",
+           # and relied on: sketch_datum.py, script_tool.py, derive.py, bodies.py
+           "add_sketch", "_origin_point", "_sketch_coords", "_radius_dimensions", "_arc_count", "_sketch_by_name",
+           "_dimension_entries", "_dimension_unit", "_equation_entries", "_equation_lhs", "_body_box",
+           "_part_bodies", "insert_component", "activate_document", "_open_documents", "_failing_features"]
 
 
 def _original(name):
     from solidworks_mcp.session import SolidWorksSession
-    from solidworks_mcp.rbr import fastpath, guard, journal, speed
+    from solidworks_mcp.rbr import context, fastpath, guard, journal, query, speed
     fn = (fastpath._ORIGINAL.get(name) or speed._ORIGINAL.get(name) or guard._ORIGINAL.get(name)
-          or journal._ORIGINAL.get(name)
+          or journal._ORIGINAL.get(name) or context._ORIGINAL.get(name) or query._ORIGINAL.get(name)
           or getattr(SolidWorksSession, name, None))
-    return getattr(fn, "__wrapped__", fn)  # new_part/new_assembly carry the original
+    fn = getattr(fn, "__func__", fn)       # a staticmethod read off the class
+    while getattr(fn, "__wrapped__", None) is not None:   # new_part, screenshot, export ... carry the original
+        fn = fn.__wrapped__
+    return fn
 
 
 def current_hashes() -> dict:

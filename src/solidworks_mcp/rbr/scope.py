@@ -46,7 +46,7 @@ SCOPED = frozenset({
 BUILDER_PREFIXES = ("add_", "cut_", "extrude_", "sweep_", "loft_", "mirror_", "combine_", "split_")
 BUILDERS_EXTRA = frozenset({"move_copy_body", "delete_bodies", "insert_part", "set_feature_scope"})
 NOT_BUILDERS = frozenset({"add_configuration", "add_mate", "add_relation", "add_sketch", "add_plane",
-                          "add_sketch3d", "split_line_project"})
+                          "add_sketch3d", "split_line_project", "add_dimension"})
 
 EXPECT_KEYS = ("volume", "volume_mm3", "bodies", "changed_bodies", "no_errors", "fully_defined")
 
@@ -123,18 +123,27 @@ def check_expect(expect: dict, change: dict) -> list:
         if not ok:
             failed.append(f"volume was to {want}, it changed by {delta:+.3f} mm^3")
     if expect.get("volume_mm3") is not None:
-        low, high = sorted(float(v) for v in expect["volume_mm3"])
+        try:
+            low, high = sorted(float(v) for v in expect["volume_mm3"])
+        except (TypeError, ValueError):
+            raise SolidWorksError("expect volume_mm3 is [low, high], the range the volume change must lie in, "
+                                  f"e.g. [-2100, -1900] (got {expect['volume_mm3']!r}).") from None
         if not low - VOLUME_TOL_MM3 <= delta <= high + VOLUME_TOL_MM3:
             failed.append(f"the volume change was to lie in [{low:g}, {high:g}] mm^3, it is {delta:+.3f}")
     want = expect.get("bodies")
     if want is not None:
         count0, count1 = change["body_count"]["before"], change["body_count"]["after"]
         text = str(want).strip().lower()
-        target = count0 if text == "same" else count0 + int(text) if text[:1] in "+-" else int(text)
+        try:
+            target = count0 if text == "same" else count0 + int(text) if text[:1] in "+-" else int(text)
+        except ValueError:
+            raise SolidWorksError("expect bodies is 'same', a count such as 2, or a change such as '+1' / '-1' "
+                                  f"(got {want!r}).") from None
         if count1 != target:
             failed.append(f"{target} bodies were expected after the call, there are {count1} (before: {count0})")
     if expect.get("changed_bodies") is not None:
-        wanted = set(bodies_mod.as_names(expect["changed_bodies"]))
+        named = expect["changed_bodies"]   # [] says: no body may change
+        wanted = set() if isinstance(named, (list, tuple)) and not named else set(bodies_mod.as_names(named))
         changed = {row.get("was", row["body"]) for row in change["bodies"] if abs(row["delta_mm3"]) > VOLUME_TOL_MM3}
         if changed != wanted:
             failed.append(f"bodies {sorted(wanted)} were to change, {sorted(str(c) for c in changed) or 'none'} did")

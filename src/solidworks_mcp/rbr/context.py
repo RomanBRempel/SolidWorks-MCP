@@ -192,6 +192,22 @@ def _index_of(names: list, name: str, what: str) -> int:
     return names.index(name)
 
 
+SKETCH_TYPES = ("ProfileFeature", "3DProfileFeature")
+
+
+def bar_is_before(names: list, kinds: list, wanted: int, bar_name) -> bool:
+    """Is the rollback bar, reported as lying before `bar_name`, where "before
+    names[wanted]" puts it? Pure. A feature rolls back together with the
+    sketches it absorbed, which the history lists right before it: rolling back
+    before a boss made from one sketch leaves the bar before that sketch (seen
+    on SW 2025 SP3 - the first test part with a plain boss; the 205-feature
+    part had been rolled back before a free-standing sketch)."""
+    if bar_name not in names:
+        return False
+    at = names.index(bar_name)
+    return at <= wanted and all(kind in SKETCH_TYPES for kind in kinds[at:wanted])
+
+
 def _enable_freeze_bar(session, fm) -> None:
     """Switch on the 'Enable Freeze bar' option - with the feature tree enabled.
 
@@ -267,7 +283,9 @@ def edit_context(session, freeze_to: str | None = None, rollback_before: str | N
                 "failing_features": session._failing_features(), "whats_wrong": geom.whats_wrong(session),
                 "elapsed_s": round(time.perf_counter() - t0, 2)}
 
-    names = [f.Name for f in session._history()]
+    history = session._history()
+    names = [f.Name for f in history]
+    kinds = [f.GetTypeName2() for f in history] if rollback_before else []
     freeze_at = _index_of(names, freeze_to, "freeze up to") if freeze_to else None
     roll_at = _index_of(names, rollback_before, "roll back before") if rollback_before else None
     bar_now = names.index(before["rolled_back_before"]) if before.get("rolled_back_before") in names else len(names)
@@ -302,7 +320,7 @@ def edit_context(session, freeze_to: str | None = None, rollback_before: str | N
             raise SolidWorksError(
                 f"SolidWorks did not freeze up to '{freeze_to}' (the freeze bar is at {now.get('frozen_to')!r}): "
                 "name a feature of the tree's top level, not a sketch absorbed by another feature.")
-        if rollback_before and now.get("rolled_back_before") != rollback_before:
+        if rollback_before and not bar_is_before(names, kinds, roll_at, now.get("rolled_back_before")):
             raise SolidWorksError(f"SolidWorks did not roll back before '{rollback_before}' (the bar is before "
                                   f"{now.get('rolled_back_before')!r}).")
     except Exception:

@@ -335,7 +335,7 @@ def test_builtin_scripts_parse():
 def test_register_adds_tools_without_touching_upstream(swmcp_home):
     import asyncio
     from solidworks_mcp import server
-    from solidworks_mcp.rbr import guard, register, speed
+    from solidworks_mcp.rbr import context, guard, instance, query, register, speed
     before = {t.name for t in asyncio.run(server.mcp.list_tools())}
     try:
         register(server)
@@ -350,7 +350,17 @@ def test_register_adds_tools_without_touching_upstream(swmcp_home):
                 "plane_normal_to_line", "mirror_features", "mirror_body",
                 "sketch_intersection", "sketch_trim_region", "sketch_offset_chain", "split_line_project",
                 "loft_cut", "cut_offset_from_surface"} <= new
-        assert before <= after  # every upstream tool still there
+        assert {"edit_context", "section_screenshot", "section_profile", "read_sketches", "set_dimensions",   # 1.10.0
+                "add_sketch3d", "sweep_cut", "sweep_boss", "find_faces", "find_edges", "fully_define_sketch",
+                "add_dimension", "sketch_fillet", "derive_part", "list_external_refs", "update_external_refs",
+                "dialog_list", "dialog_respond", "sw_instances", "api_search"} <= new
+        assert before <= after  # every upstream tool still there (screenshot and add_sketch replaced under their names)
+        tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
+        assert {"datum_x", "datum_y"} <= set(tools["add_sketch"].inputSchema["properties"])
+        assert {"mode", "document", "bodies"} <= set(tools["screenshot"].inputSchema["properties"])
+        assert {"bodies", "expect"} <= set(tools["cut_sketch"].inputSchema["properties"])
+        assert "rollback_on_error" in tools["run_script"].inputSchema["properties"]
+        assert "dialog_list" not in guard.READ_ONLY and "list_external_refs" in guard.READ_ONLY
     finally:
         # register() patches SolidWorksSession itself: undo, or the journal-wrapped
         # run_guarded leaks into the upstream tests (and writes a real journal).
@@ -358,7 +368,10 @@ def test_register_adds_tools_without_touching_upstream(swmcp_home):
         guard.unapply()
         speed.unapply()
         fastpath.unapply()
-        for name in ("new_part", "new_assembly", "add_shell", "export"):  # each carries its original
+        context.unapply()
+        query.uninstall()
+        instance.unapply()
+        for name in ("new_part", "new_assembly", "add_shell", "export", "screenshot", "set_equations"):  # each carries its original
             fn = getattr(SolidWorksSession, name)
             if hasattr(fn, "__wrapped__"):
                 setattr(SolidWorksSession, name, fn.__wrapped__)

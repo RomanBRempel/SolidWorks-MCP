@@ -648,15 +648,41 @@ def _distance_to_ring(point, ring) -> float:
     return min(offset_loop._segment_distance(point, a, b) for a, b in zip(ring, ring[1:] + ring[:1]))
 
 
+def loop_depths(loops: list) -> list:
+    """For each closed loop (a polygon) how many of the others contain it; pure. Depth 0 is
+    an outer contour, 1 a hole in it, 2 an island in the hole: material lies inside the
+    loops of even depth and outside those of odd depth."""
+    return [sum(1 for j, other in enumerate(loops) if j != i and offset_loop.point_in_polygon(loop[0], other))
+            for i, loop in enumerate(loops)]
+
+
+def assign_to_loops(pieces: list, loops: list, tol: float = 0.02) -> list:
+    """Which loop each piece (a sampled segment) lies on, by its middle point; None for a
+    piece on no loop (it never closed). Pure."""
+    owners = []
+    for piece in pieces:
+        middle = piece[len(piece) // 2]
+        best = min(range(len(loops)), key=lambda j: _distance_to_ring(middle, loops[j]), default=None)
+        owners.append(best if best is not None and _distance_to_ring(middle, loops[best]) <= tol else None)
+    return owners
+
+
 def sketch_offset_chain(session, sketch: str, distance_mm: float, inward: bool = True,
                         original_to_construction: bool = True, link_to: str | None = None) -> dict:
-    """Offset the closed contour of a sketch as one chain (SketchOffset2) by
-    distance_mm to the inside (or outside) - a wall's thickness - and turn the
-    original contour into construction geometry, so the offset is the profile.
+    """Offset the closed contour(s) of a sketch (SketchOffset2, one chain per contour) by
+    distance_mm into the material (inward) or away from it - a wall's thickness - and
+    turn the original contour into construction geometry, so the offset is the profile.
 
-    The side is checked against the contour, not guessed from the sign: an
-    offset on the wrong side is deleted and redone the other way. The offset
-    gets one dimension; link_to names a global variable to drive it.
+    A hollow contour (an outline with holes in it) is taken loop by loop: the outline is
+    offset to its inside, a hole to its outside, both into the material between them.
+    The side is checked against the contour, not guessed from the sign: an offset on the
+    wrong side is deleted and redone the other way. Each loop's offset gets a dimension;
+    link_to names a global variable to drive them all.
+
+    A limit of SolidWorks' offset, not of this tool: where the contour is narrower than
+    twice the distance (the tip of a wedge, a thin web) no offset exists and the call is
+    refused; cut the thin end off first (sketch_trim_region), or build the wall on the
+    face with offset_face_loop, which drops the collapsed pieces.
     """
     from . import param
     if distance_mm <= 0:
@@ -679,36 +705,52 @@ def sketch_offset_chain(session, sketch: str, distance_mm: float, inward: bool =
         locked = [se.locked_by(session, s) for s in chain]
         pieces = [[(m_to_mm(p[0]), m_to_mm(p[1])) for p in _sample_seg(session, s)] for s in chain]
         loops = rings(pieces, 0.01)
-        if len(loops) != 1 or sum(len(p) for p in pieces) - len(pieces) > len(loops[0]) + 1:
-            raise SolidWorksError(f"'{sketch}' is not one closed contour ({len(loops)} closed loops of "
-                                  f"{len(chain)} segments): trim it first (sketch_trim_region).")
-        polygon = loops[0]
+        owners = assign_to_loops(pieces, loops) if loops else []
+        if not loops or any(owner is None for owner in owners):
+            stray = sum(1 for owner in owners if owner is None) if loops else len(chain)
+            raise SolidWorksError(f"'{sketch}' is not made of closed contours only ({len(loops)} closed loop(s), "
+                                  f"{stray} of {len(chain)} segments on none): trim it first (sketch_trim_region).")
+        depths = loop_depths(loops)
+        polygon = max(loops, key=offset_loop.polygon_area)
         keys_before = {se._seg_key(s) for s in _segments(session, sk)}
-        sign = 1.0
-        for _attempt in range(2):
-            model.ClearSelection2(True)
-            picked = sum(1 for s in chain if s.Select4(True, None))
-            if picked != len(chain):
-                raise SolidWorksError("Could not select the whole contour.")
-            sm.SketchOffset2(sign * d_m, False, True, 0, 0, True)
-            model.ClearSelection2(True)
-            made = [s for s in _segments(session, sk) if se._seg_key(s) not in keys_before]
-            if not made:
+        made, made_by_loop = [], []
+        for index, ring in enumerate(loops):
+            members = [seg for seg, owner in zip(chain, owners) if owner == index]
+            # into the material: inside an outline, outside a hole in it
+            want_inside = inward == (depths[index] % 2 == 0)
+            known = keys_before | {se._seg_key(s) for s in made}
+            sign, new = 1.0, []
+            for _attempt in range(2):
+                model.ClearSelection2(True)
+                picked = sum(1 for seg in members if seg.Select4(True, None))
+                if picked != len(members):
+                    raise SolidWorksError("Could not select the whole contour.")
+                sm.SketchOffset2(sign * d_m, False, True, 0, 0, True)
+                model.ClearSelection2(True)
+                new = [seg for seg in _segments(session, sk) if se._seg_key(seg) not in known]
+                if not new:
+                    sign = -sign
+                    continue
+                mids = [(m_to_mm(q[0]), m_to_mm(q[1])) for seg in new for q in _sample_seg(session, seg, 8)[1:-1]]
+                if all(offset_loop.point_in_polygon(q, ring) == want_inside for q in mids):
+                    break
+                offset_loop._delete(model, new)
+                new = []
                 sign = -sign
-                continue
-            mids = [(m_to_mm(p[0]), m_to_mm(p[1])) for s in made for p in _sample_seg(session, s, 8)[1:-1]]
-            if all(offset_loop.point_in_polygon(p, polygon) == inward for p in mids):
-                break
-            offset_loop._delete(model, made)
-            made = []
-            sign = -sign
-        if not made:
-            raise SolidWorksError(
-                f"SolidWorks could not offset the contour {distance_mm:g} mm to the "
-                f"{'inside' if inward else 'outside'}: the contour may be narrower than twice that "
-                "somewhere, or a spline folds over itself at that distance (try a smaller wall).")
-        new_pieces = [[(m_to_mm(p[0]), m_to_mm(p[1])) for p in _sample_seg(session, s)] for s in made]
-        gaps = [_distance_to_ring(p, polygon) for piece in new_pieces for p in piece[1:-1]]
+            if not new:
+                where = [round(min(q[0] for q in ring), 2), round(min(q[1] for q in ring), 2),
+                         round(max(q[0] for q in ring), 2), round(max(q[1] for q in ring), 2)]
+                which = ("the outline" if depths[index] == 0 else "the hole") if len(loops) > 1 else "the contour"
+                raise SolidWorksError(
+                    f"SolidWorks could not offset {which} (sketch box {where} mm) {distance_mm:g} mm "
+                    f"{'into' if inward else 'away from'} the material: the contour is narrower than twice that "
+                    "somewhere (the tip of a wedge, a thin web), or a spline folds over itself at that distance. "
+                    "Use a smaller wall, cut the thin end off first (sketch_trim_region), or build the wall on "
+                    "the face with offset_face_loop.")
+            made += new
+            made_by_loop.append((ring, new))
+        gaps = [_distance_to_ring((m_to_mm(q[0]), m_to_mm(q[1])), ring)
+                for ring, new in made_by_loop for seg in new for q in _sample_seg(session, seg)[1:-1]]
         if original_to_construction:
             for s in chain:
                 s.ConstructionGeometry = True
@@ -720,11 +762,13 @@ def sketch_offset_chain(session, sketch: str, distance_mm: float, inward: bool =
     new_dims = [e["name"] for e in session._dimension_entries(feature) if e["name"] not in dims_before]
     equations = []
     if link_to and new_dims:
-        equations = [f'"{new_dims[0]}" = "{link_to}"']
+        equations = [f'"{dim}" = "{link_to}"' for dim in new_dims]
         session.set_equations(equations)
     final = binding.wrap(feature.GetSpecificFeature2(), mod.ISketch)
     result = {"ok": True, "sketch": feature.Name, "side": "inside" if inward else "outside",
+              "loops": len(loops), "holes": sum(1 for d in depths if d % 2),
               "offset_segments": len(made), "offset_dimension": new_dims[0] if new_dims else None,
+              "offset_dimensions": new_dims,
               "equations": equations, "original_area_mm2": round(offset_loop.polygon_area(polygon), 3),
               "wall_mm": {"min": round(min(gaps), 4), "max": round(max(gaps), 4)} if gaps else None,
               "original_locked": [r for r in locked if r]}

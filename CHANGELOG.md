@@ -5,6 +5,72 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Added (rbr 1.10.0)
+- Working mid-tree: edit_context(freeze_to, rollback_before, end) puts the
+  freeze bar and the rollback bar round the features being edited (a
+  205-feature part: set_dimension 8.5 s -> 3.5-3.7 s); "the feature just
+  created" is looked up above the rollback bar, so new features get the names
+  given; save_part is refused while features are rolled back. Rolling back
+  before a feature that absorbed a sketch is accepted (the bar lands before
+  the sketch).
+- Pictures without a window: screenshot renders off-screen from the display
+  tessellation (mode, document, bodies, width, height) and returns the image in
+  the reply; section_screenshot; section_profile gives a section's exact
+  contours with the wall thickness per segment.
+- Checked changes: every building tool reports `change` (volume per body
+  before / after, faces, whats_wrong, new under-defined sketches) and takes
+  expect={...} with automatic removal when it is not met; cuts, bosses, holes
+  and sweeps take bodies=[...] (Feature Scope).
+- add_sketch3d, sweep_cut, sweep_boss: a channel or a rod along a route in the
+  existing body, the bend radius and the diameter as dimensions.
+- read_sketches (many sketches, no sketch opened, no rebuild), set_dimensions
+  (many dimensions, one rebuild).
+- find_faces / find_edges: entities by description with expect=<count>, and
+  `ref` - a short name ('ref:' + 12 hex) of SolidWorks' persistent reference
+  (360-420 bytes each, kept in <home>/refs.jsonl), taken by every tool that
+  takes a face or an edge, upstream's *_on_face tools, add_fillet / add_chamfer
+  and list_edges included.
+- Sketches placed from the model: datum_x / datum_y on sketch_rect,
+  sketch_circles and add_sketch (an edge, a planar face seen edge-on, a
+  vertex); fully_define_sketch (origin dimensions moved to datums under their
+  names, the rest by SolidWorks' Fully Define Sketch); add_dimension;
+  sketch_fillet.
+- run_script(rollback_on_error): False keeps the finished steps and answers
+  `kept`; the default undoes exactly what the script created - features told
+  apart by IFeature.GetID, so a renamed feature is not deleted - and restores
+  equations it added or changed; a sketch left open is closed.
+- derive_part (Insert into New Part with a live external reference),
+  list_external_refs, update_external_refs.
+- Dialogs: a call that runs into a modal SolidWorks dialog answers
+  DIALOG_BLOCKING after ~3 s with the dialog's text (read through MSAA: the
+  message boxes are TaskDialogs) and buttons; dialog_list, dialog_respond. The
+  interrupted call goes on when the dialog is answered.
+- server_health: lock_holder is asked of the mutex (null when idle), owners
+  holds live server processes only (owners.json is pruned), the document
+  warning says how many close_hidden_documents would close;
+  close_hidden_documents(dry_run); opening a document past 30 open ones
+  carries a hint.
+- sw_instances and SWMCP_SW_PID: attach to one SolidWorks instance by its
+  process id (running object table "SolidWorks_PID_<pid>").
+- api_search: methods, properties and constants of the installed SolidWorks
+  type libraries with their parameters.
+- sketch_offset_chain takes a hollow contour loop by loop (outline in, holes
+  out); the cavity tools, find_*, section_profile, the batch and sketch tools,
+  body_box, insert_component and new_assembly are in the run_script namespace.
+
+### Changed (rbr 1.10.0)
+- release_ui keeps CommandInProgress set while it walks the open documents
+  and clears it at the end: 12.3 s -> 0.7 s with 56 documents open (it runs on
+  the first call of every server process and after a refused call that left
+  the UI switched off).
+- A refused call no longer rebuilds when nothing was added, and releases the
+  UI of every document only when something is still switched off.
+- The history is read without a QueryInterface per feature (0.85 s -> 0.1 s
+  per walk on 222 features); the freeze bar's pseudo-feature is left out of it.
+- rename_body says why SolidWorks kept the old name (a name of a feature in
+  the body's own history is not taken).
+- A job's record is written to its file before memory shows it finished.
+
 ### Added
 - rbr 1.8.0, multibody parts: body_properties (mass, volume, area, centre, box,
   material per body), rename_body, show_bodies, delete_bodies (delete/keep),

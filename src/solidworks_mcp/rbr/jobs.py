@@ -84,7 +84,8 @@ def cleanup() -> None:
 
 
 def submit(worker, session, code: str | None, args: dict | None = None,
-           name: str | None = None, tool: str = "run_script_async", call=None) -> dict:
+           name: str | None = None, tool: str = "run_script_async", call=None,
+           rollback_on_error: bool = True) -> dict:
     """Queue `code` on the COM worker as a job; returns the job record at once.
 
     `call` (a function of the session, e.g. a Flow solve) runs instead of a
@@ -103,26 +104,31 @@ def submit(worker, session, code: str | None, args: dict | None = None,
         job.update(state="running", started=_now())
         _write(job)
         t0 = time.perf_counter()
-        try:
+        end = {}   # the final fields: written to the file BEFORE memory shows them, so whoever
+        try:       # sees the job done (get reads memory first) finds its file complete too
             if call is not None:
                 result = session.run_guarded(call, session)
             else:
-                result = session.run_guarded(script_tool.run_script, session, code, args or {})
+                result = session.run_guarded(script_tool.run_script, session, code, args or {},
+                                             bool(rollback_on_error))
         except SolidWorksError as exc:
-            job.update(state="failed", error=str(exc))
+            end.update(state="failed", error=str(exc))
         except Exception as exc:  # noqa: BLE001 - the job must end in a readable record
-            job.update(state="failed", error=f"{type(exc).__name__}: {exc}",
+            end.update(state="failed", error=f"{type(exc).__name__}: {exc}",
                        traceback=traceback.format_exc(limit=6))
         else:
-            job["state"] = "failed" if isinstance(result, dict) and not result.get("ok", True) else "done"
-            job["result"] = result
+            failed = isinstance(result, dict) and not result.get("ok", True)
+            end.update(state="failed" if failed else "done", result=result)
+            if failed:
+                end["error"] = str(result.get("error", "failed"))
             if isinstance(result, dict):
                 added = (result.get("features") or {}).get("added")
                 if added:
-                    job["features_added"] = added
+                    end["features_added"] = added
         finally:
-            job.update(finished=_now(), elapsed_s=round(time.perf_counter() - t0, 3))
-            _write(job)
+            end.update(finished=_now(), elapsed_s=round(time.perf_counter() - t0, 3))
+            _write({**job, **end})
+            job.update(end)
         return job
 
     fut = worker.submit(run)
@@ -189,6 +195,8 @@ def answer(record: dict) -> dict:
             return {**result, "job_id": record["job_id"]}
         return {"ok": True, "job_id": record["job_id"], "result": result}
     if state == "failed":
+        if isinstance(record.get("result"), dict):  # a script that kept its finished steps says which
+            return {**record["result"], "ok": False, "job_id": record["job_id"]}
         out = {"ok": False, "job_id": record["job_id"], "error": record.get("error", "failed")}
         if record.get("traceback"):
             out["traceback"] = record["traceback"]

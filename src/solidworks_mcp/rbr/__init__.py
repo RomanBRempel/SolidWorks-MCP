@@ -13,13 +13,16 @@ import functools
 import os
 
 from ..errors import SolidWorksError
-from . import (apiref, batch, bodies as bodies_mod, cavity, context, equations, export_check, fastpath, features, flow, geom, guard, health,
-               image, jobs, journal, library, offset_loop, param, render, scope, script_tool, section, solidcam,
-               speed, sweep, tools)
+from . import (apiref, batch, bodies as bodies_mod, cavity, context, derive, dialogs, equations, export_check,
+               fastpath,
+               features,
+               flow, geom, guard, health, image, instance, jobs, journal, library, offset_loop, param, query,
+               render, scope,
+               script_tool, section, sketch_datum, solidcam, speed, sweep, tools)
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.9.0"
+RBR_VERSION = "1.10.0"
 
 INSTRUCTIONS = """
 
@@ -35,13 +38,23 @@ RBR extension (solidworks-mcp-rbr)
 - New parts and assemblies are switched to MMGS (mm, g) at creation. Also: set_units, get/set_custom_properties, list/activate/add_configuration, export_face_dxf (flat part -> DXF 1:1 for milling), assembly_bom (BOM + mass budget, CSV).
 - A script that may run long: run_script answers {job_id, state: running} after ~50 s instead of dying, run_script_async / run_saved_script_async answer {job_id} at once; the work keeps running and get_job(job_id) returns its result (kept 24 h), list_jobs the recent ones. Never resubmit a script because the reply detached.
 - After editing the linked global-variables file: sync_equation_file() adds the new names, updates the changed ones and names what the file no longer has, with a reason for every refused line.
-- server_health warns when open documents or SLDWORKS.exe memory run high; close_hidden_documents(keep=[...]) closes the invisible, saved, unowned ones.
+- server_health warns when open documents or SLDWORKS.exe memory run high and says how many documents close_hidden_documents would close; close_hidden_documents(keep=[...], dry_run=True) lists them, without dry_run closes the invisible, saved, unowned ones. Its lock_holder is null when nothing runs; owners lists live server processes only.
 - check_containment(envelope, keepout) measures how much of each body sits inside another part's envelope body (master-model parts sharing an origin).
 - Flow Simulation on a saved part: flow_create_project(name, template) -> flow_add_boundary_condition(kind, faces, value) (an internal flow needs an inlet and a pressure condition on the inner faces of its lids) -> flow_add_goal(kind, faces) -> optionally flow_set_conditions -> flow_solve (detaches like run_script; get_job) -> flow_goals. Check each goal against a hand estimate (pressure drop, drag) as you would a mass.
 - More script names: vec(*doubles) / pt(x,y,z) (COM-ready VARIANTs), ui_unlocked() (lift the UI freeze for InsertSketch/EditSketch), tree_before() + features_added(before) + rename_new(before, name), combine(op, main, tools), mirror_body(body, plane, merge=True), whats_wrong(), new_part(), activate(title), rays(bodies, points, dirs), export(path, fmt), split_segment / trim_to_intersection (in the sketch being edited).
 - Parametric building on SolidWorks objects, no tool bodies: set_global / link_dimension / feature_dimensions; sketch_circles (also centred on a profile's mean line at a station) / sketch_rect; convert_entities, add_relation; offset_face_loop (a wall-thick contour inside a face, also where SolidWorks' own offset refuses); extrude_toward / cut_toward (explicit direction, depth / through_all / up_to, also one region of a sketch); plane_normal_to_line; mirror_features. Drive every size and position by a global variable.
 - A cavity following a curved skin, section by section: sketch_intersection(plane=..., body/faces) -> sketch_trim_region(sketch, keep_box) (one closed contour) -> sketch_offset_chain(sketch, wall_mm) (inside, original to construction) -> loft_cut([sections]) or cut_offset_from_surface(sketch, face, wall_mm, toward) ending a wall short of the skin; split_line_project(sketch, faces) cuts the skin patch such a cut ends on. Check region_area_mm2 and the removed volume against a hand estimate.
 - Multibody parts: body_properties (mass, volume, area, centre, box, material per body), rename_body, show_bodies(visible), delete_bodies(keep=False), move_copy_body(translate_mm, rotate, copies), set_feature_scope(feature, bodies) (a cut or boss acting on some bodies only), save_bodies(bodies, path) (to a new part), insert_part(path) (another part as bodies). A material per body is not settable through the API (SolidWorks ignores it): bodies carry the part's material.
+- Working in the middle of a big part: edit_context(freeze_to=..., rollback_before=...) limits rebuilds to the features between the two bars (set_dimension 10 s -> 3-4 s on 205 features); new features land above the rollback bar under the names you give; save_part is refused until edit_context(end=True). get_status and server_health show an open context.
+- Seeing: screenshot renders off-screen and returns the picture in the reply - no window needed, works for a document that is not active or not visible (document='title'), bodies=[...] limits it. section_screenshot(point_mm, normal) shows a cut; section_profile(point_mm, normal) gives the exact contours with wall_mm per segment - measure walls with it, not by eye.
+- Checked changes: every building tool answers `change` (each body's volume before / after, faces added / removed, whats_wrong, new under-defined sketches) and takes expect={'volume': 'decrease', 'bodies': 'same', 'changed_bodies': [...]}: a call that does otherwise fails and what it added is removed. Cuts, bosses and holes take bodies=[names] to act on those bodies only - no tool body + combine.
+- Picking: find_faces / find_edges describe the entity (surface, normal, parallel_to, box, feature, body; expect = how many must match) and return `ref` - a short reference that names the same face or edge after any rebuild, where '#N' renumbers. Pass a ref wherever a face or an edge is taken (on=, face=, up_to=, edges=, datum_x=, the face= of *_on_face tools).
+- Sketches that follow the model: sketch_rect / sketch_circles / add_sketch take datum_x / datum_y (an edge, a planar face seen edge-on, a vertex '@x,y,z') - positions are then measured from that geometry, not from the origin. For a sketch that exists: fully_define_sketch(sketch, datum_x, datum_y) moves its origin dimensions to the datums and defines what is still free; add_dimension adds one dimension (also to a model edge or vertex); sketch_fillet rounds a corner with a radius dimension.
+- Routes: add_sketch3d(points_mm, bend_radius_mm) + sweep_cut(path, diameter_mm) / sweep_boss - a channel or a rod along a route in the existing body, one feature, the bend radius a dimension. Many at once: read_sketches([names]) (no sketch opened, no rebuild), set_dimensions({name: value}) (one rebuild).
+- run_script(rollback_on_error=False) keeps what the script finished before an error (`kept`); the default removes exactly what the script created (by feature ID - a renamed feature stays) and restores changed equations.
+- Derived parts: derive_part(body, path) gives a body its own part file that follows the master; list_external_refs shows what a part takes from other files and whether each link is alive; update_external_refs loads the sources, rebuilds and reports each body's volume before / after.
+- A call that answers DIALOG_BLOCKING ran into a modal SolidWorks dialog: the reply holds its text and buttons. dialog_respond(button) presses one ('yes' / 'no' / 'ok' / 'cancel' or the caption); the interrupted call is NOT cancelled and goes on then - never send it again. dialog_list shows the open dialogs at any time. Read the text before answering; when it asks about the user's data (save changes?), ask the user.
+- api_search(query) finds a method, property or constant of the installed SolidWorks API with its parameters - use it before a run_script call you are not sure of. sw_instances lists the running SolidWorks processes and the one this server drives.
 - SolidCAM (in the same SolidWorks; never start another SolidWorks or SolidCAM): solidcam_status -> solidcam_new_part(path, machine) (makes the zero SolidCAM_Zero on the top face at the bottom-left corner, then SolidCAM's Part Data panel waits for the user to pick it) or solidcam_open(path) -> solidcam_stock -> solidcam_add_operation(template, geometry) -> solidcam_calculate -> solidcam_gcode (says whether the program cuts) -> solidcam_save / solidcam_close. The API cannot define job geometry (chains, faces): a template job on the target alone posts no moves.
 """
 
@@ -246,6 +259,7 @@ def _patch_set_equations():
 
 def register(server) -> None:
     """Patch the session and add the RBR tools to `server.mcp` (the upstream FastMCP)."""
+    instance.apply()  # SWMCP_SW_PID: a SolidWorks of the server's own
     fastpath.apply()
     speed.apply()
     guard.apply()    # before the journal, so the journal times the guard too
@@ -259,12 +273,52 @@ def register(server) -> None:
 
     mcp, worker, session, call, com_error = (server.mcp, server._worker, server._session,
                                              server._call, server._COM_ERROR)
+    query.install(session)
     try:
         mcp._mcp_server.instructions = (mcp._mcp_server.instructions or "") + INSTRUCTIONS
     except AttributeError:
         pass
 
     upstream_call = call
+    detached = set()   # calls answered with DIALOG_BLOCKING that still wait on the COM thread
+
+    async def _blocking_dialogs() -> list:
+        """The modal dialogs SolidWorks waits behind, read off the event loop (pure Win32)."""
+        if DIALOG_WATCH_S <= 0:
+            return []
+        pid = guard.state().get("sw_pid")   # the instance this server drives, not another one's dialogs
+        try:
+            found = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: dialogs.blocking(pids=[pid] if pid else None))
+        except Exception:  # noqa: BLE001 - the watch never breaks a call
+            return []
+        return dialogs.questions(found)
+
+    async def _watched(awaitable, tool: str | None = None):
+        """Await a call; when SolidWorks shows a modal dialog meanwhile, answer
+        DIALOG_BLOCKING within seconds instead of waiting for the client's timeout.
+
+        The dialog has to be seen on two looks in a row (a message box that a tool
+        itself answers, or one flashing by, is not reported). The call is not
+        cancelled - it cannot be: the COM thread waits inside SolidWorks."""
+        task = asyncio.ensure_future(awaitable)
+        if DIALOG_WATCH_S <= 0:
+            return await task
+        started = asyncio.get_running_loop().time()
+        seen = 0
+        while True:
+            done, _pending = await asyncio.wait({task}, timeout=DIALOG_WATCH_S)
+            if done:
+                return task.result()
+            found = await _blocking_dialogs()
+            seen = seen + 1 if found else 0
+            if seen >= 2 and not task.done():
+                detached.add(task)
+                task.add_done_callback(detached.discard)
+                return dialogs.blocking_reply(found, tool, asyncio.get_running_loop().time() - started)
+
+    def _tool_of(fn) -> str:
+        return journal.tool_name(fn)
 
     def _in_request(fn):
         """`fn` with the change report / body scope / expectations of the tool call in progress."""
@@ -274,7 +328,7 @@ def register(server) -> None:
         return scope.runner(session, fn, request["tool"], request.get("bodies"), request.get("expect"))
 
     async def call(fn, *args, **kwargs):  # noqa: F811 - replaces server._call for upstream's tools too
-        return await upstream_call(_in_request(fn), *args, **kwargs)
+        return await _watched(upstream_call(_in_request(fn), *args, **kwargs), _tool_of(fn))
 
     server._call = call
 
@@ -284,6 +338,10 @@ def register(server) -> None:
         async def call_fail_fast(fn):
             busy = guard.busy_error()  # no queueing behind a call that has run for long
             if busy:
+                found = await _blocking_dialogs()
+                if found:  # ... because a dialog is open: say that, it is the way out
+                    raise SolidWorksError(dialogs.blocking_reply(found, guard.state().get("tool"))["error"]
+                                          + " dialog_respond(button=...) answers it.")
                 raise SolidWorksError(busy)
             return await original_call(fn)
 
@@ -297,22 +355,30 @@ def register(server) -> None:
         limit = max(5.0, min(float(timeout_s), 1800.0))
         busy = None if fn is guard.release_ui else guard.busy_error()
         if busy:
+            found = await _blocking_dialogs()
+            if found:
+                return dialogs.blocking_reply(found, guard.state().get("tool"))
             return {"ok": False, "error": busy}
+        tool = _tool_of(fn)
         fn = _in_request(fn)
         fut = worker.submit(lambda: session.run_guarded(fn, *args))
-        try:
-            return await asyncio.wait_for(asyncio.wrap_future(fut), limit)
-        except asyncio.TimeoutError:
-            return {"ok": False, "error": f"SolidWorks did not finish within {limit:.0f}s; a modal dialog may be "
-                                          "open, or the work is still running (the COM thread stays busy)."}
-        except SolidWorksError as exc:
-            return {"ok": False, "error": str(exc)}
-        except com_error as exc:
-            info = getattr(exc, "excepinfo", None)
-            desc = info[2] if info and len(info) > 2 and info[2] else getattr(exc, "strerror", None)
-            return {"ok": False, "error": f"SolidWorks COM error: {desc or exc}"}
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+        async def finish():
+            try:
+                return await asyncio.wait_for(asyncio.wrap_future(fut), limit)
+            except asyncio.TimeoutError:
+                return {"ok": False, "error": f"SolidWorks did not finish within {limit:.0f}s: the work is still "
+                                              "running (the COM thread stays busy); server_health shows it."}
+            except SolidWorksError as exc:
+                return {"ok": False, "error": str(exc)}
+            except com_error as exc:
+                info = getattr(exc, "excepinfo", None)
+                desc = info[2] if info and len(info) > 2 and info[2] else getattr(exc, "strerror", None)
+                return {"ok": False, "error": f"SolidWorks COM error: {desc or exc}"}
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+        return await _watched(finish(), tool)
 
     def _local(fn, *args, **kwargs) -> dict:
         try:
@@ -325,15 +391,20 @@ def register(server) -> None:
     # --- scripts ---------------------------------------------------------------
 
     @mcp.tool()
-    async def run_script(code: str, timeout_s: float = 120.0) -> dict:
+    async def run_script(code: str, timeout_s: float = 120.0, rollback_on_error: bool = True) -> dict:
         """Run a Python script against SolidWorks in ONE call: batch work that would take many tool calls.
 
         Use it for repetitive or bulk operations (delete/suppress/move many
         components, rename, bulk set_dimension, export loops, reading data
         across a part or assembly) instead of calling granular tools one by one.
         The script runs on the server's COM thread with the UI frozen and
-        CommandInProgress set; if it raises, what it added to the current part
-        is rolled back. The full code is written to the journal.
+        CommandInProgress set; if it raises, the features it CREATED (told by
+        feature ID: a renamed one is not new) and the equations it added or
+        changed are rolled back. rollback_on_error=False keeps what the script
+        finished before the error instead: the reply is ok false with the error
+        and `kept` {features, equations}, so the failing step can be fixed and
+        the rest run without redoing the first steps. The full code is written
+        to the journal.
 
         Namespace: sw/swApp/swapp (ISldWorks, early-bound), mod (typelib wrapper
         module, e.g. mod.IComponent2), wrap(obj, mod.IFace2) to early-bind a raw
@@ -364,7 +435,18 @@ def register(server) -> None:
         converted curves: SolidWorks keeps those whole). The parametric tools are here too:
         set_global, link_dimension, feature_dimensions, sketch_circles, sketch_rect,
         convert_entities, add_relation, offset_face_loop, extrude_toward, cut_toward,
-        plane_normal_to_line, mirror_features.
+        plane_normal_to_line, mirror_features; and find_faces / find_edges / entity(ref),
+        section_profile, read_sketches, set_dimensions, add_sketch3d, sweep_cut, sweep_boss,
+        fully_define_sketch, add_dimension, sketch_fillet, sketch_intersection,
+        sketch_trim_region, sketch_offset_chain, split_line_project, loft_cut,
+        cut_offset_from_surface (keyword arguments as the tools of those names).
+        Raw API calls that mislead, and what to call instead: IBody2.GetBodyBox /
+        IPartDoc.GetPartBox run loose round curved faces -> body_box(body) (tight, from
+        extreme points); model.SaveAs3 to STL / STEP right after adding features can
+        write an empty file -> export(path); asm.AddComponent5(path, ..., x, y, z) centres
+        the component's BOX at x, y, z -> insert_component(path, x_mm, y_mm, z_mm) puts
+        its origin there; sw.NewDocument with the default template preference gets a
+        file name without its folder -> new_part() / new_assembly().
         IModeler.CreateBodyFromBox3(data) - only for helper calculations, never as a tool body in
         a part - reads data = [x, y, z, dx, dy, dz, width, length, height] (m): (x, y, z) is the
         CENTRE OF THE BOTTOM FACE, (dx, dy, dz) the direction of the HEIGHT; then width runs
@@ -390,10 +472,10 @@ def register(server) -> None:
         {job_id, state: running} and get_job(job_id) returns the result when done -
         never resubmit the script because the reply detached.
         """
-        return await _run_detachable(code, None, None, "run_script", timeout_s)
+        return await _run_detachable(code, None, None, "run_script", timeout_s, rollback_on_error)
 
     async def _run_detachable(code: str, args: dict | None, name: str | None,
-                              tool: str, timeout_s: float) -> dict:
+                              tool: str, timeout_s: float, rollback_on_error: bool = True) -> dict:
         """Submit as a job, answer within the client's window, detach when it runs longer."""
         if worker is None:
             return {"ok": False, "error": "SolidWorks tools only work on Windows with SolidWorks."}
@@ -401,24 +483,30 @@ def register(server) -> None:
         if busy:
             return {"ok": False, "error": busy}
         try:
-            job = jobs.submit(worker, session, code, args, name, tool)
+            job = jobs.submit(worker, session, code, args, name, tool, rollback_on_error=rollback_on_error)
         except SolidWorksError as exc:
             return {"ok": False, "error": str(exc)}
         wait_s = max(5.0, min(float(timeout_s), jobs.SYNC_WAIT_S))
-        return jobs.answer(await jobs.wait(job["job_id"], wait_s))
+        record = await _watched(jobs.wait(job["job_id"], wait_s), tool)
+        if isinstance(record, dict) and record.get("dialog_blocking"):
+            return {**record, "job_id": job["job_id"],
+                    "hint": record["hint"] + f" get_job('{job['job_id']}') returns the script's result."}
+        return jobs.answer(record)
 
     @mcp.tool()
-    async def run_saved_script(name: str, args: dict | None = None, timeout_s: float = 120.0) -> dict:
+    async def run_saved_script(name: str, args: dict | None = None, timeout_s: float = 120.0,
+                               rollback_on_error: bool = True) -> dict:
         """Run a script from the library (list_scripts) by name; `args` reaches it as the dict `args`.
-        Detaches like run_script: a long run answers {job_id, state: running}, get_job finishes it."""
+        Detaches like run_script: a long run answers {job_id, state: running}, get_job finishes it.
+        rollback_on_error as in run_script."""
         try:
             code = library.code_of(name)
         except SolidWorksError as exc:
             return {"ok": False, "error": str(exc)}
-        return await _run_detachable(code, args or {}, name, "run_saved_script", timeout_s)
+        return await _run_detachable(code, args or {}, name, "run_saved_script", timeout_s, rollback_on_error)
 
     @mcp.tool()
-    async def run_script_async(code: str, args: dict | None = None) -> dict:
+    async def run_script_async(code: str, args: dict | None = None, rollback_on_error: bool = True) -> dict:
         """Start a run_script job in the background and answer {job_id} at once.
 
         Same namespace and guarantees as run_script; the job queues behind other
@@ -427,17 +515,20 @@ def register(server) -> None:
         the record is kept 24 h. Use this for anything expected to pass ~50 s.
         """
         def start():
-            job = jobs.submit(worker, session, code, args, None, "run_script_async")
+            job = jobs.submit(worker, session, code, args, None, "run_script_async",
+                              rollback_on_error=rollback_on_error)
             return {"ok": True, "job_id": job["job_id"], "state": job["state"],
                     "hint": f"get_job('{job['job_id']}') returns the result when done."}
         return _local(start)
 
     @mcp.tool()
-    async def run_saved_script_async(name: str, args: dict | None = None) -> dict:
+    async def run_saved_script_async(name: str, args: dict | None = None,
+                                     rollback_on_error: bool = True) -> dict:
         """run_saved_script as a background job: {job_id} at once, get_job for the result."""
         def start():
             code = library.code_of(name)
-            job = jobs.submit(worker, session, code, args or {}, name, "run_saved_script_async")
+            job = jobs.submit(worker, session, code, args or {}, name, "run_saved_script_async",
+                              rollback_on_error=rollback_on_error)
             return {"ok": True, "job_id": job["job_id"], "state": job["state"], "script": name,
                     "hint": f"get_job('{job['job_id']}') returns the result when done."}
         return _local(start)
@@ -490,16 +581,18 @@ def register(server) -> None:
     @mcp.tool()
     async def server_health() -> dict:
         """What the server is doing now, answered without waiting for SolidWorks: the running call
-        and its age, queued calls, the cross-process lock holder, document owners, the last faults
-        and errors; plus SLDWORKS.exe memory and (when the COM thread is free) the open document
-        count, with a warning past 30 documents or 70% of RAM. Use it when a call is slow or
-        SolidWorks seems stuck."""
+        and its age, queued calls, who holds the cross-process lock at this moment (null when
+        nothing runs), the documents owned by LIVE server processes (records of processes that
+        exited are dropped), the last faults and errors; plus SLDWORKS.exe memory and (when the
+        COM thread is free) the open document count, with a warning past 30 documents - and how
+        many of them close_hidden_documents would close - or 70% of RAM. Use it when a call is
+        slow or SolidWorks seems stuck."""
         def build():
             st = guard.state()
             last = journal.read(last_n=5, errors_only=True, entries=True)
             return {"ok": True, "version": RBR_VERSION, "server": st,
                     "queued": worker._queue.qsize() if worker is not None else 0,
-                    "lock_holder": guard._lock.holder(), "owners": guard.owners(),
+                    "lock_holder": guard._lock.held_by(), "owners": guard.prune_owners(),
                     "edit_context": context.seen(),
                     "sldworks_memory": health.sldworks_memory(),
                     "recent_errors": [{k: e.get(k) for k in ("ts", "pid", "tool", "doc", "error")}
@@ -515,18 +608,38 @@ def register(server) -> None:
             except Exception:  # noqa: BLE001 - health never hangs on SolidWorks
                 documents = None
         report["documents_open"] = documents
-        warn = health.warnings_for(documents, report.get("sldworks_memory"))
+        closable = None
+        if documents is not None and documents > health.DOCS_WARN:
+            try:  # the suggestion with its number: what close_hidden_documents would close now
+                fut = worker.submit(lambda: session.run_guarded(health.count_closable, session))
+                closable = await asyncio.wait_for(asyncio.wrap_future(fut), 5.0)
+                report["close_hidden_documents_would_close"] = closable
+            except Exception:  # noqa: BLE001 - health never hangs on SolidWorks
+                closable = None
+        warn = health.warnings_for(documents, report.get("sldworks_memory"), closable)
         if warn:
             report["warnings"] = warn
         return report
 
     @mcp.tool()
-    async def close_hidden_documents(keep: list | None = None) -> dict:
-        """Close every open document that is invisible, saved and not owned by another server
-        process. Assemblies silently open their parts; past a few dozen documents every call
-        crawls (server_health warns). keep lists titles to spare; the active document, the
-        current model, visible and unsaved documents always stay."""
-        return await _timed(health.close_hidden_documents, session, keep, timeout_s=120)
+    async def sw_instances() -> dict:
+        """The SolidWorks processes running on this machine - pid, memory (working set and
+        private MB), whether each is registered for automation - and which one this server is
+        attached to. Answers without calling into SolidWorks. With SWMCP_SW_PID=<pid> in the
+        server's environment the server attaches to that instance instead of the first one: a
+        SolidWorks of its own, the user's left alone (start it yourself; the server never
+        starts SolidWorks)."""
+        return _local(instance.instances, guard.state().get("sw_pid"))
+
+    @mcp.tool()
+    async def close_hidden_documents(keep: list | None = None, dry_run: bool = False) -> dict:
+        """Close every open document that is invisible, saved and not owned by another live
+        server process. Assemblies silently open their parts; past a few dozen documents every
+        call crawls (server_health warns and says how many would close). keep lists titles to
+        spare; the active document, the current model, visible and unsaved documents always
+        stay. dry_run=True only lists what would be closed (would_close) and why the rest
+        stays."""
+        return await _timed(health.close_hidden_documents, session, keep, dry_run, timeout_s=120)
 
     @mcp.tool()
     async def sync_equation_file(path: str | None = None) -> dict:
@@ -656,6 +769,52 @@ def register(server) -> None:
         by title without making it current."""
         return await _timed(section.section_profile, session, point_mm, normal, bodies, document, timeout_s=300)
 
+    # --- picking by description (1.10.0) --------------------------------------------------
+
+    @mcp.tool()
+    async def find_faces(surface: str | None = None, normal: str | list | None = None,
+                         parallel_to: str | list | None = None, within_mm: list | None = None,
+                         at_mm: list | None = None, area_mm2: float | list | None = None,
+                         radius_mm: float | list | None = None, feature: str | None = None,
+                         body: str | list | None = None, expect: int | list | None = None,
+                         limit: int = 30) -> dict:
+        """Find faces of the current part by what they are - no ray, no '#N' index. Every
+        filter given must hold: surface 'plane' / 'cylinder' / 'cone' / 'sphere' / 'torus' /
+        'spline' / ...; normal '+z' / '-x' / [x, y, z] (planar faces facing that way);
+        parallel_to 'front' / 'top' / 'right' (planes parallel to it, cylinders with their axis
+        across it) or an axis 'x' / [x, y, z] (cylinders along it, planes containing it);
+        within_mm [[x1, y1, z1], [x2, y2, z2]] (the face's box inside it); at_mm [x, y, z] (a
+        point on the face); area_mm2 and radius_mm a value or [min, max] (None = open);
+        feature (the list_features name that made the face); body (list_bodies names).
+        expect: how many must match, a count or [min, max] - otherwise the call fails and
+        shows what matched, so a wrong pick stops here. Each face comes back with surface,
+        area, box, normal or radius + axis, the feature that made it, and `ref`: a reference
+        that names the same face after rebuilds and in later sessions, where '#N' renumbers.
+        Pass it wherever a face is taken: on= / face= / up_to= / faces=, and the face= of
+        the *_on_face tools (the point then only places the sketch)."""
+        return await call(query.find_faces, session, surface, normal, parallel_to, within_mm, at_mm, area_mm2,
+                          radius_mm, feature, body, expect, limit)
+
+    @mcp.tool()
+    async def find_edges(kind: str | None = None, parallel_to: str | list | None = None,
+                         length_mm: float | list | None = None, radius_mm: float | list | None = None,
+                         within_mm: list | None = None, at_mm: list | None = None, face: str | None = None,
+                         between: list | None = None, feature: str | None = None,
+                         body: str | list | None = None, expect: int | list | None = None,
+                         limit: int = 30) -> dict:
+        """Find edges of the current part by what they are: kind 'line' / 'circle' / 'arc' /
+        'ellipse' / 'spline' / 'curve' (anything else); parallel_to an axis 'x' / [x, y, z]
+        (lines along it, circles and arcs about it); length_mm and radius_mm a value or
+        [min, max]; within_mm a box holding both ends; at_mm a point on the edge; face (the
+        edges of that face: a `ref`, '#N' or '+z'); between [face, face] (the edge two faces
+        share); feature (edges of the faces a feature made); body. expect: the count that
+        must match (or [min, max]), else the call fails. Each edge comes back with type,
+        length, ends, direction or centre + radius + axis, and `ref`, taken by add_fillet /
+        add_chamfer edges= ('ref:..., ref:...') and convert_entities edges=[...] in place of
+        list_edges indices, which renumber on every rebuild."""
+        return await call(query.find_edges, session, kind, parallel_to, length_mm, radius_mm, within_mm, at_mm,
+                          face, between, feature, body, expect, limit)
+
     # --- many at once (1.10.0) ---------------------------------------------------------
 
     @mcp.tool()
@@ -731,7 +890,8 @@ def register(server) -> None:
 
     @mcp.tool()
     async def sketch_circles(on: str, circles: list, name: str | None = None,
-                             profile_face: str | None = None) -> dict:
+                             profile_face: str | None = None, datum_x: str | list | None = None,
+                             datum_y: str | list | None = None) -> dict:
         """A fully defined sketch of circles on a plane ('front'/'top'/'right' or a tree plane
         such as 'Plane5') or a face ('+x', '#5', '@x,y,z').
 
@@ -741,16 +901,98 @@ def register(server) -> None:
         {"diameter": "BOSS_D", "station": "POS_1"}}: a construction chord across
         profile_face's outer loop (converted) at that station, the centre at its midpoint, so
         the hole follows the profile. vars keys: diameter, station, x / y (sketch axes) or X / Y /
-        Z (model axes); positions are linked as abs(expr). Then extrude_toward / cut_toward."""
-        return await call(param.sketch_circles, session, on, circles, name, profile_face)
+        Z (model axes); positions are linked as abs(expr). datum_x / datum_y: measure the x / y
+        positions from model geometry instead of the origin (see sketch_rect). Then
+        extrude_toward / cut_toward."""
+        return await call(param.sketch_circles, session, on, circles, name, profile_face, datum_x, datum_y)
 
     @mcp.tool()
     async def sketch_rect(on: str, corner_mm: list, width_mm: float, height_mm: float,
-                          name: str | None = None, vars: dict | None = None) -> dict:
+                          name: str | None = None, vars: dict | None = None,
+                          datum_x: str | list | None = None, datum_y: str | list | None = None) -> dict:
         """A fully defined rectangle on a plane or face: corner_mm (model space), width along
         the sketch x, height along its y (negative: the other way). Dimensions width, height,
-        x, y (corner from the origin); vars links them, also by model axis ('X': 'SLOT_X')."""
-        return await call(param.sketch_rect, session, on, corner_mm, width_mm, height_mm, name, vars)
+        x, y (corner from the origin); vars links them, also by model axis ('X': 'SLOT_X').
+        datum_x / datum_y: what x / y are measured from instead of the origin, so the
+        rectangle follows the model - an edge ('ref:...' from find_edges, 'edge:5'), a planar
+        face seen edge-on ('+x', 'ref:...') or a vertex ('@x,y,z'); the datum for x must run
+        across the sketch's x axis. A corner lying on the datum gets a relation, not a
+        dimension."""
+        return await call(param.sketch_rect, session, on, corner_mm, width_mm, height_mm, name, vars,
+                          datum_x, datum_y)
+
+    # --- sketches placed from the model (1.10.0) ------------------------------------------
+
+    try:
+        mcp.remove_tool("add_sketch")  # upstream's: dimensions from the origin only
+    except Exception:  # noqa: BLE001 - an mcp without remove_tool: upstream's stays
+        pass
+
+    @mcp.tool()
+    async def add_sketch(plane: str, start_mm: list, segments: list, name: str | None = None,
+                         datum_x: str | list | None = None, datum_y: str | list | None = None) -> dict:
+        """Draw a sketch of lines, arcs and splines on a plane, fully defined, to extrude or cut.
+
+        plane: "front", "top", "right" or a plane by name (add_plane). Points are
+        [u, v] in the plane's own axes, which the result gives (origin_mm + u
+        x_axis + v y_axis): front is (x, y), top (x, -z), right (-z, y).
+        The outline starts at start_mm; each segment runs on from where the last
+        ended: {"line": [u, v]}; {"arc": [u, v], "through": [u, v]} (an arc through
+        a middle point); {"arc": [u, v], "tangent": true} (an arc flowing on from
+        the segment before); {"spline": [[u, v], ..., [u, v]]} (through the points,
+        ending at the last). "tangent": true on a line checks that it flows on.
+        End on start_mm to close the outline. Segments that meet smoothly get a
+        tangent relation, the rest is dimensioned from the origin: x<i>/y<i> for
+        the i-th point given (points_mm lists them; start_mm is 0), r<k> for the
+        radius of segment k. datum_x / datum_y: measure the x<i> / y<i> from model
+        geometry instead - an edge ('ref:...', 'edge:5'), a planar face seen edge-on
+        ('+x') or a vertex ('@x,y,z') - so the outline follows the model; the names
+        stay. Then extrude_sketch / cut_sketch the returned sketch.
+        """
+        return await call(sketch_datum.add_sketch, session, plane, start_mm, segments, name, datum_x, datum_y)
+
+    server._rbr_add_sketch = add_sketch
+
+    @mcp.tool()
+    async def fully_define_sketch(sketch: str, datum_x: str | list | None = None,
+                                  datum_y: str | list | None = None,
+                                  replace_origin_dimensions: bool = True) -> dict:
+        """Make an existing sketch fully defined and measured from the model, not the origin.
+        datum_x / datum_y: the model entity its x / y positions are measured from - an edge
+        ('ref:...' from find_edges, 'edge:5' from list_edges), a planar face seen edge-on
+        ('+x', '#5', 'ref:...') or a vertex ('@x,y,z'). Every dimension or relation that ties
+        a sketch point to the origin is replaced by one from the datum, under the same name
+        (x, y2, ...), so set_dimension and equations keep working; the sketch then follows
+        that geometry. What is still free afterwards (a sketch a person drew) gets relations
+        and dimensions from SolidWorks' Fully Define Sketch, measured from the datums.
+        Returns replaced, kept (with the reason), dimensions_added, origin_dimensions (those
+        still from the origin) and fully_defined. A dimension an equation drives is kept."""
+        return await call(sketch_datum.fully_define_sketch, session, sketch, datum_x, datum_y,
+                          replace_origin_dimensions)
+
+    @mcp.tool()
+    async def add_dimension(sketch: str, entities: list | str, value_mm: float | None = None,
+                            direction: str = "auto", name: str | None = None, var: str | None = None) -> dict:
+        """Add one dimension to an existing sketch that is not yet fully defined - between its
+        own entities, or from one of them to the model. entities: one or two of '#3' (a
+        segment, read_sketch order), '#3.start' / '#3.end' / '#3.center', 'origin', and of the
+        model 'ref:...' (find_edges / find_faces), 'edge:5' (list_edges), '@x,y,z' (the vertex
+        there). One line gives its length, one circle its diameter, one arc its radius; two
+        entities their distance (direction 'horizontal' / 'vertical' along the sketch axes), two
+        lines that are not parallel their angle. value_mm (degrees for an angle) sets it and
+        moves the geometry; name names it; var links it to a global variable. A dimension
+        that would over-define the sketch is refused and removed."""
+        return await call(sketch_datum.add_dimension, session, sketch, entities, value_mm, direction, name, var)
+
+    @mcp.tool()
+    async def sketch_fillet(sketch: str, corners: list | str, radius_mm: float, name: str | None = None,
+                            var: str | None = None) -> dict:
+        """Round corners of an existing sketch (a real sketch fillet): corners '#3.end' (a
+        segment's end, read_sketch order), ['#2', '#3'] (where two segments meet), [x, y, z]
+        model mm at the corner, or a list of those. The corner stays a virtual sharp, so the
+        dimensions on it hold; the radius is one dimension for all corners given
+        (dimensions.radius), changed by set_dimension, linked by var."""
+        return await call(sketch_datum.sketch_fillet, session, sketch, corners, radius_mm, name, var)
 
     @mcp.tool()
     async def convert_entities(sketch: str | None = None, on: str | None = None, face: str | None = None,
@@ -831,7 +1073,9 @@ def register(server) -> None:
 
     @mcp.tool()
     async def rename_body(body: str, new_name: str) -> dict:
-        """Rename a solid body (its list_bodies name); the name survives rebuilds."""
+        """Rename a solid body (its list_bodies name); the name survives rebuilds. The name is
+        read back: when SolidWorks keeps the old one the call fails and says so (from a script,
+        body.Name = ... can fail silently - use this tool, also as session method)."""
         return await call(bodies_mod.rename_body, session, body, new_name)
 
     @mcp.tool()
@@ -870,6 +1114,35 @@ def register(server) -> None:
         """Insert another part's solid bodies into the current part (linked Insert Part feature);
         the new bodies get unique names (name, name_2, ...). Position them with move_copy_body."""
         return await call(bodies_mod.insert_part, session, path, config, name, material)
+
+    # --- derived parts (1.10.0) ---------------------------------------------------------
+
+    @mcp.tool()
+    async def derive_part(body: list | str, path: str, close: bool = False) -> dict:
+        """Give a body of the current (saved) part its own part file that keeps following it
+        ("Insert into New Part"): for a lid, a cover or a print section modelled as a body of
+        the master. body: a list_bodies name (or several). The new part starts with one
+        feature holding an external reference to the body; a later change of the body arrives
+        there with update_external_refs (or when the part is opened). Returns the new part's
+        references and its volume against the body's. close=False (default) leaves the new
+        part open in the background; this part stays current."""
+        return await _timed(derive.derive_part, session, body, path, close, timeout_s=300)
+
+    @mcp.tool()
+    async def list_external_refs(document: str | None = None) -> dict:
+        """What the current document (or an open one by title) takes from other files: per
+        external reference the feature holding it, the file and entity it points to, its
+        status (in context / out of context / locked / broken / dangling), whether the file
+        exists and is loaded, and whether that source has unsaved changes."""
+        return await call(derive.list_external_refs, session, document)
+
+    @mcp.tool()
+    async def update_external_refs(load_sources: bool = True) -> dict:
+        """Bring the current part up to date with the files it references (a derived part
+        after its master changed): loads each referenced file that is not open, rebuilds,
+        and returns each body's volume before and after (`changed`), the references' status
+        and failing_features. A locked or broken reference does not update and is named."""
+        return await _timed(derive.update_external_refs, session, load_sources, timeout_s=600)
 
     # --- SolidCAM (1.8.0) -------------------------------------------------------------
 
@@ -966,10 +1239,15 @@ def register(server) -> None:
     @mcp.tool()
     async def sketch_offset_chain(sketch: str, distance_mm: float, inward: bool = True,
                                   original_to_construction: bool = True, link_to: str | None = None) -> dict:
-        """Offset a sketch's closed contour as one chain (SketchOffset2) distance_mm inside (inward)
-        or outside, the side checked against the contour (a wrong-side offset is redone the other
-        way), and make the original construction geometry. One offset dimension comes back;
-        link_to: a global variable to drive it. wall_mm gives the measured min/max distance."""
+        """Offset a sketch's closed contour(s) (SketchOffset2) distance_mm into the material
+        (inward) or away from it, the side checked against the contour (a wrong-side offset is
+        redone the other way), and make the original construction geometry. A hollow contour -
+        an outline with holes - is taken loop by loop: the outline to its inside, each hole to
+        its outside. One offset dimension per loop comes back (offset_dimensions); link_to: a
+        global variable to drive them. wall_mm gives the measured min/max distance.
+        SolidWorks' limit: where the contour is narrower than twice the distance (a wedge's
+        tip, a thin web) no offset exists and the call is refused - use a smaller wall, cut
+        the thin end off first (sketch_trim_region), or offset_face_loop on the face."""
         return await _timed(cavity.sketch_offset_chain, session, sketch, distance_mm, inward,
                             original_to_construction, link_to, timeout_s=300)
 
@@ -1089,6 +1367,38 @@ def register(server) -> None:
         return await _timed(guard.release_ui, session, dry_run, True, clear_quarantine, timeout_s=30)
 
     @mcp.tool()
+    async def dialog_list() -> dict:
+        """The dialogs SolidWorks shows right now, read without SolidWorks' help (so it answers
+        while every other tool waits): title, message text, buttons, check boxes, and whether
+        the dialog is modal - blocking SolidWorks until it is answered. A call that runs into a
+        modal dialog answers DIALOG_BLOCKING after a few seconds with the same description; it
+        is not cancelled and goes on when the dialog is answered. A progress window is marked
+        progress and is not a question."""
+        def build():
+            pid = guard.state().get("sw_pid")
+            found = dialogs.find(pids=[pid] if pid else None)
+            return {"ok": True, "count": len(found), "blocking": len(dialogs.questions(found)),
+                    "dialogs": [dialogs.public(d) for d in found], "server": guard.state()}
+        return _local(build)
+
+    @mcp.tool()
+    async def dialog_respond(button: str | int, hwnd: int | None = None, title: str | None = None) -> dict:
+        """Press a button of a SolidWorks dialog: its caption as dialog_list shows it ('Да',
+        'Отмена', 'Rebuild'), its control id, or a language-neutral name for the standard
+        ones - 'ok', 'cancel', 'yes', 'no', 'retry', 'ignore', 'abort', 'close', 'continue'.
+        With several dialogs open name one by hwnd or part of its title; otherwise the one
+        modal dialog is taken. Returns whether it closed and which dialogs remain (a second
+        one often follows). What the answer does is SolidWorks' business: 'no' to "save
+        changes?" discards them - read the text first, and ask the user when it is their
+        data."""
+        def press():
+            pid = guard.state().get("sw_pid")
+            result = dialogs.respond(button, hwnd=hwnd, title=title, pids=[pid] if pid else None)
+            journal.record("dialog_respond", {"button": button, "hwnd": hwnd, "title": title}, result)
+            return result
+        return _local(press)
+
+    @mcp.tool()
     async def release_document(title: str | None = None) -> dict:
         """Free a document (or all, title=None) that another server process holds after changing it,
         so this one may change it too. Only when you know the other session is done with it."""
@@ -1194,6 +1504,9 @@ def register(server) -> None:
 
     _extend_builders(mcp)
 
+
+# How often a waiting call looks for a modal SolidWorks dialog (s); 0 switches the watch off.
+DIALOG_WATCH_S = float(os.environ.get("SWMCP_DIALOG_WATCH_S", "1.5"))
 
 BODIES_DOC = (" bodies=[names]: the feature acts on these bodies only (list_bodies names), the others "
               "stay as they are.")

@@ -122,12 +122,14 @@ def sldworks_memory() -> dict | None:
     return out
 
 
-def warnings_for(documents: int | None, memory: dict | None) -> list:
-    """The health warnings the numbers justify; pure, unit-tested."""
+def warnings_for(documents: int | None, memory: dict | None, closable: int | None = None) -> list:
+    """The health warnings the numbers justify; pure, unit-tested. closable: how many of
+    the documents close_hidden_documents would close now (None: not counted)."""
     warn = []
     if documents is not None and documents > DOCS_WARN:
+        would = "" if closable is None else f" - {closable} of them now"
         warn.append(f"{documents} documents are open (> {DOCS_WARN}): every modelling call rebuilds "
-                    "slower; close_hidden_documents closes the invisible, saved ones.")
+                    f"slower; close_hidden_documents closes the invisible, saved ones{would}.")
     if memory:
         pct = memory.get("memory_pct")
         if pct is not None and pct > MEMORY_WARN_PCT:
@@ -139,12 +141,19 @@ def warnings_for(documents: int | None, memory: dict | None) -> list:
 
 # --- shedding documents (COM thread, via the worker) ----------------------------------------
 
-def close_hidden_documents(session, keep: list | None = None) -> dict:
+def count_closable(session) -> int:
+    """How many documents close_hidden_documents would close now (a quick read for
+    server_health: title, visibility and save flag of each document)."""
+    return len(close_hidden_documents(session, None, True)["would_close"])
+
+
+def close_hidden_documents(session, keep: list | None = None, dry_run: bool = False) -> dict:
     """Close every open document that is invisible, saved and not owned elsewhere.
 
     Assemblies silently open their parts; after a day the count passes 70 and
     everything crawls. keep lists titles to spare (the active document, the
-    current model, dirty and visible documents are always spared).
+    current model, dirty and visible documents are always spared). dry_run only
+    lists what would be closed.
     """
     sw = session._ensure()
     spare = {str(k).lower() for k in (keep or [])}
@@ -159,7 +168,7 @@ def close_hidden_documents(session, keep: list | None = None) -> dict:
         current_title = session._model.GetTitle() if session._model is not None else None
     except Exception:  # noqa: BLE001
         pass
-    own = guard.owners()
+    own = guard.prune_owners()
     closed, kept = [], []
     for doc in guard._documents(session):
         try:
@@ -175,12 +184,13 @@ def close_hidden_documents(session, keep: list | None = None) -> dict:
                 why = "unsaved changes"
             else:
                 owner = own.get(title)
-                if owner and owner.get("pid") not in (None, os.getpid()) and guard._pid_alive(int(owner["pid"])):
-                    why = f"owned by pid {owner['pid']}"
+                if owner and owner.get("pid") not in (None, os.getpid()):
+                    why = f"owned by pid {owner['pid']}"   # prune_owners left only live processes
             if why:
                 kept.append({"title": title, "why": why})
             else:
-                sw.CloseDoc(title)
+                if not dry_run:
+                    sw.CloseDoc(title)
                 closed.append(title)
         except Exception as exc:  # noqa: BLE001 - one stubborn document must not stop the sweep
             kept.append({"title": locals().get("title"), "why": f"error: {exc}"})
@@ -191,4 +201,6 @@ def close_hidden_documents(session, keep: list | None = None) -> dict:
         pass
     if not closed and not kept:
         raise SolidWorksError("No open documents.")
+    if dry_run:
+        return {"ok": True, "dry_run": True, "would_close": closed, "kept": kept, "open_now": remaining}
     return {"ok": True, "closed": closed, "kept": kept, "open_now": remaining}

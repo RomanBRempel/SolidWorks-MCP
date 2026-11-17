@@ -6,20 +6,29 @@ is in front. find_faces / find_edges describe the entity instead - its
 surface, where it faces, what it is parallel to, its size, the feature that
 made it, the body it belongs to - and say how many must match (`expect`).
 
-Each match comes back with `ref`: SolidWorks' persistent reference
-(IModelDocExtension.GetPersistReference3) as text. It names the same face or
-edge after rebuilds and in the next session, and the tools that take a face
-or an edge take it in place of '#N' / '+z' (see `entity` and `install`).
+Each match comes back with `ref`: a short name ('ref:' + 12 hex digits) of
+SolidWorks' persistent reference (IModelDocExtension.GetPersistReference3). It
+names the same face or edge after rebuilds and in the next session, and the
+tools that take a face or an edge take it in place of '#N' / '+z' (see
+`entity` and `install`).
+
+The reference itself is 360-420 bytes per face or edge (measured on SW 2025
+SP3: a box with a boss and a hole), 500-560 characters as text - thirty faces
+would cost 16 KB of reply. So the reply carries the first 12 hex digits of its
+SHA-1 and the bytes go to <home>/refs.jsonl, shared by every server process
+and kept across restarts; the full base64 form is still accepted.
 """
 
 import base64
+import hashlib
 import math
+import os
 
 from .. import binding
 from ..errors import SolidWorksError
 from ..session import SolidWorksSession
 from . import bodies as bodies_mod
-from . import fastpath, render
+from . import fastpath, journal, render
 
 REF_PREFIX = "ref:"
 SURFACE_NAMES = {4001: "plane", 4002: "cylinder", 4003: "cone", 4004: "sphere", 4005: "torus",
@@ -38,24 +47,136 @@ _session = None
 # --- pure parts (unit-tested) -------------------------------------------------------------------
 
 
+SHORT_LEN = 12
+NEWLINE = bytes([10])
+STORE_MAX_BYTES = 8 * 1024 * 1024   # ~14 000 references; the older half goes when it is passed
+
+_store = {}        # short name -> reference bytes, as far as this process has seen
+_unsaved = []      # lines to append to the store file
+_store_seen = 0    # bytes of the store file already read
+_store_tail = b""  # the last bytes read before that offset: they tell a pruned file from a grown one
+_on_disk = set()   # names known to have a line in the file as it is now
+_pending = set()   # names waiting in _unsaved
+TAIL_BYTES = 48
+
+
+def short_of(ref: bytes) -> str:
+    """The short name of a persistent reference; pure."""
+    return hashlib.sha1(bytes(ref)).hexdigest()[:SHORT_LEN]
+
+
+def _store_path() -> str:
+    return os.path.join(journal.home(), "refs.jsonl")
+
+
+def _read_store() -> None:
+    """Take in what the store file gained since the last look (other processes append too).
+
+    Another process may have pruned the file meanwhile (the older half dropped, the rest
+    rewritten). A shorter file shows that; a pruned file that grew past the old offset
+    again does not, so the bytes just before the offset are compared too. A pruned file
+    is read again from the top, and what is known to be on disk starts over."""
+    global _store_seen, _store_tail
+    path = _store_path()
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    try:
+        with open(path, "rb") as fh:
+            if size < _store_seen:
+                _store_seen = 0
+            elif _store_seen:
+                fh.seek(_store_seen - len(_store_tail))
+                if fh.read(len(_store_tail)) != _store_tail:
+                    _store_seen = 0
+            if not _store_seen:
+                _store_tail = b""
+                _on_disk.clear()
+            if size == _store_seen:
+                return
+            fh.seek(_store_seen)
+            data = fh.read()
+    except OSError:
+        return
+    end = data.rfind(NEWLINE) + 1  # a line still being written is left for the next look
+    _store_seen += end
+    _store_tail = (_store_tail + data[:end])[-TAIL_BYTES:]
+    for line in data[:end].splitlines():
+        name, _, body = line.partition(b" ")
+        try:
+            key = name.decode("ascii")
+            _store[key] = base64.b64decode(body)
+            _on_disk.add(key)
+        except Exception:  # noqa: BLE001 - a damaged line names nothing
+            continue
+
+
+def flush() -> None:
+    """Write the references handed out since the last flush to the store file."""
+    global _store_seen, _store_tail
+    if not _unsaved:
+        return
+    path = _store_path()
+    lines, _unsaved[:] = list(_unsaved), []
+    _pending.clear()
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > STORE_MAX_BYTES:
+            _read_store()
+            with open(path, "rb") as fh:
+                kept = fh.read().splitlines(keepends=True)
+            kept = kept[len(kept) // 2:]
+            with open(path + ".tmp", "wb") as fh:
+                fh.writelines(kept)
+            os.replace(path + ".tmp", path)
+            _store_seen, _store_tail = 0, b""   # what is on disk is read again below
+            _on_disk.clear()
+        with open(path, "ab") as fh:
+            fh.write("".join(lines).encode("ascii"))
+        _read_store()
+    except OSError:
+        pass  # the references still resolve in this process
+
+
 def to_token(ref: bytes) -> str:
-    return REF_PREFIX + base64.urlsafe_b64encode(bytes(ref)).decode("ascii").rstrip("=")
+    """'ref:<short name>' for a persistent reference; the bytes are remembered (see flush)."""
+    ref = bytes(ref)
+    name = short_of(ref)
+    _store.setdefault(name, ref)
+    if name not in _on_disk and name not in _pending:
+        _read_store()   # another process may have written it; or its line was pruned: write it again
+        if name not in _on_disk:
+            _pending.add(name)
+            _unsaved.append(f"{name} {base64.b64encode(ref).decode('ascii')}{NEWLINE.decode()}")
+    return REF_PREFIX + name
 
 
 def from_token(token) -> bytes | None:
-    """The persistent reference inside 'ref:...', or None when the text is no such token."""
+    """The persistent reference behind 'ref:...', or None when the text is no such token."""
     text = str(token).strip()
-    if not text.startswith(REF_PREFIX):
+    if text[:len(REF_PREFIX)].lower() != REF_PREFIX:
         return None
-    body = text[len(REF_PREFIX):]
-    try:
+    body = text[len(REF_PREFIX):].strip()
+    if body and len(body) <= 2 * SHORT_LEN and all(c in "0123456789abcdefABCDEF" for c in body):
+        name = body.lower()
+        if name not in _store:
+            _read_store()
+        if name not in _store:
+            raise SolidWorksError(f"No reference '{REF_PREFIX}{name}' is known here: find_faces / find_edges give "
+                                  "them (the store keeps the latest ~14 000). Find the entity again.")
+        return _store[name]
+    problem = SolidWorksError(f"'{text[:24]}...' is not a valid entity reference (find_faces / find_edges give "
+                              "them).")
+    if not body or any(not (c.isascii() and (c.isalnum() or c in "-_")) for c in body):
+        raise problem   # b64decode would drop foreign characters silently and answer b''
+    try:  # the reference itself, base64
         return base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
     except Exception:  # noqa: BLE001
-        raise SolidWorksError(f"'{text[:24]}...' is not a valid entity reference (find_faces / find_edges give them).") from None
+        raise problem from None
 
 
 def is_ref(token) -> bool:
-    return isinstance(token, str) and token.strip().startswith(REF_PREFIX)
+    return isinstance(token, str) and token.strip()[:len(REF_PREFIX)].lower() == REF_PREFIX
 
 
 def unit(vector) -> tuple:
@@ -89,13 +210,17 @@ def count_ok(expect, found: int) -> str | None:
     """Why `found` matches do not meet `expect` (an exact count or [min, max]), or None; pure."""
     if expect is None:
         return None
+    problem = SolidWorksError(f"expect is a count or [min, max] of counts (got {expect!r}).")
     if isinstance(expect, (list, tuple)) and len(expect) == 2:
-        low, high = int(expect[0]), int(expect[1])
+        try:
+            low, high = int(expect[0]), int(expect[1])
+        except (TypeError, ValueError):
+            raise problem from None
         return None if low <= found <= high else f"{low} to {high} were expected"
     try:
         want = int(expect)
     except (TypeError, ValueError):
-        raise SolidWorksError(f"expect is a count or [min, max] (got {expect!r}).") from None
+        raise problem from None
     return None if found == want else f"{want} {'was' if want == 1 else 'were'} expected"
 
 
@@ -111,8 +236,13 @@ def in_range(value: float, bounds) -> bool:
         return True
     if isinstance(bounds, (int, float)):
         return abs(value - float(bounds)) <= max(1e-3, 1e-4 * abs(float(bounds)))
-    low, high = bounds
-    return (low is None or value >= float(low) - 1e-9) and (high is None or value <= float(high) + 1e-9)
+    try:
+        low, high = bounds
+        low = None if low is None else float(low)
+        high = None if high is None else float(high)
+    except (TypeError, ValueError):
+        raise SolidWorksError(f"A range is a number or [min, max] with None for an open end (got {bounds!r}).") from None
+    return (low is None or value >= low - 1e-9) and (high is None or value <= high + 1e-9)
 
 
 # --- references ---------------------------------------------------------------------------------
@@ -216,6 +346,7 @@ def _answer(kind: str, matches: list, expect, limit: int, scanned: int) -> dict:
         raise SolidWorksError(f"{len(matches)} {kind}(s) match, {problem}. "
                               + (f"The matches: {shown}" if matches else "Loosen the filters."))
     limit = max(1, int(limit))
+    flush()
     return {"ok": True, "count": len(matches), kind + "s": matches[:limit], "scanned": scanned,
             "truncated": len(matches) > limit}
 
@@ -385,7 +516,27 @@ def find_edges(session, kind: str | None = None, parallel_to=None, length_mm=Non
     return _answer("edge", matches, expect, limit, scanned)
 
 
-# --- the other tools take a reference where they take '#N' -------------------------------------------
+# --- the other tools take a reference where they take '#N' or '+z' ---------------------------------
+
+
+class _Picked:
+    """Stands in for upstream's face side ('outer' / 'inner') when the selector was a
+    reference: the face itself, already found."""
+
+    def __init__(self, face):
+        self.face = face
+
+
+def ref_tokens(selector) -> list | None:
+    """The 'ref:...' tokens of an edge selector - one token, several in a string separated
+    by commas or spaces, or a list of them - or None when it is something else; pure."""
+    if isinstance(selector, (list, tuple)):
+        tokens = [str(t).strip() for t in selector]
+    elif isinstance(selector, str):
+        tokens = selector.replace(",", " ").split()
+    else:
+        return None
+    return tokens if tokens and all(is_ref(t) for t in tokens) else None
 
 
 def _face_index(selector):
@@ -404,9 +555,9 @@ def _face_index(selector):
 
 
 def _parse_edge_indices(selector):
-    """Upstream's '2,5' -> [2, 5], also for 'ref:...' tokens (one, or a list of them)."""
-    tokens = selector if isinstance(selector, (list, tuple)) else [selector]
-    if _session is None or not tokens or not all(is_ref(t) for t in tokens):
+    """Upstream's '2,5' -> [2, 5], also for 'ref:...' tokens (one, several, or a list of them)."""
+    tokens = ref_tokens(selector) if _session is not None else None
+    if tokens is None:
         return _ORIGINAL["_parse_edge_indices"](selector)
     session = _session
     ext = _ext(session)
@@ -415,8 +566,45 @@ def _parse_edge_indices(selector):
                 for i, raw in enumerate(render._raw(session._solid_body()).GetEdges() or ())}
     missing = [t for t, w in zip(tokens, wanted) if w not in index_of]
     if missing:
-        raise SolidWorksError(f"{len(missing)} referenced edge(s) are not on the part's first solid body.")
+        raise SolidWorksError(f"{len(missing)} referenced edge(s) are not on the part's first solid body: "
+                              f"{', '.join(missing)}.")
     return [index_of[w] for w in wanted]
+
+
+def _parse_face_selector(self, token, default_side="outer"):
+    """Upstream's '+z' / '+z:inner' -> (normal, side), also for 'ref:...': the planar face's
+    own normal, and the face itself in place of the side."""
+    if not is_ref(token):
+        return _ORIGINAL["_parse_face_selector"](self, token, default_side)
+    face = entity(self, token, "face")
+    surface = binding.wrap(face.GetSurface(), self._mod.ISurface)
+    if surface is None or not surface.IsPlane():
+        raise SolidWorksError("The referenced face is not planar: this tool sketches on (or opens) a planar face.")
+    return tuple(float(c) for c in face.Normal), _Picked(face)
+
+
+def _select_picked(self, picked, label):
+    self._model.ClearSelection2(True)
+    if not binding.wrap(picked.face, self._mod.IEntity).Select4(False, None):
+        raise SolidWorksError(f"Could not select the face {label}.")
+    return picked.face
+
+
+def _select_face_through(self, body, normal, side, point_mm, label):
+    if isinstance(side, _Picked):
+        return _select_picked(self, side, label)
+    return _ORIGINAL["_select_face_through"](self, body, normal, side, point_mm, label)
+
+
+def _select_planar_face(self, body, normal, label, side="outer"):
+    if isinstance(side, _Picked):
+        return _select_picked(self, side, label)
+    return _ORIGINAL["_select_planar_face"](self, body, normal, label, side)
+
+
+_STATIC = {"_face_index": _face_index, "_parse_edge_indices": _parse_edge_indices}
+_METHODS = {"_parse_face_selector": _parse_face_selector, "_select_face_through": _select_face_through,
+            "_select_planar_face": _select_planar_face}
 
 
 def install(session) -> None:
@@ -425,15 +613,15 @@ def install(session) -> None:
     _session = session
     if _ORIGINAL:
         return
-    for name, fn in (("_face_index", _face_index), ("_parse_edge_indices", _parse_edge_indices)):
+    for name, fn in {**_STATIC, **_METHODS}.items():
         _ORIGINAL[name] = getattr(SolidWorksSession, name)
         fn.__wrapped__ = _ORIGINAL[name]
-        setattr(SolidWorksSession, name, staticmethod(fn))
+        setattr(SolidWorksSession, name, staticmethod(fn) if name in _STATIC else fn)
 
 
 def uninstall() -> None:
     global _session
     for name, fn in _ORIGINAL.items():
-        setattr(SolidWorksSession, name, staticmethod(fn))
+        setattr(SolidWorksSession, name, staticmethod(fn) if name in _STATIC else fn)
     _ORIGINAL.clear()
     _session = None

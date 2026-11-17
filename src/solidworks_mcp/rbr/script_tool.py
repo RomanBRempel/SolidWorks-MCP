@@ -350,6 +350,49 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
                          "normal": [float(c) for c in row[6:9]]})
         return hits
 
+    from . import batch, cavity, query, section, sketch_datum, sweep   # here: they import this package's parts
+
+    def body_box(body=None):
+        """A body's TIGHT box in mm ({min_mm, max_mm, size_mm}) from its extreme points; body:
+        an IBody2, a list_bodies name, or None for the first solid body. IBody2.GetBodyBox
+        and IPartDoc.GetPartBox run loose round curved faces (10.004 for a 10 mm loft)."""
+        target = session._solid_body() if body is None else geom.resolve_body(session, session._require_model(), body)
+        return session._body_box(target)
+
+    def new_assembly():
+        """A new assembly that becomes the current document; returns its IModelDoc2 (raw
+        NewDocument gets a template name without its folder on some installations)."""
+        session.new_assembly()
+        return session._model
+
+    ns.update(
+        body_box=body_box, new_assembly=new_assembly,
+        # AddComponent5's own x, y, z centre the component's BOX there; this puts its ORIGIN there
+        insert_component=lambda path, x_mm=0.0, y_mm=0.0, z_mm=0.0, fixed=None: session.insert_component(
+            path, x_mm, y_mm, z_mm, fixed),
+        find_faces=lambda **kw: query.find_faces(session, **kw),
+        find_edges=lambda **kw: query.find_edges(session, **kw),
+        entity=lambda ref, kind=None: query.entity(session, ref, kind),
+        section_profile=lambda point_mm, normal="z", bodies=None: section.section_profile(
+            session, point_mm, normal, bodies),
+        read_sketches=lambda names=None, dimensions=True: batch.read_sketches(session, names, dimensions),
+        set_dimensions=lambda values: batch.set_dimensions(session, values),
+        add_sketch3d=lambda points_mm, **kw: sweep.add_sketch3d(session, points_mm, **kw),
+        sweep_cut=lambda path, **kw: sweep.sweep_cut(session, path, **kw),
+        sweep_boss=lambda path, **kw: sweep.sweep_boss(session, path, **kw),
+        fully_define_sketch=lambda sketch, **kw: sketch_datum.fully_define_sketch(session, sketch, **kw),
+        add_dimension=lambda sketch, entities, **kw: sketch_datum.add_dimension(session, sketch, entities, **kw),
+        sketch_fillet=lambda sketch, corners, radius_mm, **kw: sketch_datum.sketch_fillet(
+            session, sketch, corners, radius_mm, **kw),
+        sketch_intersection=lambda **kw: cavity.sketch_intersection(session, **kw),
+        sketch_trim_region=lambda sketch, keep_box, max_trims=80: cavity.sketch_trim_region(
+            session, sketch, keep_box, max_trims),
+        sketch_offset_chain=lambda sketch, distance_mm, **kw: cavity.sketch_offset_chain(
+            session, sketch, distance_mm, **kw),
+        split_line_project=lambda sketch, faces, **kw: cavity.split_line_project(session, sketch, faces, **kw),
+        loft_cut=lambda sketches, **kw: cavity.loft_cut(session, sketches, **kw),
+        cut_offset_from_surface=lambda sketch, face, offset_mm, toward, **kw: cavity.cut_offset_from_surface(
+            session, sketch, face, offset_mm, toward, **kw))
     ns.update(comp=comp, select=select, feature=feature, features=features, api=api, swapp=sw,
               W=W, call=call, segments=segments, relations=relations,
               vec=vec, pt=pt, ui_unlocked=ui_unlocked, tree_before=tree_before,
@@ -363,10 +406,10 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
               set_global=lambda name, value: param.set_global(session, name, value),
               link_dimension=lambda dimension, expression: param.link_dimension(session, dimension, expression),
               feature_dimensions=lambda feature=None: param.feature_dimensions(session, feature),
-              sketch_circles=lambda on, circles, name=None, profile_face=None: param.sketch_circles(
-                  session, on, circles, name, profile_face),
-              sketch_rect=lambda on, corner_mm, width_mm, height_mm, name=None, vars=None: param.sketch_rect(
-                  session, on, corner_mm, width_mm, height_mm, name, vars),
+              sketch_circles=lambda on, circles, name=None, profile_face=None, **kw: param.sketch_circles(
+                  session, on, circles, name, profile_face, **kw),
+              sketch_rect=lambda on, corner_mm, width_mm, height_mm, name=None, vars=None, **kw: param.sketch_rect(
+                  session, on, corner_mm, width_mm, height_mm, name, vars, **kw),
               convert_entities=lambda **kw: param.convert_entities(session, **kw),
               add_relation=lambda sketch, kind, entities: param.add_relation(session, sketch, kind, entities),
               offset_face_loop=lambda face, distance_mm, inward=True, link_to=None, name=None:
@@ -386,19 +429,178 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
     return ns
 
 
-def run_script(session, code: str, args: dict | None = None) -> dict:
+# --- what a script made, and undoing exactly that (S-11) ------------------------------------------
+
+
+def made_state(session) -> dict | None:
+    """What exists before a script runs: the current part's features by ID and its
+    equations. None when there is no part (nothing can be undone then).
+
+    Features are told apart by IFeature.GetID, not by name: a script that renames an
+    existing feature has not created one, and "every name that was not there before"
+    used to delete it on failure."""
+    try:
+        model = session._model
+        if model is None or int(model.GetType()) != 1:  # swDocPART
+            return None
+        state = {"title": model.GetTitle(), "ids": {int(f.GetID()): f.Name for f in session._history()}}
+    except Exception:  # noqa: BLE001 - no reliable picture: the caller falls back to the name snapshot
+        return None
+    try:
+        state["equations"] = [e["equation"] for e in session._equation_entries()]
+    except Exception:  # noqa: BLE001
+        state["equations"] = None
+    return state
+
+
+def made_since(before: dict, now: dict) -> dict:
+    """What a script did to the tree and the equations, from two made_state pictures; pure.
+    created: feature names new by ID; renamed: [{was, now}]; equations_added /
+    equations_lost: texts that appeared / are gone (a changed equation is both)."""
+    created = [name for fid, name in now["ids"].items() if fid not in before["ids"]]
+    renamed = [{"was": before["ids"][fid], "now": name} for fid, name in now["ids"].items()
+               if fid in before["ids"] and before["ids"][fid] != name]
+    old, new = before.get("equations"), now.get("equations")
+    added = [t for t in new if t not in old] if old is not None and new is not None else []
+    lost = [t for t in old if t not in new] if old is not None and new is not None else []
+    return {"created": created, "renamed": renamed, "equations_added": added, "equations_lost": lost}
+
+
+def _close_open_sketch(session) -> str | None:
+    """Leave a sketch the script left open (every later tool would draw into it)."""
+    try:
+        model = session._model
+        sketch = model.GetActiveSketch2() if model is not None else None
+        if sketch is None:
+            return None
+        name = None
+        try:
+            name = binding.wrap(sketch, session._mod.IFeature).Name
+        except Exception:  # noqa: BLE001
+            pass
+        model.ClearSelection2(True)
+        binding.wrap(model.SketchManager, session._mod.ISketchManager).InsertSketch(True)
+        return name or "a sketch"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _undo_equations(session, before: list, change: dict) -> dict:
+    """Put the equations back as they were: delete the added ones, restore the lost ones."""
+    report = {"removed": [], "restored": [], "failed": []}
+    eqmgr = session._equation_mgr()
+    lost_names = {session._equation_lhs(t).lower() for t in change["equations_lost"]}
+    for text in change["equations_added"]:
+        try:
+            if session._equation_lhs(text).lower() in lost_names:
+                continue  # a changed equation: set back below, in place
+            index = next((i for i in range(eqmgr.GetCount()) if eqmgr.Equation(i) == text), None)
+            if index is not None and eqmgr.Delete(index) >= 0:
+                report["removed"].append(text)
+            else:
+                report["failed"].append(text)
+        except Exception:  # noqa: BLE001
+            report["failed"].append(text)
+    if change["equations_lost"]:
+        try:
+            session.set_equations(list(change["equations_lost"]))
+            report["restored"] = list(change["equations_lost"])
+        except Exception as exc:  # noqa: BLE001
+            report["failed"] += [f"{t} ({exc})" for t in change["equations_lost"]]
+    elif report["removed"]:
+        try:
+            session._require_model().ForceRebuild3(False)
+        except Exception:  # noqa: BLE001
+            pass
+    return report
+
+
+def after_failure(session, before: dict | None, rollback: bool) -> dict:
+    """After a script raised: undo what it created (rollback) or report what stays."""
+    report = {}
+    closed = _close_open_sketch(session)
+    if closed:
+        report["closed_open_sketch"] = closed
+    now = made_state(session)
+    if before is None or now is None or now["title"] != before["title"]:
+        report["rolled_back"] = False
+        report["note"] = ("Nothing was undone: the script started without a current part, or switched "
+                          "documents.")
+        return report
+    change = made_since(before, now)
+    if change["renamed"]:
+        report["renamed"] = change["renamed"]
+    if not rollback:
+        report["rolled_back"] = False
+        report["kept"] = {"features": change["created"], "equations": change["equations_added"]}
+        if change["equations_lost"]:
+            report["kept"]["equations_changed_or_deleted"] = change["equations_lost"]
+        return report
+    report["rolled_back"] = True
+    left = []
+    if change["created"]:
+        keep = {name for fid, name in now["ids"].items() if fid in before["ids"]}
+        left = list(session._remove_features_since(keep))
+    report["removed"] = {"features": [n for n in change["created"] if n not in left]}
+    if left:
+        report["could_not_remove"] = left
+    if before.get("equations") is not None and (change["equations_added"] or change["equations_lost"]):
+        report["removed"]["equations"] = _undo_equations(session, before["equations"], change)
+    return report
+
+
+def _fault(exc) -> bool:
+    """A COM error after which SolidWorks' state cannot be trusted: the guard must see it."""
+    from ..session import SolidWorksSession
+    from . import guard
+    hresult = getattr(exc, "hresult", None)
+    return hresult is not None and (hresult in guard.FAULTS or hresult in SolidWorksSession._GONE_HRESULTS)
+
+
+def run_script(session, code: str, args: dict | None = None, rollback_on_error: bool = True) -> dict:
+    """Run `code` in the script namespace. When it raises:
+
+    rollback_on_error=True (default): the features the script CREATED - told by feature
+    ID, so a renamed feature is not one of them - and the equations it added or changed
+    are undone, and the error is raised (the caller sees ok false).
+    rollback_on_error=False: nothing is undone; the reply is {ok: false, error, kept:
+    {features, equations}} - the finished steps stay, the script can be continued."""
     out = []
     ns = namespace(session, out, args)
     before = journal.tree_state(session, names=True)
+    made_before = made_state(session)
     t0 = time.perf_counter()
     try:
         exec(compile(code, "<run_script>", "exec"), ns)  # noqa: S102 - the point of the tool
-    except SolidWorksError:
-        raise
     except Exception as exc:  # noqa: BLE001
-        tb = traceback.format_exc(limit=6)
+        if _fault(exc):
+            raise
+        if isinstance(exc, SolidWorksError):
+            message = str(exc)
+        else:
+            # the script's own frames: the exec frame of this module says nothing
+            frames = exc.__traceback__.tb_next if exc.__traceback__ is not None else None
+            tb = "".join(traceback.format_exception(type(exc), exc, frames, limit=6))
+            message = f"Script failed: {type(exc).__name__}: {exc}\n{tb}"
         stdout = "".join(out)[-4000:]
-        raise SolidWorksError(f"Script failed: {type(exc).__name__}: {exc}\n{tb}\nstdout:\n{stdout}")
+        try:
+            report = after_failure(session, made_before, bool(rollback_on_error))
+        except Exception as undo_exc:  # noqa: BLE001 - the script's own error is what matters
+            report = {"rolled_back": False, "note": f"Undoing failed: {type(undo_exc).__name__}: {undo_exc}"}
+        if not rollback_on_error:
+            return {"ok": False, "error": message, "elapsed_s": round(time.perf_counter() - t0, 3),
+                    "stdout": stdout, **report,
+                    "hint": "rollback_on_error=False: what the script finished before the error is kept "
+                            "(see kept); fix the failing step and run the rest."}
+        undone = report.get("removed") or {}
+        tail = ""
+        if undone.get("features") or undone.get("equations"):
+            tail = f"\nRolled back: {undone}."
+        if report.get("could_not_remove"):
+            tail += f"\nCould not remove: {report['could_not_remove']}."
+        if report.get("closed_open_sketch"):
+            tail += f"\nLeft the sketch the script had open: {report['closed_open_sketch']}."
+        raise SolidWorksError(f"{message}{tail}\nstdout:\n{stdout}") from None
     elapsed = round(time.perf_counter() - t0, 3)
     after = journal.tree_state(session, names=True)
     stdout = "".join(out)

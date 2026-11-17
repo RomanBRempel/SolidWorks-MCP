@@ -198,6 +198,11 @@ _DIRS = {"+x": (1, 0, 0), "-x": (-1, 0, 0), "+y": (0, 1, 0), "-y": (0, -1, 0), "
 
 
 def _face_for(session, face: str):
+    """The face behind '#index', a direction ('+z', '-z:inner') or a 'ref:...' reference
+    (find_faces): the reference reaches a face of any body, the others the first body's."""
+    from . import query
+    if query.is_ref(face):
+        return query.entity(session, face, "face")
     body = session._solid_body()
     faces = session._body_faces(body)
     if face.startswith("#"):
@@ -207,7 +212,8 @@ def _face_for(session, face: str):
             raise SolidWorksError(f"No face {face}; list_faces shows indices 0..{len(faces) - 1}.")
     direction, _, side = face.partition(":")
     if direction not in _DIRS:
-        raise SolidWorksError("face: '#index' from list_faces, or a direction such as '+z' / '-z:inner'.")
+        raise SolidWorksError("face: '#index' from list_faces, a direction such as '+z' / '-z:inner', or a "
+                              "'ref:...' reference from find_faces.")
     picked = session._pick_planar_face(faces, _DIRS[direction], side or "outer")
     if not picked or picked[0] is None:
         raise SolidWorksError(f"No planar face facing {direction}.")
