@@ -50,8 +50,12 @@ All notable changes to this project are documented here. This project follows
   warning says how many close_hidden_documents would close;
   close_hidden_documents(dry_run); opening a document past 30 open ones
   carries a hint.
-- sw_instances and SWMCP_SW_PID: attach to one SolidWorks instance by its
-  process id (running object table "SolidWorks_PID_<pid>").
+- sw_instances: the running SolidWorks processes with their memory and the
+  one the server holds, with a warning when there is more than one - only one
+  SolidWorks runs on a machine, a second instance is never started (the answer
+  to "a separate instance for the server" is no). SWMCP_SW_PID attaches to
+  one process by its id (running object table "SolidWorks_PID_<pid>") while a
+  stray one is still open.
 - api_search: methods, properties and constants of the installed SolidWorks
   type libraries with their parameters.
 - sketch_offset_chain takes a hollow contour loop by loop (outline in, holes

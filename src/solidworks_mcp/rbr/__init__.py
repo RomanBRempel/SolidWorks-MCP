@@ -54,7 +54,7 @@ RBR extension (solidworks-mcp-rbr)
 - run_script(rollback_on_error=False) keeps what the script finished before an error (`kept`); the default removes exactly what the script created (by feature ID - a renamed feature stays) and restores changed equations.
 - Derived parts: derive_part(body, path) gives a body its own part file that follows the master; list_external_refs shows what a part takes from other files and whether each link is alive; update_external_refs loads the sources, rebuilds and reports each body's volume before / after.
 - A call that answers DIALOG_BLOCKING ran into a modal SolidWorks dialog: the reply holds its text and buttons. dialog_respond(button) presses one ('yes' / 'no' / 'ok' / 'cancel' or the caption); the interrupted call is NOT cancelled and goes on then - never send it again. dialog_list shows the open dialogs at any time. Read the text before answering; when it asks about the user's data (save changes?), ask the user.
-- api_search(query) finds a method, property or constant of the installed SolidWorks API with its parameters - use it before a run_script call you are not sure of. sw_instances lists the running SolidWorks processes and the one this server drives.
+- api_search(query) finds a method, property or constant of the installed SolidWorks API with its parameters - use it before a run_script call you are not sure of. sw_instances lists the running SolidWorks processes and the one this server drives; only one SolidWorks may run on a machine - never start a second one.
 - SolidCAM (in the same SolidWorks; never start another SolidWorks or SolidCAM): solidcam_status -> solidcam_new_part(path, machine) (makes the zero SolidCAM_Zero on the top face at the bottom-left corner, then SolidCAM's Part Data panel waits for the user to pick it) or solidcam_open(path) -> solidcam_stock -> solidcam_add_operation(template, geometry) -> solidcam_calculate -> solidcam_gcode (says whether the program cuts) -> solidcam_save / solidcam_close. The API cannot define job geometry (chains, faces): a template job on the target alone posts no moves.
 """
 
@@ -259,7 +259,7 @@ def _patch_set_equations():
 
 def register(server) -> None:
     """Patch the session and add the RBR tools to `server.mcp` (the upstream FastMCP)."""
-    instance.apply()  # SWMCP_SW_PID: a SolidWorks of the server's own
+    instance.apply()  # SWMCP_SW_PID: which SolidWorks process, should a stray second one be running
     fastpath.apply()
     speed.apply()
     guard.apply()    # before the journal, so the journal times the guard too
@@ -625,10 +625,10 @@ def register(server) -> None:
     async def sw_instances() -> dict:
         """The SolidWorks processes running on this machine - pid, memory (working set and
         private MB), whether each is registered for automation - and which one this server is
-        attached to. Answers without calling into SolidWorks. With SWMCP_SW_PID=<pid> in the
-        server's environment the server attaches to that instance instead of the first one: a
-        SolidWorks of its own, the user's left alone (start it yourself; the server never
-        starts SolidWorks)."""
+        attached to. Answers without calling into SolidWorks. Only ONE SolidWorks may run on
+        a machine: never start a second one, for no purpose. More than one in the list (a
+        process left behind by a crash) comes with a warning - tell the user and close
+        nothing yourself."""
         return _local(instance.instances, guard.state().get("sw_pid"))
 
     @mcp.tool()

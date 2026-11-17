@@ -1,19 +1,22 @@
-"""Which SolidWorks this server drives, when more than one is running (S-15).
+"""Which SolidWorks this server drives, and a check that there is only one (S-15).
 
-Upstream attaches with GetActiveObject("SldWorks.Application"): whichever
-instance registered first. Every SolidWorks process also registers itself in
-the Running Object Table as "SolidWorks_PID_<pid>" (seen on SW 2025 SP3 next
-to the open documents' file monikers), so one instance can be picked by its
-process id:
+One SolidWorks per machine is the rule here: a second instance is not started,
+not for a server of its own and not for a measurement. S-15 asked whether the
+server could work in a separate instance; technically each SolidWorks process
+registers itself in the Running Object Table as "SolidWorks_PID_<pid>" (seen
+on SW 2025 SP3 next to the open documents' file monikers), so one could be
+picked by its process id - but the answer to S-15 is no, by the owner's
+decision. What is left of it:
 
-- SWMCP_SW_PID=<pid> in the server's environment: attach to that instance
-  instead of the first one. That is all a server needs to work in a second
-  SolidWorks of its own while the user's stays untouched.
-- instances(): the running instances with their memory, and which one this
-  server holds - no COM call into SolidWorks, so it answers while one is busy.
+- instances(): the SolidWorks processes that are running, with their memory
+  and the one this server holds - no COM call into SolidWorks, so it answers
+  while SolidWorks is busy - and a warning when there is more than one (a
+  process left behind by a crash, or one started by mistake).
+- SWMCP_SW_PID=<pid> in the server's environment: attach to exactly that
+  process instead of whichever registered first. For the case above, until the
+  stray process is closed; never a reason to run two.
 
-Starting the second instance is not done from here: it takes a licence check,
-~half a minute and a few hundred MB, and belongs to whoever owns the machine.
+Nothing here starts SolidWorks.
 """
 
 import os
@@ -90,9 +93,13 @@ def instances(attached_pid: int | None = None) -> dict:
         out["requested_pid"] = wanted_pid()
     except SolidWorksError as exc:
         out["warning"] = str(exc)
-    if len(rows) > 1 and out["requested_pid"] is None:
-        out["note"] = (f"{len(rows)} SolidWorks instances are running and {PID_ENV} is not set: the server "
-                       "attaches to the one that registered first.")
+    if len(rows) > 1:
+        which = ("the server attaches to the one that registered first" if out["requested_pid"] is None
+                 else f"the server attaches to pid {out['requested_pid']} ({PID_ENV})")
+        extra = (f"{len(rows)} SolidWorks processes are running: only one may run on a machine. Tell the user - "
+                 f"one of them is a leftover or was started by mistake; do not close either yourself. Meanwhile "
+                 f"{which}.")
+        out["warning"] = (out["warning"] + " " + extra) if out.get("warning") else extra
     return out
 
 

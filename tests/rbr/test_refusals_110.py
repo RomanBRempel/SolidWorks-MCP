@@ -58,3 +58,17 @@ def test_a_disabled_default_button_is_not_offered():
                           {"id": 2, "text": "Cancel", "enabled": True, "default": False}]}
     shown = dialogs.public(dialog)
     assert shown["buttons"] == ["Cancel"] and "default_button" not in shown
+
+
+def test_more_than_one_solidworks_is_warned_about(monkeypatch):
+    """One SolidWorks per machine: a second process (a leftover of a crash) is named, never used as a feature."""
+    monkeypatch.setattr(instance.health, "find_processes", lambda image="SLDWORKS.exe": [101, 202])
+    monkeypatch.setattr(instance.health, "process_memory", lambda pid: {"working_set_bytes": 1 << 30,
+                                                                       "private_bytes": 2 << 30})
+    monkeypatch.setattr(instance, "_rot_monikers", lambda: {})
+    monkeypatch.delenv(instance.PID_ENV, raising=False)
+    two = instance.instances(attached_pid=101)
+    assert two["count"] == 2 and "only one may run on a machine" in two["warning"]
+    assert [row["attached"] for row in two["instances"]] == [True, False]
+    monkeypatch.setattr(instance.health, "find_processes", lambda image="SLDWORKS.exe": [101])
+    assert "warning" not in instance.instances(attached_pid=101)
