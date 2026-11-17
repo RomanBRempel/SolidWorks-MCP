@@ -24,6 +24,18 @@ MAX_CODE_CHARS = 65536
 _ORIGINAL = {}
 _lock = threading.Lock()
 
+# The guard (applied underneath) reads the tree state for us inside its lock and
+# with CommandInProgress set: outside it each read cost ~0.15 s on a 200-feature
+# part and raced the other server processes.
+GUARDED = False
+_notes = threading.local()
+
+
+def note(session, when: str) -> None:
+    """Called by the guard at the start ('before') and end ('after') of a call."""
+    if getattr(_notes, "open", False):
+        setattr(_notes, when, tree_state(session))
+
 
 def home() -> str:
     base = os.environ.get("SWMCP_HOME") or os.path.join(
@@ -70,24 +82,63 @@ def describe_args(fn, args, kwargs) -> dict:
     return out
 
 
-def tree_state(session):
-    """(title, top-level feature count, last feature name) of the current document; cheap."""
+def tree_state(session, names=None):
+    """{title, top-level feature count, last feature name, rolled} of the current document; cheap.
+
+    `names` (the top-level feature names in tree order) is what tells WHICH
+    features a call added when they did not land at the end of the tree: below
+    the rollback bar the tree goes on, and reading "the last N features" then
+    names rolled-back ones (a script renamed an existing plane that way).
+    names=None lists them only while the part is rolled back, True always.
+    """
     model = session._model
     if model is None:
         return None
     try:
         fm = binding.wrap(model.FeatureManager, session._mod.IFeatureManager)
-        last = model.FeatureByPositionReverse(0)
-        return {"title": model.GetTitle(), "count": int(fm.GetFeatureCount(True)),
-                "last": last.Name if last is not None else None}
+        last = binding.wrap(model.FeatureByPositionReverse(0), session._mod.IFeature)
+        state = {"title": model.GetTitle(), "count": int(fm.GetFeatureCount(True)),
+                 "last": last.Name if last is not None else None}
     except Exception:  # noqa: BLE001 - the journal never breaks a call
         return None
+    try:
+        if fm.GetFreezeLocation() is not None:
+            state["count"] -= 1  # the freeze bar is listed as a feature of its own
+    except Exception:  # noqa: BLE001 - no freeze bar in this build or document type
+        pass
+    try:
+        state["rolled"] = bool(last.IsRolledBack()) if last is not None else False
+        if names:
+            state["names"] = [f.Name for f in session._iter_features()]
+        elif state["rolled"]:
+            from .fastpath import live_count
+            feats = list(session._iter_features())
+            live = live_count(feats)
+            state.update(live=live, below=feats[live].Name if live < len(feats) else None)
+    except Exception:  # noqa: BLE001 - an assembly, a drawing: no rollback bar to mind
+        state.setdefault("rolled", False)
+    return state
 
 
 def tree_added(session, before, after) -> list:
-    """Names of the features appended since `before` (same document only)."""
+    """Names of the features added since `before` (same document only)."""
     if not before or not after or before["title"] != after["title"]:
         return []
+    if "names" in before and "names" in after:
+        old = set(before["names"])
+        return [n for n in after["names"] if n not in old][:50]
+    if before.get("rolled") or after.get("rolled"):
+        # new features land right above the rollback bar; with the bar moved by the
+        # call itself, positions say nothing
+        grown = after.get("live", 0) - before.get("live", 0)
+        if not (before.get("rolled") and after.get("rolled")) or before.get("below") != after.get("below") \
+                or grown <= 0:
+            return []
+        try:
+            feats = list(session._iter_features())
+            return [f.Name for f in feats[after["live"] - grown:after["live"]]][:50]
+        except Exception:  # noqa: BLE001
+            return []
     grown = after["count"] - before["count"]
     if grown <= 0:
         return []
@@ -110,11 +161,30 @@ def write(entry: dict) -> None:
         fh.write(line + "\n")
 
 
+def record(tool: str, args: dict, result=None) -> None:
+    """Journal a call that did not go through run_guarded (it never touched COM), such
+    as pressing a dialog button: what was asked and how it ended."""
+    entry = {"ts": _dt.datetime.now().isoformat(timespec="milliseconds"), "pid": os.getpid(), "tool": tool,
+             "args": args}
+    ok = result.get("ok", True) if isinstance(result, dict) else True
+    entry["ok"] = ok
+    if isinstance(result, dict):
+        if not ok:
+            entry["error"] = str(result.get("error", ""))[:2000]
+        entry["result"] = _clip({k: v for k, v in result.items() if k in ("closed", "pressed", "dialog", "method")})
+    try:
+        write(entry)
+    except Exception:  # noqa: BLE001 - a full disk must not fail the call
+        pass
+
+
 def _run_guarded(self, fn, *args, **kwargs):
     t0 = time.perf_counter()
     entry = {"ts": _dt.datetime.now().isoformat(timespec="milliseconds"), "pid": os.getpid(), "tool": tool_name(fn),
              **describe_args(fn, args, kwargs)}
-    before = tree_state(self)
+    nested = getattr(_notes, "open", False)
+    _notes.open, _notes.before, _notes.after = True, None, None
+    before = None if GUARDED else tree_state(self)
     try:
         result = _ORIGINAL["run_guarded"](self, fn, *args, **kwargs)
     except Exception as exc:
@@ -127,11 +197,15 @@ def _run_guarded(self, fn, *args, **kwargs):
             entry["error"] = str(result.get("error", ""))[:2000]
         return result
     finally:
-        after = tree_state(self)
+        before = before or _notes.before
+        after = _notes.after or tree_state(self)
+        _notes.open = nested
         entry["ms"] = round((time.perf_counter() - t0) * 1000, 1)
         entry["doc"] = (after or before or {}).get("title")
         if before and after and before["title"] == after["title"]:
             entry["features"] = {"before": before["count"], "after": after["count"]}
+            if after.get("rolled"):
+                entry["features"]["rolled_back"] = True
             added = tree_added(self, before, after)
             if added:
                 entry["features"]["added"] = added

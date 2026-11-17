@@ -247,7 +247,17 @@ def rename_body(session, body: str, new_name: str) -> dict:
     model = session._require_model()
     model.ForceRebuild3(False)
     if new_name not in _names(session):
-        raise SolidWorksError(f"SolidWorks kept the old name of '{body}'.")
+        why = ""
+        try:
+            if new_name in {f.Name for f in session._history()}:
+                # seen on SW 2025 SP3: a body cut by POCKET, made by BLOCK, does not take the name
+                # 'BLOCK' back - body.Name = ... answers nothing and the name stays
+                why = (f" '{new_name}' is the name of a feature in the part's history: SolidWorks names bodies "
+                       "after features itself and does not take such a name by hand for a body that feature "
+                       f"built. Choose another, e.g. '{new_name}_body'.")
+        except Exception:  # noqa: BLE001
+            pass
+        raise SolidWorksError(f"SolidWorks kept the old name of '{body}'.{why}")
     model.SetSaveFlag()
     return {"ok": True, "renamed": body, "name": new_name, "bodies": _summary(session)}
 

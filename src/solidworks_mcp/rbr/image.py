@@ -11,6 +11,7 @@ Supported: 8-bit greyscale/RGB/RGBA, and 1/2/4-bit greyscale or palette,
 without interlacing. Anything else answers None ("cannot tell"), not a guess.
 """
 
+import os
 import struct
 import zlib
 
@@ -127,6 +128,21 @@ def is_blank_png(data: bytes) -> bool | None:
 def _unfilter_bytes(raw: bytes, stride: int, height: int) -> bytearray | None:
     """_unfilter for sub-byte depths: one 'pixel' = one byte of packed bits."""
     return _unfilter(raw, stride, height, 1)
+
+
+INLINE_MAX_BYTES = 1_500_000  # a PNG beyond this is not sent in the reply (base64 adds a third)
+
+
+def inline_png(path: str, limit: int = INLINE_MAX_BYTES) -> bytes | None:
+    """The PNG at `path` for an MCP image block, or None when it is not a PNG or too large."""
+    try:
+        if os.path.getsize(path) > limit:
+            return None
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    return data if data.startswith(_SIGNATURE) else None
 
 
 def is_blank_file(path: str) -> bool | None:

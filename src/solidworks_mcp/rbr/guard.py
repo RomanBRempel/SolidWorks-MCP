@@ -41,7 +41,8 @@ READ_ONLY = frozenset({
     "get_status", "list_documents", "get_mass_properties", "get_bounding_box", "list_faces", "list_edges",
     "list_bodies", "list_features", "list_dimensions", "read_sketch", "list_equations", "list_components",
     "get_assembly_bounding_box", "get_custom_properties", "list_configurations", "shell_check",
-    "release_ui", "flow_goals", "flow_info",
+    "release_ui", "flow_goals", "flow_info", "render_view", "section_view", "section_profile",
+    "read_sketches", "find_faces", "find_edges", "list_external_refs", "api_search", "count_closable",
 })
 
 # Tools that switch the current document: ownership is checked on the document they act on, not before.
@@ -66,7 +67,7 @@ BUSY_FAIL_S = float(os.environ.get("SWMCP_BUSY_FAIL_S", "20"))
 _ORIGINAL = {}
 _state_lock = threading.Lock()
 _state = {"tool": None, "since": None, "doc": None, "calls": 0, "faults": 0, "releases": 0,
-          "last_fault": None, "last_release": None, "quarantine": None}
+          "last_fault": None, "last_release": None, "quarantine": None, "sw_pid": None}
 
 
 # --- status (any thread) -----------------------------------------------------------------
@@ -113,11 +114,49 @@ class _ProcessLock:
         return os.path.join(journal.home(), "lock.json")
 
     def holder(self) -> dict | None:
+        """What the holder file says: the last process that took the lock (it may be done)."""
         try:
             with open(self._holder_path(), encoding="utf-8") as fh:
-                return json.load(fh)
+                data = json.load(fh)
+            return data if isinstance(data, dict) else None
         except (OSError, ValueError):
             return None
+
+    def held_by(self) -> dict | None:
+        """Who holds the lock at this moment, or None when it is free.
+
+        The holder file alone is not the answer: it kept naming the last caller
+        while nothing ran (server_health showed a lock_holder for minutes of idle
+        time, and one of a process that had exited). The mutex itself is asked: if
+        it can be taken without waiting, nobody holds it. Call this from a thread
+        other than the COM thread (a mutex is re-entrant for its owner)."""
+        if self._win:
+            import win32event
+            try:
+                if self._handle is None:
+                    self._handle = win32event.CreateMutex(None, False, MUTEX_NAME)
+                rc = win32event.WaitForSingleObject(self._handle, 0)
+            except Exception:  # noqa: BLE001 - unknown: say what the file says
+                return self.holder()
+            if rc in (0, 0x80):
+                try:
+                    win32event.ReleaseMutex(self._handle)
+                except Exception:  # noqa: BLE001
+                    pass
+                return None
+            return self.holder() or {"pid": None, "tool": None, "since": None}
+        if self._local.acquire(blocking=False):
+            self._local.release()
+            return None
+        return self.holder()
+
+    def _forget_holder(self) -> None:
+        """Empty the holder file when it names this process (the call is over)."""
+        try:
+            if (self.holder() or {}).get("pid") == os.getpid():
+                os.remove(self._holder_path())
+        except OSError:
+            pass
 
     def acquire(self, tool: str, timeout_s: float) -> None:
         if self._win:
@@ -140,6 +179,7 @@ class _ProcessLock:
             pass
 
     def release(self) -> None:
+        self._forget_holder()
         if self._win:
             import win32event
             if self._handle is not None:
@@ -159,6 +199,9 @@ _lock = _ProcessLock()
 
 # --- document ownership --------------------------------------------------------------------
 
+_owners_lock = threading.Lock()   # claim() runs on the COM thread, server_health prunes on another
+
+
 def _owners_path() -> str:
     return os.path.join(journal.home(), "owners.json")
 
@@ -177,6 +220,72 @@ def _save_owners(data: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=1)
     os.replace(tmp, _owners_path())
+
+
+def live_entries(data: dict, alive) -> tuple:
+    """(entries whose process is alive, titles dropped); pure. `alive` is pid -> bool."""
+    kept, dropped, verdicts = {}, [], {}
+    for title, entry in data.items():
+        try:
+            pid = int((entry or {}).get("pid"))
+        except (TypeError, ValueError):
+            dropped.append(title)
+            continue
+        if pid not in verdicts:
+            verdicts[pid] = bool(alive(pid))
+        if verdicts[pid]:
+            kept[title] = entry
+        else:
+            dropped.append(title)
+    return kept, dropped
+
+
+def prune_owners() -> dict:
+    """Drop the ownership records of processes that are gone and return the rest.
+
+    The file only ever grew: a month of sessions left 130 records, nearly all of
+    server processes that had exited (the oldest two weeks old). Ownership
+    protects a document from another LIVE server process; a dead one protects
+    nothing and only hides the live ones in server_health."""
+    with _owners_lock:
+        data = owners()
+        kept, dropped = live_entries(data, _server_alive)
+        if dropped:
+            try:
+                _save_owners(kept)
+            except OSError:
+                pass
+    return kept
+
+
+_SERVER_IMAGES = ("python", "solidworks-mcp")
+
+
+def _server_alive(pid: int) -> bool:
+    """Is `pid` a live server process? Alive, and - where the image name can be read -
+    a Python or solidworks-mcp executable (Windows reuses the pids of dead processes)."""
+    if pid == os.getpid():
+        return True
+    if not _pid_alive(pid):
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        try:
+            size = wt.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if not ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return True
+            return os.path.basename(buf.value).lower().startswith(_SERVER_IMAGES)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 - cannot tell: keep the record
+        return True
 
 
 def _pid_alive(pid: int) -> bool:
@@ -220,10 +329,11 @@ def claim(title: str | None, tool: str) -> None:
     if not title:
         return
     try:
-        data = owners()
-        data[title] = {"pid": os.getpid(), "tool": tool, "ts": time.time(),
-                       "at": time.strftime("%Y-%m-%d %H:%M:%S")}
-        _save_owners(data)
+        with _owners_lock:
+            data, _dropped = live_entries(owners(), _server_alive)   # the dead go whenever the file is written
+            data[title] = {"pid": os.getpid(), "tool": tool, "ts": time.time(),
+                           "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+            _save_owners(data)
     except OSError:
         pass
 
@@ -255,16 +365,44 @@ def release_ui(session, dry_run: bool = False, _retry: bool = True, clear_quaran
     report = {"ok": True, "command_in_progress": None, "documents": [], "errors": []}
     if session._sw is None:
         _ORIGINAL.get("connect", SolidWorksSession.connect)(session)
+    flagged = None
     try:
-        report["command_in_progress"] = bool(session._sw.CommandInProgress)
-        if report["command_in_progress"] and not dry_run:
-            session._sw.CommandInProgress = False
+        report["command_in_progress"] = flagged = bool(session._sw.CommandInProgress)
+        # The flag stays SET while the documents are walked and is cleared at the end: with it
+        # the walk's ~10 COM calls per document are fast, without it they took 0.2 s per
+        # document - 11.5-12.3 s with 56 documents open (measured 2026-11-16), on the first
+        # call of every server process and after a refused call that left the UI switched off.
+        if not flagged:
+            session._sw.CommandInProgress = True
     except Exception as exc:  # noqa: BLE001
         if _retry and getattr(exc, "hresult", None) in FAULTS:  # the link died: attach to the running SolidWorks
             session._sw = session._model = None
             _ORIGINAL.get("connect", SolidWorksSession.connect)(session)
             return release_ui(session, dry_run, _retry=False, clear_quarantine=clear_quarantine)
         report["errors"].append(f"CommandInProgress: {exc}")
+    try:
+        _release_documents(session, report, dry_run)
+    finally:
+        try:
+            session._sw.CommandInProgress = bool(flagged) if dry_run else False
+        except Exception as exc:  # noqa: BLE001
+            report["errors"].append(f"CommandInProgress: {exc}")
+    if not dry_run:
+        # Never touch _quiet_depth: when this runs inside a guarded call (a script, or
+        # connect() from _ensure) upstream's _quiet_ui still has to count itself out.
+        if not session._quiet_depth:
+            session._to_wake = []
+        _set(releases=_state["releases"] + 1, last_release=time.strftime("%H:%M:%S"))
+    report["dry_run"] = dry_run
+    if clear_quarantine and not dry_run:
+        _set(quarantine=None)
+    report["quarantine"] = _state.get("quarantine")
+    report["frozen"] = bool(report["command_in_progress"]) or any(d["switched_off"] for d in report["documents"])
+    return report
+
+
+def _release_documents(session, report: dict, dry_run: bool) -> None:
+    """Switch drawing back on in every open document (each setting on its own)."""
     mod = session._mod
     for doc in _documents(session):
         entry = {"title": None, "switched_off": []}
@@ -289,18 +427,28 @@ def release_ui(session, dry_run: bool = False, _retry: bool = True, clear_quaran
         except Exception as exc:  # noqa: BLE001
             report["errors"].append(f"{entry['title']}: {exc}")
         report["documents"].append(entry)
-    if not dry_run:
-        # Never touch _quiet_depth: when this runs inside a guarded call (a script, or
-        # connect() from _ensure) upstream's _quiet_ui still has to count itself out.
-        if not session._quiet_depth:
-            session._to_wake = []
-        _set(releases=_state["releases"] + 1, last_release=time.strftime("%H:%M:%S"))
-    report["dry_run"] = dry_run
-    if clear_quarantine and not dry_run:
-        _set(quarantine=None)
-    report["quarantine"] = _state.get("quarantine")
-    report["frozen"] = bool(report["command_in_progress"]) or any(d["switched_off"] for d in report["documents"])
-    return report
+
+
+def _left_frozen(session) -> bool:
+    """After a refused call: is CommandInProgress or the current document's
+    drawing still switched off? Unknown counts as yes."""
+    try:
+        if session._sw is None:
+            return False
+        if session._sw.CommandInProgress or session._to_wake:
+            return True
+        doc = session._model
+        if doc is None:
+            return False
+        mod = session._mod
+        view = binding.wrap(doc.ActiveView, mod.IModelView)
+        fm = binding.wrap(doc.FeatureManager, mod.IFeatureManager)
+        sk = binding.wrap(doc.SketchManager, mod.ISketchManager)
+        return not all(getattr(target, prop) for target, prop in (
+            (view, "EnableGraphicsUpdate"), (fm, "EnableFeatureTree"), (fm, "EnableFeatureTreeWindow"),
+            (sk, "DisplayWhenAdded")) if target is not None)
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def _clear_stale_flag(session) -> None:
@@ -365,7 +513,11 @@ def _run_guarded(self, fn, *args, **kwargs):
                 # (journal through 2026-11-03); a live A/B on a 93-feature part
                 # measured 4.1 s -> 0.3 s. Snapshot and UI freeze stay skipped.
                 busy = self._command_in_progress(True)
-                return fn(*args, **kwargs)
+                journal.note(self, "before")
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    journal.note(self, "after")
             except pythoncom.com_error as exc:
                 # the link died during the read itself (the probe above had just passed)
                 if getattr(exc, "hresult", None) in SolidWorksSession._GONE_HRESULTS:
@@ -385,15 +537,34 @@ def _run_guarded(self, fn, *args, **kwargs):
         if tool not in SWITCHERS:
             check_owner(_title(self), tool)
         _clear_stale_flag(self)
+        # CommandInProgress BEFORE upstream's snapshot: with the rollback bar inside the
+        # tree that snapshot reads every feature name, 20.7 s without the flag on a
+        # 205-feature part against 0.3 s with it (measured 2026-11-16).
         try:
-            result = _ORIGINAL["run_guarded"](self, fn, *args, **kwargs)
+            flagged = self._command_in_progress(True)
+        except Exception:  # noqa: BLE001 - a dead link: upstream reattaches and sets it itself
+            flagged = None
+        try:
+            journal.note(self, "before")
+            try:
+                result = _ORIGINAL["run_guarded"](self, fn, *args, **kwargs)
+            finally:
+                journal.note(self, "after")
+                try:
+                    self._command_in_progress(flagged)
+                except Exception:  # noqa: BLE001 - the link died in the call
+                    pass
         except Exception as exc:
             # a lost link arrives as a SolidWorksError raised from the COM error
             hresult = getattr(exc, "hresult", None) or getattr(exc.__cause__, "hresult", None)
             if hresult in FAULTS:
                 _set(faults=_state["faults"] + 1, last_fault=f"{time.strftime('%H:%M:%S')} {tool}: {FAULTS[hresult]}")
             try:
-                release_ui(self)
+                # A refusal (a tool's own SolidWorksError) leaves upstream's restore intact:
+                # the full release walks every open document, 5-7 s with 48 of them open,
+                # so it runs only when something really is still switched off.
+                if not isinstance(exc, SolidWorksError) or hresult in FAULTS or _left_frozen(self):
+                    release_ui(self)
             except Exception:  # noqa: BLE001 - the original error is what the caller needs
                 pass
             if hresult in QUARANTINE_FAULTS:
@@ -406,10 +577,28 @@ def _run_guarded(self, fn, *args, **kwargs):
                     "without changing its inputs.") from exc
             raise
         claim(_title(self), tool)
+        if tool in SWITCHERS and isinstance(result, dict) and result.get("ok", True):
+            _note_document_load(self, result)
         return result
     finally:
         _set(tool=None, since=None)
         _lock.release()
+
+
+DOCS_WARN = int(os.environ.get("SWMCP_DOCS_WARN", "30"))
+
+
+def _note_document_load(session, result: dict) -> None:
+    """After opening or creating a document: say so when too many are open (one COM call)."""
+    try:
+        count = int(session._sw.GetDocumentCount())
+    except Exception:  # noqa: BLE001
+        return
+    if count > DOCS_WARN:
+        result["documents_open"] = count
+        result["hint"] = (f"{count} documents are open (> {DOCS_WARN}): calls slow down with every one. "
+                          "close_hidden_documents(dry_run=True) shows which invisible, saved, unowned ones "
+                          "it would close; close_hidden_documents() closes them.")
 
 
 _releasing = threading.local()
@@ -418,6 +607,7 @@ _releasing = threading.local()
 def _connect(self):
     """Attach as upstream does, then clear whatever a previous server or a crash left frozen."""
     result = _ORIGINAL["connect"](self)
+    _set(sw_pid=_sw_pid(self))   # for the checks that must not call into a busy SolidWorks
     if not getattr(_releasing, "on", False):
         _releasing.on = True
         try:
@@ -438,6 +628,7 @@ def apply() -> None:
         _ORIGINAL["connect"] = SolidWorksSession.connect
         SolidWorksSession.run_guarded = _run_guarded
         SolidWorksSession.connect = _connect
+        journal.GUARDED = True
 
 
 def unapply() -> None:
@@ -446,3 +637,4 @@ def unapply() -> None:
         SolidWorksSession.run_guarded = _ORIGINAL["run_guarded"]
         SolidWorksSession.connect = _ORIGINAL["connect"]
         _ORIGINAL.clear()
+        journal.GUARDED = False

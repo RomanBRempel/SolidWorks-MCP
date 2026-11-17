@@ -87,10 +87,20 @@ def test_spares_a_document_owned_by_a_live_process(swmcp_home, monkeypatch):
     hidden = Doc("Theirs.SLDPRT")
     sw = Sw([hidden])
     monkeypatch.setattr(guard, "owners", lambda: {"Theirs.SLDPRT": {"pid": 4242, "tool": "x"}})
-    monkeypatch.setattr(guard, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(guard, "_server_alive", lambda pid: True)
     report = health.close_hidden_documents(_session(sw))
     assert report["closed"] == []
     assert report["kept"][0]["why"] == "owned by pid 4242"
+
+
+def test_a_dead_owner_protects_nothing(swmcp_home, monkeypatch):
+    from solidworks_mcp.rbr import guard
+    sw = Sw([Doc("Theirs.SLDPRT")])
+    monkeypatch.setattr(guard, "owners", lambda: {"Theirs.SLDPRT": {"pid": 4242, "tool": "x"}})
+    monkeypatch.setattr(guard, "_server_alive", lambda pid: False)
+    monkeypatch.setattr(guard, "_save_owners", lambda data: None)
+    assert health.close_hidden_documents(_session(sw), dry_run=True)["would_close"] == ["Theirs.SLDPRT"]
+    assert sw.docs and health.close_hidden_documents(_session(sw))["closed"] == ["Theirs.SLDPRT"]
 
 
 def test_no_documents_is_a_named_error(swmcp_home):

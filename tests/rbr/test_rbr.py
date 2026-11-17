@@ -71,13 +71,33 @@ def test_rollback_noop_when_nothing_added(fake_session):
     assert len(fake_session._history()) == 2
 
 
-def test_rollback_bar_mid_tree_uses_upstream_snapshot(fake_session):
-    fake_session._model.rolled_back = True
+def test_rollback_bar_mid_tree_snapshot_names_the_bar(fake_session):
+    fake_session._model.bar = 4  # Boss1 is rolled back
     snap = fake_session._history_snapshot()
-    assert snap[0] == "P.SLDPRT" and snap[1] == {"Sketch1", "Boss1"}  # the upstream shape
-    fake_session._model.add("Extra")
-    fake_session._roll_back(snap)
+    assert snap == ("bar", "P.SLDPRT", "Sketch1", "Boss1", 5)  # between which two features the bar lies
+    fake_session._model.add("Extra")  # lands above the bar, not at the end
+    assert [f.Name for f in fake_session._history()] == ["Sketch1", "Extra", "Boss1"]
+    assert fake_session._roll_back(snap) == []
     assert [f.Name for f in fake_session._history()] == ["Sketch1", "Boss1"]
+
+
+def test_rollback_leaves_the_tree_alone_when_the_call_moved_the_bar(fake_session):
+    fake_session._model.bar = 4
+    snap = fake_session._history_snapshot()
+    fake_session._model.bar = None  # the call rolled forward: Boss1 is live again
+    fake_session._model.add("Extra")
+    assert fake_session._roll_back(snap) == []
+    assert [f.Name for f in fake_session._history()] == ["Sketch1", "Boss1", "Extra"]  # nothing guessed
+
+
+def test_refused_call_that_added_nothing_does_not_rebuild(fake_session):
+    rebuilds = []
+    fake_session._model.ForceRebuild3 = lambda *a: rebuilds.append(a) or True
+    assert fake_session._remove_features_since({"Sketch1", "Boss1"}) == []
+    assert rebuilds == []
+    fake_session._model.add("Extra")
+    assert fake_session._remove_features_since({"Sketch1", "Boss1"}) == []
+    assert len(rebuilds) == 1
 
 
 def test_rollback_other_document_does_nothing(fake_session):
@@ -315,7 +335,7 @@ def test_builtin_scripts_parse():
 def test_register_adds_tools_without_touching_upstream(swmcp_home):
     import asyncio
     from solidworks_mcp import server
-    from solidworks_mcp.rbr import guard, register, speed
+    from solidworks_mcp.rbr import context, guard, instance, query, register, speed
     before = {t.name for t in asyncio.run(server.mcp.list_tools())}
     try:
         register(server)
@@ -330,7 +350,17 @@ def test_register_adds_tools_without_touching_upstream(swmcp_home):
                 "plane_normal_to_line", "mirror_features", "mirror_body",
                 "sketch_intersection", "sketch_trim_region", "sketch_offset_chain", "split_line_project",
                 "loft_cut", "cut_offset_from_surface"} <= new
-        assert before <= after  # every upstream tool still there
+        assert {"edit_context", "section_screenshot", "section_profile", "read_sketches", "set_dimensions",   # 1.10.0
+                "add_sketch3d", "sweep_cut", "sweep_boss", "find_faces", "find_edges", "fully_define_sketch",
+                "add_dimension", "sketch_fillet", "derive_part", "list_external_refs", "update_external_refs",
+                "dialog_list", "dialog_respond", "sw_instances", "api_search"} <= new
+        assert before <= after  # every upstream tool still there (screenshot and add_sketch replaced under their names)
+        tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
+        assert {"datum_x", "datum_y"} <= set(tools["add_sketch"].inputSchema["properties"])
+        assert {"mode", "document", "bodies"} <= set(tools["screenshot"].inputSchema["properties"])
+        assert {"bodies", "expect"} <= set(tools["cut_sketch"].inputSchema["properties"])
+        assert "rollback_on_error" in tools["run_script"].inputSchema["properties"]
+        assert "dialog_list" not in guard.READ_ONLY and "list_external_refs" in guard.READ_ONLY
     finally:
         # register() patches SolidWorksSession itself: undo, or the journal-wrapped
         # run_guarded leaks into the upstream tests (and writes a real journal).
@@ -338,7 +368,10 @@ def test_register_adds_tools_without_touching_upstream(swmcp_home):
         guard.unapply()
         speed.unapply()
         fastpath.unapply()
-        for name in ("new_part", "new_assembly", "add_shell", "export"):  # each carries its original
+        context.unapply()
+        query.uninstall()
+        instance.unapply()
+        for name in ("new_part", "new_assembly", "add_shell", "export", "screenshot", "set_equations"):  # each carries its original
             fn = getattr(SolidWorksSession, name)
             if hasattr(fn, "__wrapped__"):
                 setattr(SolidWorksSession, name, fn.__wrapped__)

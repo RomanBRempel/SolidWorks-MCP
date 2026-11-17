@@ -316,12 +316,21 @@ def convert_entities(session, sketch: str | None = None, on: str | None = None, 
     if face is not None:
         entities = _outer_loop_edges(session, face)
     else:
-        body = session._solid_body()
-        all_edges = [binding.wrap(e, session._mod.IEdge) for e in (body.GetEdges() or ())]
-        try:
-            entities = [all_edges[int(str(i).lstrip("#"))] for i in edges]
-        except (ValueError, IndexError):
-            raise SolidWorksError(f"edges must be list_edges indices 0..{len(all_edges) - 1}.") from None
+        from . import query
+        items = [edges] if isinstance(edges, (str, int)) else list(edges)
+        all_edges = None
+        entities = []
+        for item in items:
+            if query.is_ref(item):  # find_edges' reference: an edge of any body
+                entities.append(query.entity(session, item, "edge"))
+                continue
+            if all_edges is None:
+                all_edges = [binding.wrap(e, session._mod.IEdge) for e in (session._solid_body().GetEdges() or ())]
+            try:
+                entities.append(all_edges[int(str(item).lstrip("#"))])
+            except (ValueError, IndexError):
+                raise SolidWorksError(f"edges are list_edges indices 0..{len(all_edges) - 1} or 'ref:...' "
+                                      f"references from find_edges (got {item!r}).") from None
     sk, open_sketch, feature = _open_sketch_on(session, on) if on is not None else _edit_sketch(session, sketch)
     try:
         made = _convert(session, open_sketch, sk, entities, construction)
@@ -454,8 +463,28 @@ def _midline_centre(session, sketch, sk, profile, station_axis: str, station_mm:
 # --- B2: circles and rectangles -----------------------------------------------------
 
 
+def _place(session, sketch, point, role: str, horizontal: bool, coord: float, through: float, datum):
+    """Fix one coordinate of a sketch point: from the datum when one is given (S-08), else
+    from the origin - a dimension named `role`, or a relation when the point lies on the
+    datum / on the origin's line. Returns the dimension's full name, or None."""
+    if datum is not None:
+        from . import sketch_datum
+        return sketch_datum.position_dimension(session, sketch, point, datum, role, horizontal)
+    if abs(coord - through) <= 1e-9:
+        _relate(session, sketch, "vertical_points" if horizontal else "horizontal_points",
+                point, session._origin_point())
+        return None
+    return _dimension_point(session, point, role, horizontal)
+
+
+def _datums(session, sketch, datum_x, datum_y) -> dict:
+    from . import sketch_datum
+    return {"x": sketch_datum.resolve_datum(session, sketch, datum_x, "x"),
+            "y": sketch_datum.resolve_datum(session, sketch, datum_y, "y")}
+
+
 def sketch_circles(session, on: str, circles: list, name: str | None = None,
-                   profile_face: str | None = None) -> dict:
+                   profile_face: str | None = None, datum_x=None, datum_y=None) -> dict:
     """A fully defined sketch of circles on a plane or face, each dimension
     optionally driven by a variable.
 
@@ -467,6 +496,8 @@ def sketch_circles(session, on: str, circles: list, name: str | None = None,
     its midpoint. vars keys: 'diameter', 'station', 'x' / 'y' (sketch axes) or
     'X' / 'Y' / 'Z' (the model axis a position dimension runs along). Position
     links are wrapped in abs(): a dimension from the origin is a distance.
+    datum_x / datum_y: the model edge, planar face or vertex the x / y positions
+    are measured from instead of the origin (see sketch_datum.resolve_datum).
     """
     if not circles:
         raise SolidWorksError("circles is empty.")
@@ -476,6 +507,7 @@ def sketch_circles(session, on: str, circles: list, name: str | None = None,
         origin, u_dir, v_dir = _sketch_axes(session, sketch)
         roles_axis = axis_role(u_dir, v_dir)
         o_u, o_v, _ = session._sketch_coords(sketch, 0.0, 0.0, 0.0)  # the model origin, projected (m)
+        datums = _datums(session, sketch, datum_x, datum_y)
         for k, spec in enumerate(circles):
             d_mm = float(spec.get("diameter_mm") or 0)
             if d_mm <= 0:
@@ -505,11 +537,10 @@ def sketch_circles(session, on: str, circles: list, name: str | None = None,
                 centre = binding.wrap(binding.wrap(circle, session._mod.ISketchArc).GetCenterPoint2(),
                                       session._mod.ISketchPoint)
                 for axis_name, horizontal, coord, through in (("x", True, u, o_u), ("y", False, v, o_v)):
-                    if abs(coord - through) <= 1e-9:
-                        _relate(session, sketch, "vertical_points" if horizontal else "horizontal_points",
-                                centre, session._origin_point())
-                        continue
-                    roles[axis_name] = _dimension_point(session, centre, f"{axis_name}{suffix}", horizontal)
+                    made = _place(session, sketch, centre, f"{axis_name}{suffix}", horizontal, coord, through,
+                                  datums[axis_name])
+                    if made is not None:
+                        roles[axis_name] = made
             roles["diameter"] = _dimension_diameter(session, circle, f"diameter{suffix}")
             for key, expr in variables.items():
                 target = key
@@ -539,11 +570,12 @@ def sketch_circles(session, on: str, circles: list, name: str | None = None,
 
 
 def sketch_rect(session, on: str, corner_mm: list, width_mm: float, height_mm: float,
-                name: str | None = None, vars: dict | None = None) -> dict:
+                name: str | None = None, vars: dict | None = None, datum_x=None, datum_y=None) -> dict:
     """A fully defined rectangle on a plane or face: corner_mm (model space) is
     one corner, width along the sketch x, height along the sketch y (negative:
     the other way). Dimensions: width, height, x and y of the corner from the
-    origin. vars links them ('width': 'SLOT_W', 'X': 'SLOT_X', ...)."""
+    origin - or from datum_x / datum_y, a model edge, planar face or vertex
+    (see sketch_datum.resolve_datum). vars links them ('width': 'SLOT_W', 'X': 'SLOT_X', ...)."""
     if not width_mm or not height_mm:
         raise SolidWorksError("width_mm and height_mm must not be 0.")
     sk, sketch, feature = _open_sketch_on(session, on)
@@ -555,6 +587,7 @@ def sketch_rect(session, on: str, corner_mm: list, width_mm: float, height_mm: f
         u, v, off = _uv(session, sketch, corner_mm)
         if abs(off) > 0.05:
             raise SolidWorksError(f"corner_mm is {off:.3f} mm off the sketch plane.")
+        datums = _datums(session, sketch, datum_x, datum_y)
         w, h = mm_to_m(width_mm), mm_to_m(height_mm)
         sk.AddToDB = True
         try:
@@ -589,11 +622,9 @@ def sketch_rect(session, on: str, corner_mm: list, width_mm: float, height_mm: f
                 raise SolidWorksError(f"SolidWorks refused the {role} dimension.")
             roles[role] = _named(session, display, role)
         for axis_name, horizontal, coord, through in (("x", True, u, o_u), ("y", False, v, o_v)):
-            if abs(coord - through) <= 1e-9:
-                _relate(session, sketch, "vertical_points" if horizontal else "horizontal_points",
-                        corner, session._origin_point())
-            else:
-                roles[axis_name] = _dimension_point(session, corner, axis_name, horizontal)
+            made = _place(session, sketch, corner, axis_name, horizontal, coord, through, datums[axis_name])
+            if made is not None:
+                roles[axis_name] = made
         for key, expr in (vars or {}).items():
             target = key
             if key in ("X", "Y", "Z"):
