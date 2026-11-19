@@ -1,0 +1,132 @@
+"""insert_component without a window per inserted file (the cause of the crashes of 2026-11-18/19).
+
+AddComponent5 gives None for a document that is not loaded, so upstream opens
+each component's file first - the ordinary way, which gives every inserted
+file a document WINDOW that nothing closes again. Measured on SolidWorks 2025
+SP3 (2026-11-19):
+
+    a document window                     about 250 GDI objects of SLDWORKS.exe
+    the same file loaded without a window 0
+    a file opened into a window and closed 37-45 objects never returned
+    upstream insert_component, new file   +251, and +45 for good after closing all
+
+Windows gives one process 10 000 GDI objects and SolidWorks starts with 2 000:
+thirty-odd document windows fill it. Then SolidWorks cannot create a device
+context - its journal fills with 'the requested resource is unavailable'
+message boxes, AddComponent5 fails with error 61704 ('internal application
+error'), and it dies in its own drawing code (mfc140u <- uiBaseView_c::setupDC
+<- uiModelView_c::OnMouseMove). Windows logs that as a GDIObjectLeak report
+(Application log, Windows Error Reporting, event 1001), not as an Application
+Error 1000.
+
+Here the file is loaded with ISldWorks.DocumentVisible(False, type): no
+window, no GDI object, the assembly stays the active document, and SolidWorks
+unloads the file together with the assembly. 16 inserts cost 0 GDI objects
+and left 0 behind (against +2005 and +365).
+"""
+
+import functools
+import os
+
+import pythoncom
+
+from .. import binding
+from ..constants import (SW_ADD_COMPONENT_CURRENT_CONFIG, SW_DOC_ASSEMBLY, SW_DOC_PART,
+                         SW_DONT_REBUILD_ACTIVE_DOC, SW_OPEN_DOC_SILENT)
+from ..errors import SolidWorksError
+from ..session import SolidWorksSession
+
+_ORIGINAL = {}
+
+
+def com_text(exc) -> str:
+    """SolidWorks' own words for a COM error: its description and code, else the system's; pure."""
+    info = getattr(exc, "excepinfo", None)
+    if info and len(info) > 2 and info[2]:
+        text = str(info[2]).strip()
+        return f"{text} (code {info[0]})" if info[0] else text
+    return str(getattr(exc, "strerror", None) or exc)
+
+
+def load_hidden(session, abs_path: str, doc_type: int) -> bool:
+    """Load a document without a window, unless it is open already; True when it was loaded here.
+
+    DocumentVisible is a setting of the whole SolidWorks session: it is put
+    back in `finally`, or the user's next File > Open would show nothing."""
+    sw = session._sw
+    if sw.GetOpenDocumentByName(abs_path) is not None:
+        return False
+    title = session._model.GetTitle() if session._model is not None else None
+    sw.DocumentVisible(False, doc_type)
+    try:
+        result = sw.OpenDoc6(abs_path, doc_type, SW_OPEN_DOC_SILENT, "", 0, 0)
+    finally:
+        sw.DocumentVisible(True, doc_type)
+    doc, errors = (result[0], result[1]) if isinstance(result, tuple) else (result, 0)
+    if doc is None:
+        raise SolidWorksError(f"SolidWorks could not load '{abs_path}' (swFileLoadError_e {errors}); "
+                              "nothing was inserted.")
+    if title is not None:
+        active = binding.wrap(sw.ActiveDoc, session._mod.IModelDoc2)
+        if active is None or active.GetTitle() != title:
+            sw.ActivateDoc3(title, False, SW_DONT_REBUILD_ACTIVE_DOC, 0)
+    return True
+
+
+def insert_component(self, path: str, x_mm: float = 0.0, y_mm: float = 0.0,
+                     z_mm: float = 0.0, fixed: bool | None = None) -> dict:
+    """Upstream's insert_component with the component's file loaded invisibly.
+
+    Besides that: a refusal of AddComponent5 (a COM error that is not a lost
+    link, such as 61704) comes back as an error that names it, with the
+    assembly as it was; and the assembly is rebuilt after the transform is
+    written, so the tree and the graphics show the component where it is."""
+    abs_path = os.path.abspath(path)
+    doc_type = {".sldprt": SW_DOC_PART, ".sldasm": SW_DOC_ASSEMBLY}.get(os.path.splitext(abs_path)[1].lower())
+    if doc_type is None:
+        raise SolidWorksError(f"insert_component takes a .sldprt or a .sldasm (got '{path}').")
+    asm = self._require_assembly()
+    if not os.path.isfile(abs_path):
+        raise SolidWorksError(f"Part not found: {abs_path}")
+    if fixed is None:
+        fixed = not self._component_dispatches(asm)
+
+    load_hidden(self, abs_path, doc_type)
+    try:
+        raw = asm.AddComponent5(abs_path, SW_ADD_COMPONENT_CURRENT_CONFIG, "", False, "", 0.0, 0.0, 0.0)
+    except pythoncom.com_error as exc:
+        if exc.hresult in self._GONE_HRESULTS:
+            raise  # the link itself: run_guarded tells a crash from a closed document
+        raise SolidWorksError(
+            f"SolidWorks refused to insert '{abs_path}': {com_text(exc)}. The assembly is as it was. "
+            "server_health shows whether SolidWorks is short of window resources (sldworks_gui: GDI objects) "
+            "or memory; if it is, save, close document windows and restart SolidWorks before inserting more."
+        ) from exc
+    comp = binding.wrap(raw, self._mod.IComponent2)
+    if comp is None:
+        raise SolidWorksError(
+            f"AddComponent5 returned None for '{abs_path}'. Is it a valid SolidWorks part, and could "
+            "SolidWorks load it?")
+    self._apply_transform(comp, x_mm, y_mm, z_mm, 0.0, 0.0, 0.0)
+    if fixed:
+        self._fix_component(asm, comp)
+    try:
+        self._model.EditRebuild3()
+    except pythoncom.com_error as exc:
+        if exc.hresult in self._GONE_HRESULTS:
+            raise
+    return {"ok": True, "component": self._component_entry(comp)}
+
+
+def apply() -> None:
+    if not _ORIGINAL:
+        _ORIGINAL["insert_component"] = SolidWorksSession.insert_component
+        functools.update_wrapper(insert_component, _ORIGINAL["insert_component"])  # keeps doc and __wrapped__
+        SolidWorksSession.insert_component = insert_component
+
+
+def unapply() -> None:
+    """Restore upstream's insert_component (test teardown)."""
+    if _ORIGINAL:
+        SolidWorksSession.insert_component = _ORIGINAL["insert_component"]
+        _ORIGINAL.clear()

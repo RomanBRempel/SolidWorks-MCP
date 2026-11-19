@@ -171,7 +171,8 @@ def record(tool: str, args: dict, result=None) -> None:
     if isinstance(result, dict):
         if not ok:
             entry["error"] = str(result.get("error", ""))[:2000]
-        entry["result"] = _clip({k: v for k, v in result.items() if k in ("closed", "pressed", "dialog", "method")})
+        entry["result"] = _clip({k: v for k, v in result.items()
+                                 if k in ("closed", "pressed", "dialog", "method", "dialogs")})
     try:
         write(entry)
     except Exception:  # noqa: BLE001 - a full disk must not fail the call

@@ -310,6 +310,103 @@ def drawn_text(pane_hwnd: int) -> str:
                 pass
 
 
+UIA_TEXT_TYPES = {50020, 50004, 50030}   # Text, Edit, Document
+UIA_TIMEOUT_S = 2.0
+UIA_LIMIT = 120                          # elements looked at under one window
+_CLSID_UIA = "{FF48DBA4-60EF-4201-AA87-54103EEF594E}"
+_IID_UIA = "{30CBE57D-D9D0-452A-AB13-7AC5AC4825EE}"
+
+
+def _uia_read(hwnd: int, out: list) -> None:
+    """Collect the names of the text elements UI Automation shows under `hwnd` into `out`.
+
+    Raw vtable calls (pywin32 has no UI Automation client, comtypes is not a
+    dependency): IUIAutomation.ElementFromHandle, .CreateTrueCondition,
+    IUIAutomationElement.FindAll(descendants), then each element's control type
+    and name. Own thread, own apartment."""
+    import pythoncom
+    pythoncom.CoInitialize()
+    held = []
+
+    def method(pointer, index, *argtypes):
+        table = ctypes.cast(pointer, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        return ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(table[index])
+
+    def release(pointer):
+        if pointer:
+            method(pointer, 2)(pointer)
+
+    try:
+        clsid = (ctypes.c_byte * 16).from_buffer_copy(bytes(pythoncom.MakeIID(_CLSID_UIA)))
+        iid = (ctypes.c_byte * 16).from_buffer_copy(bytes(pythoncom.MakeIID(_IID_UIA)))
+        uia = ctypes.c_void_p()
+        ctypes.oledll.ole32.CoCreateInstance(ctypes.byref(clsid), None, 1, ctypes.byref(iid), ctypes.byref(uia))
+        held.append(uia)
+        root, always, found = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+        if method(uia, 6, wt.HWND, ctypes.POINTER(ctypes.c_void_p))(uia, wt.HWND(int(hwnd)), ctypes.byref(root)) \
+                or not root:
+            return
+        held.append(root)
+        method(uia, 21, ctypes.POINTER(ctypes.c_void_p))(uia, ctypes.byref(always))
+        held.append(always)
+        if method(root, 6, ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))(
+                root, 4, always, ctypes.byref(found)) or not found:   # TreeScope_Descendants
+            return
+        held.append(found)
+        count = ctypes.c_int(0)
+        method(found, 3, ctypes.POINTER(ctypes.c_int))(found, ctypes.byref(count))
+        for index in range(min(count.value, UIA_LIMIT)):
+            element = ctypes.c_void_p()
+            if method(found, 4, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))(found, index, ctypes.byref(element)) \
+                    or not element:
+                continue
+            try:
+                kind = ctypes.c_int(0)
+                method(element, 21, ctypes.POINTER(ctypes.c_int))(element, ctypes.byref(kind))
+                if kind.value not in UIA_TEXT_TYPES:
+                    continue
+                name = ctypes.c_void_p()
+                method(element, 23, ctypes.POINTER(ctypes.c_void_p))(element, ctypes.byref(name))
+                if name.value:
+                    text = ctypes.wstring_at(name.value).strip()
+                    ctypes.windll.oleaut32.SysFreeString(name)
+                    if text and text not in out:
+                        out.append(text)
+            finally:
+                release(element)
+    except Exception:  # noqa: BLE001 - best effort, like every other way of reading the text
+        pass
+    finally:
+        for pointer in reversed(held):
+            try:
+                release(pointer)
+            except Exception:  # noqa: BLE001
+                pass
+        pythoncom.CoUninitialize()
+
+
+def uia_text(hwnd: int, timeout_s: float = UIA_TIMEOUT_S) -> str:
+    """The text of a window as UI Automation exposes it; "" when it cannot be read in time.
+
+    The second way into a drawn dialog (a TaskDialog, a WPF window). MSAA's
+    IAccessible is an ordinary COM object of SolidWorks' UI thread, and a call
+    into that thread is turned away while it is busy inside the call that
+    raised the dialog; UI Automation talks to the window over its own channel.
+    It runs on a helper thread and is given up on after timeout_s, so a window
+    that answers nothing costs the caller no more than that."""
+    if os.name != "nt":
+        return ""
+    import threading
+    lines: list = []
+    worker = threading.Thread(target=_uia_read, args=(int(hwnd), lines), daemon=True, name="swmcp-uia")
+    try:
+        worker.start()
+        worker.join(timeout_s)
+    except Exception:  # noqa: BLE001
+        return ""
+    return "" if worker.is_alive() else "\n".join(lines)
+
+
 def describe(hwnd: int) -> dict:
     """Title, message text, buttons, check boxes and edit fields of one dialog window.
 
@@ -375,8 +472,18 @@ def describe(hwnd: int) -> dict:
                 b["id"] = known.get(b["text"].casefold(), 0)
         if not out["text"] and pane is not None and not reader.hung:
             out["text"] = drawn_text(pane)
-        if not out["text"]:
-            out["text_unreadable"] = True
+            if out["text"]:
+                out["text_source"] = "msaa"
+    if not out["text"] and not reader.hung and (drawn or not out["edits"]):
+        # nothing a control holds and nothing MSAA gave (its calls are turned away while
+        # SolidWorks is busy inside the call that raised the dialog): UI Automation
+        captions = {b["text"] for b in out["buttons"]} | {c["text"] for c in out["checkboxes"]} | {out["title"]}
+        lines = [line for line in uia_text(hwnd).split("\n") if line and line not in captions]
+        if lines:
+            out["text"] = "\n".join(lines)
+            out["text_source"] = "uia"
+    if drawn and not out["text"]:
+        out["text_unreadable"] = True
     if reader.hung:
         out["hung"] = True  # the window stopped answering: texts are what the window structure holds
     return out

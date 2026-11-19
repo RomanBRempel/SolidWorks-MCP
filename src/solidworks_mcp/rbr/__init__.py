@@ -13,16 +13,17 @@ import functools
 import os
 
 from ..errors import SolidWorksError
-from . import (apiref, batch, bodies as bodies_mod, cavity, context, derive, dialogs, equations, export_check,
+from . import (apiref, assembly, batch, bodies as bodies_mod, cavity, context, derive, dialogs, equations,
+               export_check,
                fastpath,
                features,
                flow, geom, guard, health, image, instance, jobs, journal, library, offset_loop, param, query,
                render, scope,
-               script_tool, section, sketch_datum, solidcam, speed, sweep, tools)
+               script_tool, section, sketch_datum, solidcam, speed, sweep, tools, tree)
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.10.0"
+RBR_VERSION = "1.11.0"
 
 INSTRUCTIONS = """
 
@@ -54,6 +55,9 @@ RBR extension (solidworks-mcp-rbr)
 - run_script(rollback_on_error=False) keeps what the script finished before an error (`kept`); the default removes exactly what the script created (by feature ID - a renamed feature stays) and restores changed equations.
 - Derived parts: derive_part(body, path) gives a body its own part file that follows the master; list_external_refs shows what a part takes from other files and whether each link is alive; update_external_refs loads the sources, rebuilds and reports each body's volume before / after.
 - A call that answers DIALOG_BLOCKING ran into a modal SolidWorks dialog: the reply holds its text and buttons. dialog_respond(button) presses one ('yes' / 'no' / 'ok' / 'cancel' or the caption); the interrupted call is NOT cancelled and goes on then - never send it again. dialog_list shows the open dialogs at any time. Read the text before answering; when it asks about the user's data (save changes?), ask the user.
+- Assemblies: insert_component loads the part without a window of its own (a document window costs SolidWorks about 250 of its 10 000 GDI objects; at the limit it fails with 'resource unavailable', error 61704, and crashes). server_health.sldworks_gui shows the count; new_part / open_part / new_assembly / open_assembly are refused when no window fits any more; close_hidden_documents(windows=True) closes saved document windows. tree_folder(name, components) puts components into a FeatureManager folder and verifies it (raw InsertFeatureTreeFolder2(1) makes an empty folder; ReorderComponents with where 1 or 2 puts them next to the folder).
+- In run_script, model / active / part / asm / ext / fm / selmgr always mean the document that is current NOW: after closing, reloading or opening documents in the script they follow. Objects the script itself keeps (md = swApp.ActiveDoc) die with their document - fetch them again. swApp.CloseAllDocuments is refused while documents with unsaved changes that this server did not make, or documents of another server process, are open.
+- An error or a `solidworks_lost` note saying SolidWorks crashed or was closed names the last call before it and what SolidWorks' journal recorded; tell the user, nothing unsaved survived.
 - api_search(query) finds a method, property or constant of the installed SolidWorks API with its parameters - use it before a run_script call you are not sure of. sw_instances lists the running SolidWorks processes and the one this server drives; only one SolidWorks may run on a machine - never start a second one.
 - SolidCAM (in the same SolidWorks; never start another SolidWorks or SolidCAM): solidcam_status -> solidcam_new_part(path, machine) (makes the zero SolidCAM_Zero on the top face at the bottom-left corner, then SolidCAM's Part Data panel waits for the user to pick it) or solidcam_open(path) -> solidcam_stock -> solidcam_add_operation(template, geometry) -> solidcam_calculate -> solidcam_gcode (says whether the program cuts) -> solidcam_save / solidcam_close. The API cannot define job geometry (chains, faces): a template job on the target alone posts no moves.
 """
@@ -265,6 +269,7 @@ def register(server) -> None:
     guard.apply()    # before the journal, so the journal times the guard too
     journal.apply()
     context.apply()
+    assembly.apply()   # insert_component loads the component's file without a window
     _patch_new_documents()
     _patch_shell_check_result()
     _patch_screenshot()
@@ -282,14 +287,26 @@ def register(server) -> None:
     upstream_call = call
     detached = set()   # calls answered with DIALOG_BLOCKING that still wait on the COM thread
 
+    def _dialog_pids():
+        """The instance this server drives, not another one's dialogs - while that process
+        lives: after a crash and a restart the remembered pid is a dead one until the next
+        call attaches, and its dialogs would be looked for in vain."""
+        pid = guard.state().get("sw_pid")
+        return [pid] if pid and health.process_alive(pid) else None
+
+    def _journal_dialogs(tool: str, args: dict, found: list, reply: dict | None = None) -> None:
+        """What a dialog said goes into the journal: after a crash it is the only witness."""
+        shown = [dialogs.public(d) for d in found]
+        journal.record(tool, args, {"ok": reply.get("ok", True) if reply else True,
+                                    "error": (reply or {}).get("error", ""), "dialogs": shown})
+
     async def _blocking_dialogs() -> list:
         """The modal dialogs SolidWorks waits behind, read off the event loop (pure Win32)."""
         if DIALOG_WATCH_S <= 0:
             return []
-        pid = guard.state().get("sw_pid")   # the instance this server drives, not another one's dialogs
         try:
             found = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: dialogs.blocking(pids=[pid] if pid else None))
+                None, lambda: dialogs.blocking(pids=_dialog_pids()))
         except Exception:  # noqa: BLE001 - the watch never breaks a call
             return []
         return dialogs.questions(found)
@@ -315,7 +332,9 @@ def register(server) -> None:
             if seen >= 2 and not task.done():
                 detached.add(task)
                 task.add_done_callback(detached.discard)
-                return dialogs.blocking_reply(found, tool, asyncio.get_running_loop().time() - started)
+                reply = dialogs.blocking_reply(found, tool, asyncio.get_running_loop().time() - started)
+                _journal_dialogs("dialog_blocking", {"waiting": tool}, found, reply)
+                return reply
 
     def _tool_of(fn) -> str:
         return journal.tool_name(fn)
@@ -583,18 +602,24 @@ def register(server) -> None:
         """What the server is doing now, answered without waiting for SolidWorks: the running call
         and its age, queued calls, who holds the cross-process lock at this moment (null when
         nothing runs), the documents owned by LIVE server processes (records of processes that
-        exited are dropped), the last faults and errors; plus SLDWORKS.exe memory and (when the
-        COM thread is free) the open document count, with a warning past 30 documents - and how
-        many of them close_hidden_documents would close - or 70% of RAM. Use it when a call is
-        slow or SolidWorks seems stuck."""
+        exited are dropped), the last faults and errors; plus SLDWORKS.exe memory, its window
+        resources (sldworks_gui: GDI objects against the 10 000 a process may hold - each
+        document window takes about 250, and at the limit SolidWorks fails with 'resource
+        unavailable' and crashes) and (when the COM thread is free) the open document count,
+        with a warning past 30 documents - and how many of them close_hidden_documents would
+        close - past 70% of the GDI quota, or 70% of RAM. server.sw_running false means the
+        SolidWorks this server drove is gone (server.last_call: the last call before that).
+        Use it when a call is slow or SolidWorks seems stuck."""
         def build():
             st = guard.state()
+            st["sw_running"] = health.process_alive(st.get("sw_pid")) if st.get("sw_pid") else None
             last = journal.read(last_n=5, errors_only=True, entries=True)
             return {"ok": True, "version": RBR_VERSION, "server": st,
                     "queued": worker._queue.qsize() if worker is not None else 0,
                     "lock_holder": guard._lock.held_by(), "owners": guard.prune_owners(),
                     "edit_context": context.seen(),
                     "sldworks_memory": health.sldworks_memory(),
+                    "sldworks_gui": health.sldworks_gui(st.get("sw_pid") if st["sw_running"] else None),
                     "recent_errors": [{k: e.get(k) for k in ("ts", "pid", "tool", "doc", "error")}
                                       for e in last.get("entries", [])]}
         report = _local(build)
@@ -616,7 +641,9 @@ def register(server) -> None:
                 report["close_hidden_documents_would_close"] = closable
             except Exception:  # noqa: BLE001 - health never hangs on SolidWorks
                 closable = None
-        warn = health.warnings_for(documents, report.get("sldworks_memory"), closable)
+        warn = health.warnings_for(documents, report.get("sldworks_memory"), closable, report.get("sldworks_gui"))
+        if report["server"].get("sw_running") is False:
+            warn.insert(0, guard._lost_text(report["server"].get("sw_pid")))
         if warn:
             report["warnings"] = warn
         return report
@@ -632,14 +659,33 @@ def register(server) -> None:
         return _local(instance.instances, guard.state().get("sw_pid"))
 
     @mcp.tool()
-    async def close_hidden_documents(keep: list | None = None, dry_run: bool = False) -> dict:
+    async def close_hidden_documents(keep: list | None = None, dry_run: bool = False,
+                                     windows: bool = False) -> dict:
         """Close every open document that is invisible, saved and not owned by another live
         server process. Assemblies silently open their parts; past a few dozen documents every
         call crawls (server_health warns and says how many would close). keep lists titles to
         spare; the active document, the current model, visible and unsaved documents always
         stay. dry_run=True only lists what would be closed (would_close) and why the rest
-        stays."""
-        return await _timed(health.close_hidden_documents, session, keep, dry_run, timeout_s=120)
+        stays. windows=True also closes saved documents that have a window of their own (each
+        window holds about 250 of SolidWorks' 10 000 GDI objects; a part an open assembly uses
+        stays loaded, only its window goes) - use it when server_health warns about GDI objects."""
+        return await _timed(health.close_hidden_documents, session, keep, dry_run, windows, timeout_s=120)
+
+    @mcp.tool()
+    async def tree_folder(name: str, components: list[str]) -> dict:
+        """Put components of the current assembly into a FeatureManager folder: creates the folder
+        `name` holding them, or adds them at the end of an existing folder of that name.
+
+        components: top-level component names as list_components gives them ('Bolt-1'; a part
+        name alone while it is unambiguous). The result is read back from the folder and from
+        the tree control: {folder, created, count, components (everything the folder holds now),
+        added}. ok false when a named component did not end up inside - a folder the call had
+        just made and could not fill is removed again. Raw API from a script misleads here:
+        InsertFeatureTreeFolder2(1) makes an EMPTY folder, ReorderComponents(.., folder, 1 or 2)
+        puts components NEXT to the folder and still answers True, MoveToFolder is for features.
+        In run_script the same call is tree_folder(name, components); tree_folders() lists the
+        folders and what they hold."""
+        return await _timed(tree.tree_folder, session, name, components, timeout_s=120)
 
     @mcp.tool()
     async def sync_equation_file(path: str | None = None) -> dict:
@@ -1370,13 +1416,16 @@ def register(server) -> None:
     async def dialog_list() -> dict:
         """The dialogs SolidWorks shows right now, read without SolidWorks' help (so it answers
         while every other tool waits): title, message text, buttons, check boxes, and whether
-        the dialog is modal - blocking SolidWorks until it is answered. A call that runs into a
+        the dialog is modal - blocking SolidWorks until it is answered. The text of SolidWorks' own
+        message boxes is drawn, not held by a control: it is read through MSAA, else through UI
+        Automation (text_source says which); what was found is written to the journal. A call that runs into a
         modal dialog answers DIALOG_BLOCKING after a few seconds with the same description; it
         is not cancelled and goes on when the dialog is answered. A progress window is marked
         progress and is not a question."""
         def build():
-            pid = guard.state().get("sw_pid")
-            found = dialogs.find(pids=[pid] if pid else None)
+            found = dialogs.find(pids=_dialog_pids())
+            if found:
+                _journal_dialogs("dialog_list", {}, found)
             return {"ok": True, "count": len(found), "blocking": len(dialogs.questions(found)),
                     "dialogs": [dialogs.public(d) for d in found], "server": guard.state()}
         return _local(build)
@@ -1392,8 +1441,7 @@ def register(server) -> None:
         changes?" discards them - read the text first, and ask the user when it is their
         data."""
         def press():
-            pid = guard.state().get("sw_pid")
-            result = dialogs.respond(button, hwnd=hwnd, title=title, pids=[pid] if pid else None)
+            result = dialogs.respond(button, hwnd=hwnd, title=title, pids=_dialog_pids())
             journal.record("dialog_respond", {"button": button, "hwnd": hwnd, "title": title}, result)
             return result
         return _local(press)

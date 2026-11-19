@@ -5,6 +5,50 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Fixed (rbr 1.11.0) - SolidWorks running out of GDI objects and crashing
+Not yet verified on a live SolidWorks as a whole: `scripts/live_crash_scenario.py`
+is the check (the offline tests pass).
+- Cause of the crashes of 2026-11-18/19: insert_component opened every inserted
+  file in a document window of its own and nothing closed them. A window costs
+  SLDWORKS.exe about 250 GDI objects (measured on SW 2025 SP3; a file loaded
+  without a window costs 0, a file opened into a window and closed leaves 37-45
+  behind), Windows allows a process 10 000 and SolidWorks starts with 2 000.
+  At the limit: 'the requested resource is unavailable' message boxes,
+  AddComponent5 failing with 61704, then a crash in mfc140u <-
+  uiBaseView_c::setupDC. Windows logs it as a GDIObjectLeak report (Windows
+  Error Reporting, event 1001), not as Application Error 1000.
+- insert_component loads the component's file with DocumentVisible(False): no
+  window, 0 GDI objects, the assembly stays active; a refusal of AddComponent5
+  is an error naming it, not a fault; the assembly is rebuilt after the
+  transform.
+- server_health reports sldworks_gui (GDI objects against the quota) and warns
+  past 70%; new_part / open_part / new_assembly / open_assembly are refused past
+  92%; heavy calls carry the document-count and GDI warnings;
+  close_hidden_documents(windows=True) closes saved document windows too.
+- run_script: model / active / part / asm / ext / fm / selmgr are looked up when
+  read, so they follow the script through closing, reloading and opening
+  documents (they were a snapshot: after CloseAllDocuments the helpers died with
+  RPC_E_DISCONNECTED). A stale object of the script's own is explained as such
+  and is no longer counted as a SolidWorks fault. A script that calls
+  CloseAllDocuments is refused before it runs while documents with unsaved
+  changes this server did not make, or documents of another server process, are
+  open.
+- New tool tree_folder(name, components) (and tree_folder / tree_folders in
+  scripts): fills a FeatureManager folder the way that works -
+  InsertFeatureTreeFolder2(2) with the components selected, ReorderComponents
+  with where 3 for an existing folder - and reads the result back from the
+  folder and the tree control. (InsertFeatureTreeFolder2(1) makes an empty
+  folder; ReorderComponents with where 1 or 2 answers True and leaves the
+  components next to the folder; MoveToFolder is for features.)
+- A SolidWorks that is gone is reported as such: the error names the process,
+  the last call before it and what SolidWorks' own journal recorded (crash
+  stack, resource messages) instead of 'operation unavailable'; after a restart
+  the next reply carries `solidworks_lost` once.
+- Dialogs: the text of a drawn dialog is read through UI Automation when MSAA
+  gives nothing; dialog_list and DIALOG_BLOCKING replies are written to the
+  journal; dialogs are looked for in the running SolidWorks when the remembered
+  process is dead.
+
 ### Added (rbr 1.10.0)
 - Working mid-tree: edit_context(freeze_to, rollback_before, end) puts the
   freeze bar and the rollback bar round the features being edited (a
