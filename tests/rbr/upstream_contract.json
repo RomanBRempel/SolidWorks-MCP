@@ -64,5 +64,13 @@
   "insert_component": "24ddfacd8d66",
   "activate_document": "d6f4289e1d94",
   "_open_documents": "cbee0c86b3b8",
-  "_failing_features": "81b47526cb77"
+  "_failing_features": "81b47526cb77",
+  "open_part": "f32f91f9f6fb",
+  "open_assembly": "1dd2cca8b9ca",
+  "_explain_lost_link": "24142973f491",
+  "_GONE_HRESULTS": "8a03566f82b3",
+  "_component_dispatches": "fbaacec1b656",
+  "_apply_transform": "81a49ae52a23",
+  "_fix_component": "f5d3a1afcf2c",
+  "_component_entry": "818e7c854928"
 }

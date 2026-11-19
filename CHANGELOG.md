@@ -6,8 +6,14 @@ All notable changes to this project are documented here. This project follows
 ## [Unreleased]
 
 ### Fixed (rbr 1.11.0) - SolidWorks running out of GDI objects and crashing
-Not yet verified on a live SolidWorks as a whole: `scripts/live_crash_scenario.py`
-is the check (the offline tests pass).
+Verified on a live SolidWorks 2025 SP3 with `scripts/live_crash_scenario.py` (a
+cube, two assemblies of 70 components, 6 tree folders each, ReorderComponents,
+CloseAllDocuments inside a script: one document window, +222..288 GDI objects
+for 70 inserts, the same SolidWorks process at the end) and
+`scripts/live_crash_extras.py` (the GDI refusal with the limit lowered,
+document windows, tree_folder on an existing folder, a message box raised
+inside a COM call). Not verifiable without crashing SolidWorks: the 'SolidWorks
+crashed' report (fakes only).
 - Cause of the crashes of 2026-11-18/19: insert_component opened every inserted
   file in a document window of its own and nothing closed them. A window costs
   SLDWORKS.exe about 250 GDI objects (measured on SW 2025 SP3; a file loaded
@@ -39,7 +45,23 @@ is the check (the offline tests pass).
   with where 3 for an existing folder - and reads the result back from the
   folder and the tree control. (InsertFeatureTreeFolder2(1) makes an empty
   folder; ReorderComponents with where 1 or 2 answers True and leaves the
-  components next to the folder; MoveToFolder is for features.)
+  components next to the folder; MoveToFolder is for features.) Found by the
+  live run: the tree control writes a status mark before the name ('(f) Folder
+  1'), so the folder was looked for by its bare text, never found, and the
+  tree check skipped in silence - the item is now matched by the feature
+  behind it; and the components are resolved from one listing of the assembly
+  instead of one per name (ten of 70 components: 4.7 s -> 1.7 s).
+- Reading a dialog no longer takes COM away from the thread that reads it.
+  pythoncom.CoInitialize() is a no-op on the thread that imported pythoncom
+  first and CoUninitialize() is not: the MSAA reader (since 1.10.0) and
+  sw_instances bracketed their work with the two, which tore that thread's
+  apartment down - every COM object it held answered 0x800401FD 'object is not
+  connected to server' afterwards. The server's session lives on another
+  thread and was spared; a script or test doing both on one thread lost its
+  SolidWorks session. rbr/apartment.py counts through ole32 and leaves the
+  thread as it found it.
+- dialog_list and DIALOG_BLOCKING replies carry text_source ('msaa' / 'uia')
+  as documented.
 - A SolidWorks that is gone is reported as such: the error names the process,
   the last call before it and what SolidWorks' own journal recorded (crash
   stack, resource messages) instead of 'operation unavailable'; after a restart

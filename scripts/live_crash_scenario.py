@@ -73,6 +73,18 @@ def run(code, **args):
     return session.run_guarded(script_tool.run_script, session, code, args)
 
 
+own_titles = set()   # the unsaved assemblies this scenario made
+
+
+def foreign_documents():
+    """Open documents that are not this scenario's: saved outside its folder, or unsaved and
+    not made here. Someone else opened them while it ran - CloseAllDocuments must not run."""
+    inside = os.path.normcase(ROOT) + os.sep
+    return [d["title"] for d in session.list_documents()["documents"]
+            if (not os.path.normcase(os.path.abspath(d["path"])).startswith(inside) if d["path"]
+                else d["title"] not in own_titles)]
+
+
 paths = [os.path.join(ROOT, f"cube_{i + 1}.sldprt") for i in range(PARTS)]
 start = gdi(pid)
 print(f"SolidWorks pid {pid}, GDI objects {start}", flush=True)
@@ -141,6 +153,7 @@ def build_and_file(label, code):
     check(built.get("ok") and built["result"]["components"] == PARTS * COPIES,
           f"{label}: {PARTS * COPIES} components inserted", f"{built.get('result', built)}"[:200])
     data = built["result"]
+    own_titles.add(data["title"])
     grown = gdi(pid) - before
     visible = [d["title"] for d in session.list_documents()["documents"] if d["visible"]]
     check(visible == [data["title"]], f"{label}: the assembly is the only document with a window", str(visible))
@@ -171,8 +184,14 @@ check(moved.get("ok") and res.get("where_2", {}).get("inside") is False,
 after_insert = run("r = insert_component(args['path'], 0, 0, 50.0)\nresult = r['component']['name']", path=paths[0])
 check(after_insert.get("ok"), "an insert after the folder work succeeds", str(after_insert.get("result")))
 
+foreign = foreign_documents()
+if foreign:
+    sys.exit(f"Documents that are not this scenario's were opened while it ran: {foreign}. It stops here "
+             "and closes nothing; its own documents are the unsaved assemblies and the cubes in " + ROOT)
 second = run(CLOSE_AND_REBUILD, paths=paths, copies=COPIES)
 data = second.get("result") or {}
+if data.get("title"):
+    own_titles.add(data["title"])
 check(second.get("ok") and data.get("left_open") == 0 and data.get("components") == PARTS * COPIES,
       "a script that calls CloseAllDocuments goes on with the new assembly (model, asm, fm, ui_unlocked)",
       f"{second.get('error') or data}"[:300])
@@ -188,7 +207,11 @@ print(f"GDI objects: {start} at the start, {end} at the end ({load.get('gdi_pct'
 
 # --- leave SolidWorks as it was found: no documents, UI released --------------------------------
 time.sleep(0.5)
-sw.CloseAllDocuments(True)   # only this scenario's own documents can be open (checked at the start)
+foreign = foreign_documents()
+if foreign:
+    check(False, "only this scenario's documents are open at the end", f"{foreign} - nothing was closed")
+else:
+    sw.CloseAllDocuments(True)   # the unsaved assemblies and the cubes, nothing else
 guard.release_ui(session)
 print(json.dumps({"ok": not failures, "failed": failures, "gdi_start": start, "gdi_end": gdi(pid),
                   "documents_open": int(sw.GetDocumentCount()), "folder": ROOT}, ensure_ascii=False), flush=True)

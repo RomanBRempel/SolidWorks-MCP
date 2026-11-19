@@ -36,7 +36,7 @@ import os
 import time
 
 from ..errors import SolidWorksError
-from . import health
+from . import apartment, health
 
 READ_TIMEOUT_MS = 500     # one WM_GETTEXT; a second timeout in a row stops the reads of that dialog
 CLICK_TIMEOUT_MS = 1000   # BM_CLICK returns when the button's handler does
@@ -257,15 +257,16 @@ def drawn_text(pane_hwnd: int) -> str:
     if os.name != "nt":
         return ""
     try:
-        import pythoncom
+        import pythoncom  # noqa: F401
     except ImportError:
         return ""
-    initialised = False
-    try:
-        pythoncom.CoInitialize()   # this may be a pool thread that never used COM
-        initialised = True
-    except Exception:  # noqa: BLE001
-        pass
+    with apartment.com():   # this may be a pool thread that never used COM - or the session's own thread
+        return _drawn_text(pane_hwnd)
+
+
+def _drawn_text(pane_hwnd: int) -> str:
+    """drawn_text's work; every COM object it makes is gone when it returns."""
+    import pythoncom
     try:
         iid = (ctypes.c_byte * 16).from_buffer_copy(bytes(pythoncom.IID_IDispatch))
         pointer = ctypes.c_void_p()
@@ -302,12 +303,6 @@ def drawn_text(pane_hwnd: int) -> str:
         return "\n".join(lines)
     except Exception:  # noqa: BLE001 - reading is best-effort: the buttons still work
         return ""
-    finally:
-        if initialised:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 UIA_TEXT_TYPES = {50020, 50004, 50030}   # Text, Edit, Document
@@ -324,8 +319,12 @@ def _uia_read(hwnd: int, out: list) -> None:
     dependency): IUIAutomation.ElementFromHandle, .CreateTrueCondition,
     IUIAutomationElement.FindAll(descendants), then each element's control type
     and name. Own thread, own apartment."""
-    import pythoncom
-    pythoncom.CoInitialize()
+    with apartment.com():
+        _uia_collect(hwnd, out)
+
+
+def _uia_collect(hwnd: int, out: list) -> None:
+    import pywintypes
     held = []
 
     def method(pointer, index, *argtypes):
@@ -337,8 +336,8 @@ def _uia_read(hwnd: int, out: list) -> None:
             method(pointer, 2)(pointer)
 
     try:
-        clsid = (ctypes.c_byte * 16).from_buffer_copy(bytes(pythoncom.MakeIID(_CLSID_UIA)))
-        iid = (ctypes.c_byte * 16).from_buffer_copy(bytes(pythoncom.MakeIID(_IID_UIA)))
+        clsid = (ctypes.c_byte * 16).from_buffer_copy(bytes(pywintypes.IID(_CLSID_UIA)))
+        iid = (ctypes.c_byte * 16).from_buffer_copy(bytes(pywintypes.IID(_IID_UIA)))
         uia = ctypes.c_void_p()
         ctypes.oledll.ole32.CoCreateInstance(ctypes.byref(clsid), None, 1, ctypes.byref(iid), ctypes.byref(uia))
         held.append(uia)
@@ -382,7 +381,6 @@ def _uia_read(hwnd: int, out: list) -> None:
                 release(pointer)
             except Exception:  # noqa: BLE001
                 pass
-        pythoncom.CoUninitialize()
 
 
 def uia_text(hwnd: int, timeout_s: float = UIA_TIMEOUT_S) -> str:
@@ -603,6 +601,8 @@ def public(dialog: dict) -> dict:
     for key in ("progress", "text_unreadable", "hung"):
         if dialog.get(key):
             out[key] = True
+    if dialog.get("text_source"):
+        out["text_source"] = dialog["text_source"]   # 'msaa' / 'uia': the text was drawn, not held by a control
     return out
 
 

@@ -307,10 +307,15 @@ def test_tree_label_and_missing_checks():
     items = ["(f) A<1> (Default) <<Default>_Display State 1>", "(-) B<2> (Default)"]
     assert tree.missing_in_tree(["A-1", "B-2"], items) == []
     assert tree.missing_in_tree(["A-1", "B-1"], items) == ["B-1"]
+    # a whole word: 'A<1>' is not shown by 'AA<1>', nor 'B<2>' by 'B<21>'
+    assert tree.missing_in_tree(["A-1", "B-2"], ["(f) AA<1> (Default)", "B<21>"]) == ["A-1", "B-2"]
+    assert tree.shows("(ф) Folder 1", "Folder 1") and tree.shows("Folder 1", "folder 1")
+    assert not tree.shows("(ф) Folder 10", "Folder 1") and not tree.shows("Old Folder 1x", "Folder 1")
 
 
 def test_tree_folder_argument_refusals(fake_session, monkeypatch):
     monkeypatch.setattr(type(fake_session), "_require_assembly", lambda self: self._model, raising=False)
+    monkeypatch.setattr(type(fake_session), "_components", lambda self, asm: [])
     with pytest.raises(SolidWorksError, match="name"):
         tree.tree_folder(fake_session, "  ", ["A-1"])
     with pytest.raises(SolidWorksError, match="list of component names"):
@@ -354,6 +359,7 @@ class _FolderAsm:
 def _folder_session(monkeypatch, fake_session, asm, tree_shows=True):
     model = fake_session._model
     monkeypatch.setattr(type(fake_session), "_require_assembly", lambda self: asm, raising=False)
+    monkeypatch.setattr(type(fake_session), "_components", lambda self, a: list(asm.comps.values()))
     monkeypatch.setattr(type(fake_session), "_component_by_name", lambda self, a, name: asm.comps[name])
     monkeypatch.setattr(tree, "_select", lambda session, m, comps: (asm.selected.clear(), asm.selected.extend(
         c.Name2 for c in comps), len(comps))[2])
@@ -413,3 +419,104 @@ def test_tree_folder_trusts_the_tree_control_over_the_folder_feature(fake_sessio
     s = _folder_session(monkeypatch, fake_session, asm, tree_shows=False)
     with pytest.raises(SolidWorksError, match="tree control does not show"):
         tree.tree_folder(s, "Fasteners", ["A-1"])
+
+
+def test_components_are_resolved_from_one_listing(fake_session, monkeypatch):
+    """Upstream's lookup wraps every component for every name (0.3 s a name at 70 components):
+    exact instance names come from one listing, anything else still goes to upstream."""
+    comps, listings, asked = [_Comp("A-1"), _Comp("A-2"), _Comp("B-1")], [], []
+    monkeypatch.setattr(type(fake_session), "_components", lambda self, a: listings.append(1) or comps)
+    monkeypatch.setattr(type(fake_session), "_component_by_name",
+                        lambda self, a, name: asked.append(name) or comps[2])
+    found = tree.resolve_components(fake_session, object(), ["a-2", "A-1", "A-2", "B"])
+    assert [n for n, _ in found] == ["A-2", "A-1", "B-1"]      # no repeats, the order asked for
+    assert listings == [1] and asked == ["B"]                   # a part name alone: upstream's rules
+
+
+class _Item:
+    """A tree control item: its text carries a status mark, the feature behind it has the name."""
+
+    def __init__(self, text, obj=None, kids=()):
+        self.Text, self.Object, self.kids, self.next = text, obj, list(kids), None
+        for a, b in zip(self.kids, self.kids[1:]):
+            a.next = b
+
+    def GetFirstChild(self):
+        return self.kids[0] if self.kids else None
+
+    def GetNext(self):
+        return self.next
+
+
+def _feature(name, kind="FtrFolder"):
+    return types.SimpleNamespace(Name=name, GetTypeName2=lambda: kind)
+
+
+def test_tree_items_finds_the_folder_behind_a_status_mark(fake_session):
+    """Live, 2026-11-19: a folder of fixed components reads '(f) Folder A' in the tree control;
+    looking for the bare name found nothing and the tree check was skipped."""
+    root = _Item("Assem1 (Default)", kids=[
+        _Item("Annotations", _feature("Annotations", "DetailCabinet")),
+        _Item("(f) Folder A<1> (Default)", types.SimpleNamespace(Name2="Folder A-1")),   # a component, not a folder
+        _Item("(f) Folder A", _feature("Folder A"), kids=[_Item("(f) cube_1<1> (Default)"),
+                                                          _Item("(f) cube_4<1> (Default)")]),
+        _Item("(-) Folder AB", _feature("Folder AB"), kids=[_Item("(-) cube_2<1> (Default)")]),
+    ])
+    fm = fake_session._model.FeatureManager
+    fm.EnableFeatureTree, fm.UpdateFeatureTree, fm.GetFeatureTreeRootItem2 = True, lambda: None, lambda pane: root
+    items = tree.tree_items(fake_session, fake_session._model, "Folder A")
+    assert items == ["(f) cube_1<1> (Default)", "(f) cube_4<1> (Default)"]
+    assert tree.missing_in_tree(["cube_1-1", "cube_4-1"], items) == []
+    assert tree.tree_items(fake_session, fake_session._model, "Folder AB") == ["(-) cube_2<1> (Default)"]
+    assert tree.tree_items(fake_session, fake_session._model, "Folder") is None
+
+
+# --- dialogs: how a drawn text was read is part of the reply ------------------------------------
+
+def test_dialog_reply_says_how_a_drawn_text_was_read():
+    from solidworks_mcp.rbr import dialogs
+    window = {"hwnd": 7, "title": "SOLIDWORKS", "text": "Save changes?", "buttons": [], "modal": True}
+    assert "text_source" not in dialogs.public(window)   # a control held the text: nothing to say
+    assert dialogs.public({**window, "text_source": "uia"})["text_source"] == "uia"
+
+
+# --- reading a dialog must not take COM away from the thread that reads it ----------------------
+
+needs_windows = pytest.mark.skipif(__import__("os").name != "nt", reason="COM apartments are Windows")
+
+
+@needs_windows
+def test_reading_a_dialog_leaves_com_on_the_thread_that_holds_the_session():
+    """Live, 2026-11-19: pythoncom.CoInitialize() is a no-op on the thread that imported
+    pythoncom first and CoUninitialize() is not, so drawn_text() bracketed by the two tore that
+    thread's apartment down; the SolidWorks objects it held answered 0x800401FD ever after."""
+    from solidworks_mcp.rbr import apartment, dialogs, instance
+    pythoncom.CoInitialize()   # the state a thread with a session is in
+    assert apartment.initialised()
+    with apartment.com():
+        assert apartment.initialised()
+    assert apartment.initialised()
+    assert dialogs.drawn_text(0) == ""          # no such window: nothing read - and nothing taken
+    assert apartment.initialised()
+    dialogs.uia_text(0, timeout_s=5.0)          # its helper thread has an apartment of its own
+    assert apartment.initialised()
+    instance.instances()                        # reads the running object table
+    assert apartment.initialised()
+
+
+@needs_windows
+def test_a_thread_without_com_gets_it_for_the_block_only():
+    import threading
+    from solidworks_mcp.rbr import apartment
+    seen = []
+
+    def work():
+        seen.append(apartment.initialised())
+        with apartment.com():
+            seen.append(apartment.initialised())
+        seen.append(apartment.initialised())
+
+    thread = threading.Thread(target=work)
+    thread.start()
+    thread.join(10)
+    assert seen == [False, True, False]

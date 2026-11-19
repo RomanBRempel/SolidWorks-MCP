@@ -684,7 +684,8 @@ def register(server) -> None:
         InsertFeatureTreeFolder2(1) makes an EMPTY folder, ReorderComponents(.., folder, 1 or 2)
         puts components NEXT to the folder and still answers True, MoveToFolder is for features.
         In run_script the same call is tree_folder(name, components); tree_folders() lists the
-        folders and what they hold."""
+        folders and what they hold. It needs no ui_unlocked() around it (that only doubles
+        its time)."""
         return await _timed(tree.tree_folder, session, name, components, timeout_s=120)
 
     @mcp.tool()

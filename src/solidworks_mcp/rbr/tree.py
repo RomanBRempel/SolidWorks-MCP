@@ -20,6 +20,19 @@ ReorderComponents wants its components as VARIANT(VT_ARRAY | VT_DISPATCH).
 No call here is trusted on its return value: the folder is read back, through
 IFeatureFolder.GetFeatures and through the tree control (ITreeControlItem), and
 a folder that does not hold what was asked for is an error.
+
+The tree control writes more than the name: a status mark goes in front -
+'(f) Folder 1' (in the installation's language) for a folder whose components
+are all fixed, '(-)' for floating ones - and a component reads
+'(f) Bolt<3> (Default) <<Default>_Display State 1>'. A tree item is therefore
+matched by the feature it stands for, not by its text (comparing the text with
+the name found no folder at all in the live run of 2026-11-19, and the check
+was skipped in silence).
+
+Measured on an assembly of 70 components, ten of them into one folder: 1.7 s
+a call with the UI frozen as a tool call freezes it, 3.4 s inside
+ui_unlocked() - a script has no reason to unfreeze the UI around tree_folder.
+(4.7 s and 18 s while every name was looked up in a listing of its own.)
 """
 
 import re
@@ -47,10 +60,16 @@ def missing_from(wanted: list, inside: list) -> list:
     return [n for n in wanted if str(n).lower() not in have]
 
 
+def shows(text: str, label: str) -> bool:
+    """Does a tree item's text show `label` as a whole word? '(f) Bolt<3> (Default)' shows
+    'Bolt<3>' and not 'olt<3>'; a status mark before it and a configuration after it do not
+    count; pure, case-blind."""
+    return re.search(r"(?:^|[\s)])" + re.escape(str(label).lower()) + r"(?:$|[\s(])", str(text).lower()) is not None
+
+
 def missing_in_tree(wanted: list, items: list) -> list:
     """The wanted components no tree item of the folder shows ('Bolt<3>' inside the item text); pure."""
-    texts = [str(t).lower() for t in items]
-    return [n for n in wanted if not any(tree_label(n).lower() in t for t in texts)]
+    return [n for n in wanted if not any(shows(t, tree_label(n)) for t in items)]
 
 
 def _folder_feature(session, asm, name: str):
@@ -69,6 +88,41 @@ def folder_components(session, folder) -> list:
     return [binding.wrap(f, session._mod.IFeature).Name for f in (spec.GetFeatures() or ())]
 
 
+def _is_folder_item(mod, item, name: str) -> bool:
+    """Is this tree item the folder feature called `name`? The text only narrows it down (it
+    carries a status mark: '(f) Folder 1'); the feature behind the item decides."""
+    if not shows(item.Text or "", name):
+        return False
+    try:
+        feat = binding.wrap(item.Object, mod.IFeature)
+        return feat is not None and feat.Name == name and feat.GetTypeName2() == FOLDER_TYPE
+    except (pythoncom.com_error, AttributeError):
+        return False   # an item that stands for something else (a component of that name)
+
+
+def resolve_components(session, asm, components: list) -> list:
+    """[(name, component)] for the names given, without repeats, from ONE listing of the assembly.
+
+    session._component_by_name lists and wraps every component of the assembly for each
+    name it looks up: 0.3 s a name at 70 components (2.9 of the 4.7 s a folder of ten took).
+    A name that is not an exact instance name (a part name alone, a wrong one) still goes
+    to it - its rules and its words for the error are upstream's."""
+    listed = {}
+    for comp in session._components(asm):
+        listed.setdefault(comp.Name2.lower(), comp)
+    out, seen = [], set()
+    for wanted in components:
+        if "/" in str(wanted):
+            raise SolidWorksError(f"'{wanted}' is inside a sub-assembly: a folder of this assembly holds only "
+                                  "its own top-level components.")
+        comp = listed.get(str(wanted).strip().lower()) or session._component_by_name(asm, str(wanted))
+        name = comp.Name2
+        if name.lower() not in seen:
+            seen.add(name.lower())
+            out.append((name, comp))
+    return out
+
+
 def tree_items(session, model, name: str) -> list | None:
     """Texts of the tree items under the folder called `name`, read from the tree control
     (ITreeControlItem); None when the tree control cannot be read.
@@ -85,7 +139,7 @@ def tree_items(session, model, name: str) -> list | None:
         root = binding.wrap(fm.GetFeatureTreeRootItem2(SW_FM_PANE_BOTTOM), mod.ITreeControlItem)
         item = binding.wrap(root.GetFirstChild(), mod.ITreeControlItem) if root is not None else None
         while item is not None:
-            if (item.Text or "").strip() == name:
+            if _is_folder_item(mod, item, name):
                 kids = []
                 child = binding.wrap(item.GetFirstChild(), mod.ITreeControlItem)
                 while child is not None:
@@ -138,16 +192,9 @@ def tree_folder(session, name: str, components: list) -> dict:
     asm = session._require_assembly()
     model = session._model
     mod = session._mod
-    comps, seen = [], set()
-    for wanted in components:
-        if "/" in str(wanted):
-            raise SolidWorksError(f"'{wanted}' is inside a sub-assembly: a folder of this assembly holds only "
-                                  "its own top-level components.")
-        comp = session._component_by_name(asm, str(wanted))
-        if comp.Name2.lower() not in seen:
-            seen.add(comp.Name2.lower())
-            comps.append(comp)
-    wanted = [c.Name2 for c in comps]
+    resolved = resolve_components(session, asm, components)
+    wanted = [n for n, _ in resolved]
+    comps = [c for _, c in resolved]
     folder = _folder_feature(session, asm, name)
     created = folder is None
     fm = binding.wrap(model.FeatureManager, mod.IFeatureManager)
@@ -170,7 +217,7 @@ def tree_folder(session, name: str, components: list) -> dict:
     moved = missing_from(wanted, inside)
     if moved:
         array = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH,
-                                        [c._oleobj_ for c in comps if c.Name2 in moved])
+                                        [c._oleobj_ for n, c in resolved if n in moved])
         asm.ReorderComponents(array, folder, SW_REORDER_LAST_IN_FOLDER)
         inside = folder_components(session, folder)
     left_out = missing_from(wanted, inside)
