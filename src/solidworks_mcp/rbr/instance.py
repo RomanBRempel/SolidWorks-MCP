@@ -24,7 +24,7 @@ import re
 
 from .. import binding
 from ..errors import SolidWorksError
-from . import health
+from . import apartment, health
 
 PID_ENV = "SWMCP_SW_PID"
 ROT_NAME = re.compile(r"^SolidWorks_PID_(\d+)$", re.IGNORECASE)
@@ -68,16 +68,12 @@ def _rot_monikers() -> dict:
 def instances(attached_pid: int | None = None) -> dict:
     """The SolidWorks processes running on this machine: pid, memory, whether it is
     registered for automation, and which one this server is attached to."""
-    registered = {}
+    registered = set()
     try:
-        import pythoncom
-        pythoncom.CoInitialize()
-        try:
-            registered = _rot_monikers()
-        finally:
-            pythoncom.CoUninitialize()
+        with apartment.com():
+            registered = set(_rot_monikers())   # the pids only: the monikers end with the block
     except Exception:  # noqa: BLE001 - the process list still stands
-        registered = {}
+        registered = set()
     rows = []
     for pid in sorted(set(health.find_processes()) | set(registered)):
         memory = health.process_memory(pid) or {}

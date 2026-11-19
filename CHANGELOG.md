@@ -5,6 +5,72 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Fixed (rbr 1.11.0) - SolidWorks running out of GDI objects and crashing
+Verified on a live SolidWorks 2025 SP3 with `scripts/live_crash_scenario.py` (a
+cube, two assemblies of 70 components, 6 tree folders each, ReorderComponents,
+CloseAllDocuments inside a script: one document window, +222..288 GDI objects
+for 70 inserts, the same SolidWorks process at the end) and
+`scripts/live_crash_extras.py` (the GDI refusal with the limit lowered,
+document windows, tree_folder on an existing folder, a message box raised
+inside a COM call). Not verifiable without crashing SolidWorks: the 'SolidWorks
+crashed' report (fakes only).
+- Cause of the crashes of 2026-11-18/19: insert_component opened every inserted
+  file in a document window of its own and nothing closed them. A window costs
+  SLDWORKS.exe about 250 GDI objects (measured on SW 2025 SP3; a file loaded
+  without a window costs 0, a file opened into a window and closed leaves 37-45
+  behind), Windows allows a process 10 000 and SolidWorks starts with 2 000.
+  At the limit: 'the requested resource is unavailable' message boxes,
+  AddComponent5 failing with 61704, then a crash in mfc140u <-
+  uiBaseView_c::setupDC. Windows logs it as a GDIObjectLeak report (Windows
+  Error Reporting, event 1001), not as Application Error 1000.
+- insert_component loads the component's file with DocumentVisible(False): no
+  window, 0 GDI objects, the assembly stays active; a refusal of AddComponent5
+  is an error naming it, not a fault; the assembly is rebuilt after the
+  transform.
+- server_health reports sldworks_gui (GDI objects against the quota) and warns
+  past 70%; new_part / open_part / new_assembly / open_assembly are refused past
+  92%; heavy calls carry the document-count and GDI warnings;
+  close_hidden_documents(windows=True) closes saved document windows too.
+- run_script: model / active / part / asm / ext / fm / selmgr are looked up when
+  read, so they follow the script through closing, reloading and opening
+  documents (they were a snapshot: after CloseAllDocuments the helpers died with
+  RPC_E_DISCONNECTED). A stale object of the script's own is explained as such
+  and is no longer counted as a SolidWorks fault. A script that calls
+  CloseAllDocuments is refused before it runs while documents with unsaved
+  changes this server did not make, or documents of another server process, are
+  open.
+- New tool tree_folder(name, components) (and tree_folder / tree_folders in
+  scripts): fills a FeatureManager folder the way that works -
+  InsertFeatureTreeFolder2(2) with the components selected, ReorderComponents
+  with where 3 for an existing folder - and reads the result back from the
+  folder and the tree control. (InsertFeatureTreeFolder2(1) makes an empty
+  folder; ReorderComponents with where 1 or 2 answers True and leaves the
+  components next to the folder; MoveToFolder is for features.) Found by the
+  live run: the tree control writes a status mark before the name ('(f) Folder
+  1'), so the folder was looked for by its bare text, never found, and the
+  tree check skipped in silence - the item is now matched by the feature
+  behind it; and the components are resolved from one listing of the assembly
+  instead of one per name (ten of 70 components: 4.7 s -> 1.7 s).
+- Reading a dialog no longer takes COM away from the thread that reads it.
+  pythoncom.CoInitialize() is a no-op on the thread that imported pythoncom
+  first and CoUninitialize() is not: the MSAA reader (since 1.10.0) and
+  sw_instances bracketed their work with the two, which tore that thread's
+  apartment down - every COM object it held answered 0x800401FD 'object is not
+  connected to server' afterwards. The server's session lives on another
+  thread and was spared; a script or test doing both on one thread lost its
+  SolidWorks session. rbr/apartment.py counts through ole32 and leaves the
+  thread as it found it.
+- dialog_list and DIALOG_BLOCKING replies carry text_source ('msaa' / 'uia')
+  as documented.
+- A SolidWorks that is gone is reported as such: the error names the process,
+  the last call before it and what SolidWorks' own journal recorded (crash
+  stack, resource messages) instead of 'operation unavailable'; after a restart
+  the next reply carries `solidworks_lost` once.
+- Dialogs: the text of a drawn dialog is read through UI Automation when MSAA
+  gives nothing; dialog_list and DIALOG_BLOCKING replies are written to the
+  journal; dialogs are looked for in the running SolidWorks when the remembered
+  process is dead.
+
 ### Added (rbr 1.10.0)
 - Working mid-tree: edit_context(freeze_to, rollback_before, end) puts the
   freeze bar and the rollback bar round the features being edited (a

@@ -28,13 +28,20 @@ WATCHED = ["_iter_features", "_history_snapshot", "_roll_back", "_remove_feature
            # and relied on: sketch_datum.py, script_tool.py, derive.py, bodies.py
            "add_sketch", "_origin_point", "_sketch_coords", "_radius_dimensions", "_arc_count", "_sketch_by_name",
            "_dimension_entries", "_dimension_unit", "_equation_entries", "_equation_lhs", "_body_box",
-           "_part_bodies", "insert_component", "activate_document", "_open_documents", "_failing_features"]
+           "_part_bodies", "insert_component", "activate_document", "_open_documents", "_failing_features",
+           # 1.11.0 - patched: guard.py (window makers refused without GDI objects, a lost SolidWorks told),
+           "open_part", "open_assembly", "_explain_lost_link", "_GONE_HRESULTS",
+           # and relied on by assembly.py's insert_component
+           "_component_dispatches", "_apply_transform", "_fix_component", "_component_entry"]
+# guard.py keeps this original under a name of its own
+ORIGINAL_KEYS = {"_explain_lost_link": "explain"}
 
 
 def _original(name):
     from solidworks_mcp.session import SolidWorksSession
     from solidworks_mcp.rbr import context, fastpath, guard, journal, query, speed
-    fn = (fastpath._ORIGINAL.get(name) or speed._ORIGINAL.get(name) or guard._ORIGINAL.get(name)
+    fn = (fastpath._ORIGINAL.get(name) or speed._ORIGINAL.get(name)
+          or guard._ORIGINAL.get(ORIGINAL_KEYS.get(name, name))
           or journal._ORIGINAL.get(name) or context._ORIGINAL.get(name) or query._ORIGINAL.get(name)
           or getattr(SolidWorksSession, name, None))
     fn = getattr(fn, "__func__", fn)       # a staticmethod read off the class

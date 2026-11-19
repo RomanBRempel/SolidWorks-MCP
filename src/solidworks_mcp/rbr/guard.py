@@ -67,7 +67,10 @@ BUSY_FAIL_S = float(os.environ.get("SWMCP_BUSY_FAIL_S", "20"))
 _ORIGINAL = {}
 _state_lock = threading.Lock()
 _state = {"tool": None, "since": None, "doc": None, "calls": 0, "faults": 0, "releases": 0,
-          "last_fault": None, "last_release": None, "quarantine": None, "sw_pid": None}
+          "last_fault": None, "last_release": None, "quarantine": None, "sw_pid": None,
+          # last_call: the last FINISHED call {tool, doc, at, ts, ok, error}; lost: what to tell the
+          # next caller after SolidWorks went away and a new one was attached (said once)
+          "last_call": None, "lost": None}
 
 
 # --- status (any thread) -----------------------------------------------------------------
@@ -497,7 +500,68 @@ def _title(session):
         return None
 
 
+# --- SolidWorks gone: say so, with the last call (not 'operation unavailable') -------------------
+
+def _lost_text(old_pid, new_pid=None) -> str:
+    """The readable account of a SolidWorks that is gone: last call, and its own journal's end."""
+    from . import health
+    last = _state.get("last_call")
+    evidence = None
+    try:
+        evidence = health.crash_evidence(since=last.get("ts")) if last else None
+    except Exception:  # noqa: BLE001 - the account must not fail on its footnote
+        pass
+    return health.lost_message(old_pid, last, evidence, new_pid, during=_state.get("tool"))
+
+
+def _gone_for_good(pid) -> bool:
+    from . import health
+    return bool(pid) and os.name == "nt" and not health.process_alive(pid)
+
+
+def _remember(tool: str, started: str, ok: bool, error=None) -> None:
+    _set(last_call={"tool": tool, "doc": _state.get("doc"), "at": started, "ts": time.time(), "ok": bool(ok),
+                    "error": None if ok else str(error)[:400]})
+
+
+def _take_lost() -> str | None:
+    with _state_lock:
+        note, _state["lost"] = _state.get("lost"), None
+    return note
+
+
+def _explain_lost_link(self):
+    """Upstream's account of a link that died mid-call, made specific when the process is gone."""
+    previous = _state.get("sw_pid")
+    lost = _ORIGINAL["explain"](self)
+    if lost is not None and _gone_for_good(previous):
+        new_pid = _sw_pid(self) if self._sw is not None else None
+        _take_lost()  # said right here
+        return SolidWorksError(_lost_text(previous, new_pid if new_pid != previous else None))
+    return lost
+
+
 def _run_guarded(self, fn, *args, **kwargs):
+    """The guarded call, remembered as the last one, with the news of a lost SolidWorks attached."""
+    tool = journal.tool_name(fn)
+    started = time.strftime("%H:%M:%S")
+    try:
+        result = _guarded(self, fn, *args, **kwargs)
+    except Exception as exc:
+        _remember(tool, started, False, f"{type(exc).__name__}: {exc}")
+        note = _take_lost()
+        if note and isinstance(exc, SolidWorksError) and note not in str(exc):
+            raise SolidWorksError(f"{exc} [{note}]") from exc
+        raise
+    ok = result.get("ok", True) if isinstance(result, dict) else True
+    _remember(tool, started, ok, None if ok else result.get("error"))
+    note = _take_lost()
+    if note and isinstance(result, dict):
+        result["solidworks_lost"] = note
+    return result
+
+
+def _guarded(self, fn, *args, **kwargs):
     tool = journal.tool_name(fn)
     read_only = tool in READ_ONLY
     _lock.acquire(tool, LOCK_WAIT_S)
@@ -577,8 +641,8 @@ def _run_guarded(self, fn, *args, **kwargs):
                     "without changing its inputs.") from exc
             raise
         claim(_title(self), tool)
-        if tool in SWITCHERS and isinstance(result, dict) and result.get("ok", True):
-            _note_document_load(self, result)
+        if tool in HEAVY and isinstance(result, dict):
+            _note_load(self, result)
         return result
     finally:
         _set(tool=None, since=None)
@@ -587,27 +651,90 @@ def _run_guarded(self, fn, *args, **kwargs):
 
 DOCS_WARN = int(os.environ.get("SWMCP_DOCS_WARN", "30"))
 
+# Tools that load documents or build on many of them: their reply carries the load warnings.
+HEAVY = SWITCHERS | {"insert_component", "insert_part", "run_script", "derive_part", "make_drawing", "export",
+                     "tree_folder", "rebuild"}
+# Session methods that open a document WINDOW (about 250 GDI objects each), also from a script.
+WINDOW_MAKERS = ("new_part", "new_assembly", "open_part", "open_assembly")
 
-def _note_document_load(session, result: dict) -> None:
-    """After opening or creating a document: say so when too many are open (one COM call)."""
+
+def load_hints(documents: int | None, gui: dict | None) -> list:
+    """The warnings a heavy call's reply carries; pure. documents: open documents; gui: health.sldworks_gui."""
+    from . import health
+    hints = []
+    if documents is not None and documents > DOCS_WARN:
+        hints.append(f"{documents} documents are open (> {DOCS_WARN}): calls slow down with every one. "
+                     "close_hidden_documents(dry_run=True) shows which saved, unowned ones it would close; "
+                     "close_hidden_documents() closes them (windows=True takes saved document windows too).")
+    if gui and gui.get("gdi_pct", 0) >= health.GDI_WARN_PCT:
+        hints.append(f"SolidWorks holds {gui['gdi']} of {gui['gdi_quota']} GDI objects ({gui['gdi_pct']}%): about "
+                     f"{gui.get('windows_left', 0)} more document windows fit before it fails and crashes. "
+                     "Close document windows now; save and restart SolidWorks if the number stays high.")
+    return hints
+
+
+def _note_load(session, result: dict) -> None:
+    """After a heavy call: say so when too many documents are open (one COM call) or SolidWorks
+    is running out of window resources (no COM call)."""
+    from . import health
+    count = gui = None
     try:
         count = int(session._sw.GetDocumentCount())
     except Exception:  # noqa: BLE001
+        pass
+    try:
+        gui = health.sldworks_gui(_state.get("sw_pid") if not _gone_for_good(_state.get("sw_pid")) else None)
+    except Exception:  # noqa: BLE001
+        pass
+    hints = load_hints(count, gui)
+    if not hints:
         return
-    if count > DOCS_WARN:
+    if count is not None and count > DOCS_WARN:
         result["documents_open"] = count
-        result["hint"] = (f"{count} documents are open (> {DOCS_WARN}): calls slow down with every one. "
-                          "close_hidden_documents(dry_run=True) shows which invisible, saved, unowned ones "
-                          "it would close; close_hidden_documents() closes them.")
+    if gui and gui.get("gdi_pct", 0) >= health.GDI_WARN_PCT:
+        result["gdi_objects"] = {k: gui[k] for k in ("gdi", "gdi_quota", "gdi_pct", "windows_left")}
+    result["hint"] = " ".join(([str(result["hint"])] if result.get("hint") else []) + hints)
+
+
+def _window_guard(name: str, original):
+    """`original` (a session method that opens a document window), refused when SolidWorks has
+    no GDI objects left for one: the refusal costs nothing, the window would cost the session."""
+    import functools
+
+    @functools.wraps(original)
+    def guarded(self, *args, **kwargs):
+        from . import health
+        try:
+            pid = _state.get("sw_pid")
+            refusal = health.gui_refusal(health.sldworks_gui(None if _gone_for_good(pid) else pid))
+        except Exception:  # noqa: BLE001 - the check never stands in the way
+            refusal = None
+        if refusal:
+            raise SolidWorksError(f"{name} refused. {refusal}")
+        return original(self, *args, **kwargs)
+
+    guarded._rbr_window_guard = True
+    return guarded
 
 
 _releasing = threading.local()
 
 
 def _connect(self):
-    """Attach as upstream does, then clear whatever a previous server or a crash left frozen."""
-    result = _ORIGINAL["connect"](self)
-    _set(sw_pid=_sw_pid(self))   # for the checks that must not call into a busy SolidWorks
+    """Attach as upstream does, then clear whatever a previous server or a crash left frozen.
+    When the SolidWorks attached before is gone, say so - with the last call - instead of
+    passing on 'no running SolidWorks' / 'operation unavailable'."""
+    previous = _state.get("sw_pid")
+    try:
+        result = _ORIGINAL["connect"](self)
+    except SolidWorksError as exc:
+        if _gone_for_good(previous):
+            raise SolidWorksError(_lost_text(previous)) from exc
+        raise
+    pid = _sw_pid(self)
+    if previous and pid and pid != previous and _gone_for_good(previous):
+        _set(lost=_lost_text(previous, pid))   # told to the caller of the call in progress
+    _set(sw_pid=pid)   # for the checks that must not call into a busy SolidWorks
     if not getattr(_releasing, "on", False):
         _releasing.on = True
         try:
@@ -626,8 +753,14 @@ def apply() -> None:
     if not _ORIGINAL:
         _ORIGINAL["run_guarded"] = SolidWorksSession.run_guarded
         _ORIGINAL["connect"] = SolidWorksSession.connect
+        _ORIGINAL["explain"] = SolidWorksSession._explain_lost_link
         SolidWorksSession.run_guarded = _run_guarded
         SolidWorksSession.connect = _connect
+        SolidWorksSession._explain_lost_link = _explain_lost_link
+        for name in WINDOW_MAKERS:
+            _ORIGINAL[name] = getattr(SolidWorksSession, name)
+            if not getattr(_ORIGINAL[name], "_rbr_window_guard", False):
+                setattr(SolidWorksSession, name, _window_guard(name, _ORIGINAL[name]))
         journal.GUARDED = True
 
 
@@ -636,5 +769,9 @@ def unapply() -> None:
     if _ORIGINAL:
         SolidWorksSession.run_guarded = _ORIGINAL["run_guarded"]
         SolidWorksSession.connect = _ORIGINAL["connect"]
+        SolidWorksSession._explain_lost_link = _ORIGINAL["explain"]
+        for name in WINDOW_MAKERS:
+            if getattr(getattr(SolidWorksSession, name), "_rbr_window_guard", False):
+                setattr(SolidWorksSession, name, _ORIGINAL[name])  # not when another patch wraps it by now
         _ORIGINAL.clear()
         journal.GUARDED = False

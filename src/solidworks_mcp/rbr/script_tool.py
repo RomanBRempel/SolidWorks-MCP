@@ -56,42 +56,122 @@ def api(obj, contains: str = "") -> dict:
             "note": None if props or methods else "raw dispatch: wrap(obj, mod.IXxx) first"}
 
 
+class Namespace(dict):
+    """The globals of a script, with the document names looked up when they are READ.
+
+    `model`, `active`, `ext`, `fm`, `selmgr`, `asm` and `part` used to be a
+    snapshot taken before the script ran. A script that closed, reloaded or
+    opened documents went on with objects of documents that were gone, and its
+    next use of one - also inside a helper such as ui_unlocked() - died with
+    RPC_E_DISCONNECTED (2026-11-19, after swApp.CloseAllDocuments). Now each
+    of those names is resolved at the moment of use: `live` maps the name to a
+    function returning the object for the document that is current then (it
+    raises KeyError where the name does not apply, e.g. `asm` in a part, which
+    Python reports as an undefined name, as before). A script that assigns to
+    such a name itself keeps its own value from then on.
+
+    exec() honours __getitem__ of a dict SUBCLASS for global and name lookups
+    (the fast path is taken for exact dicts only); tests/rbr pins that.
+    """
+
+    def __init__(self, live: dict):
+        super().__init__()
+        self._live = dict(live)
+
+    def __getitem__(self, key):
+        resolver = self._live.get(key)
+        if resolver is not None:
+            return resolver()
+        return dict.__getitem__(self, key)
+
+    def __setitem__(self, key, value):
+        self._live.pop(key, None)
+        dict.__setitem__(self, key, value)
+
+    def __delitem__(self, key):
+        if self._live.pop(key, None) is None:
+            dict.__delitem__(self, key)
+
+    def __contains__(self, key):
+        return key in self._live or dict.__contains__(self, key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def live_documents(session):
+    """(current, resolvers) for a script namespace.
+
+    current() is the document the tools work on NOW: the server's current one
+    while it still answers, else SolidWorks' active one. A current document
+    that was closed behind the server's back (by the script itself) is dropped
+    on the way, once, instead of failing every later use."""
+    sw, mod = session._sw, session._mod
+
+    def active():
+        return binding.wrap(sw.ActiveDoc, mod.IModelDoc2)
+
+    def current():
+        held = session._model
+        if held is not None:
+            try:
+                held.GetTitle()
+                return held
+            except pythoncom.com_error as exc:
+                if getattr(exc, "hresult", None) not in session._GONE_HRESULTS:
+                    raise
+                session._model = None
+        return active()
+
+    def of(interface, attribute=None, doc_type=None):
+        def resolve():
+            doc = current()
+            if doc is None or (doc_type is not None and int(doc.GetType()) != doc_type):
+                raise KeyError(interface)
+            return binding.wrap(getattr(doc, attribute) if attribute else doc, getattr(mod, interface))
+        return resolve
+
+    return current, {
+        "model": current, "active": active,
+        "ext": of("IModelDocExtension", "Extension"), "selmgr": of("ISelectionMgr", "SelectionManager"),
+        "fm": of("IFeatureManager", "FeatureManager"),
+        "asm": of("IAssemblyDoc", doc_type=SW_DOC_ASSEMBLY), "part": of("IPartDoc", doc_type=SW_DOC_PART),
+    }
+
+
 def namespace(session, out: list, args: dict | None = None) -> dict:
     """The names a script sees (documented in the run_script tool)."""
     sw = session._ensure()
     mod = session._mod
-    active = binding.wrap(sw.ActiveDoc, mod.IModelDoc2)
-    model = session._model if session._model is not None else active
-    if model is not None and session._quiet_depth:
+    current, live = live_documents(session)
+    first = current()
+    if first is not None and session._quiet_depth:
         try:
-            session._quiet(model)
+            session._quiet(first)
         except Exception:  # noqa: BLE001
             pass
+    del first  # nothing below may hold a document: every helper asks current()
 
     def _print(*items, sep=" ", end="\n", **_):
         out.append(sep.join(str(a) for a in items) + end)
 
-    ns = {
-        "sw": sw, "swApp": sw, "mod": mod, "wrap": binding.wrap,
-        "model": model, "active": active, "session": session,
+    ns = Namespace(live)
+    ns.update({
+        "sw": sw, "swApp": sw, "mod": mod, "wrap": binding.wrap, "session": session,
         "SolidWorksError": SolidWorksError, "print": _print, "result": None,
         "MM": 0.001, "DEG": 3.141592653589793 / 180.0, "args": dict(args or {}),
-    }
-    if model is not None:
-        ns["ext"] = binding.wrap(model.Extension, mod.IModelDocExtension)
-        ns["selmgr"] = binding.wrap(model.SelectionManager, mod.ISelectionMgr)
-        ns["fm"] = binding.wrap(model.FeatureManager, mod.IFeatureManager)
-        doc_type = int(model.GetType())
-        if doc_type == SW_DOC_ASSEMBLY:
-            ns["asm"] = binding.wrap(model, mod.IAssemblyDoc)
-        elif doc_type == SW_DOC_PART:
-            ns["part"] = binding.wrap(model, mod.IPartDoc)
+    })
 
     def comp(name):
         """Component of the current assembly by list_components name."""
-        if "asm" not in ns:
-            raise SolidWorksError("comp() needs an assembly as the current document.")
-        return session._component_by_name(ns["asm"], name)
+        try:
+            assembly = live["asm"]()
+        except KeyError:
+            raise SolidWorksError("comp() needs an assembly as the current document.") from None
+        return session._component_by_name(assembly, name)
 
     def W(obj, iface=None):
         """Early-bind a raw or late-bound dispatch (or a list of them) so the API behaves.
@@ -183,8 +263,8 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         collection select fine.
         """
         if not append:
-            model.ClearSelection2(True)
-        data = ns["selmgr"].CreateSelectData()
+            current().ClearSelection2(True)
+        data = live["selmgr"]().CreateSelectData()
         count = 0
         for o in objs:
             try:
@@ -239,7 +319,8 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         was_busy = bool(sw.CommandInProgress)
         if was_busy:
             sw.CommandInProgress = False
-        view = binding.wrap(model.ActiveView, mod.IModelView) if model is not None else None
+        doc = current()
+        view = binding.wrap(doc.ActiveView, mod.IModelView) if doc is not None else None
         was_still = view is not None and not view.EnableGraphicsUpdate
         if was_still:
             view.EnableGraphicsUpdate = True
@@ -247,7 +328,10 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
             yield
         finally:
             if was_still:
-                view.EnableGraphicsUpdate = False
+                try:
+                    view.EnableGraphicsUpdate = False
+                except pythoncom.com_error:
+                    pass  # the block closed that document: nothing left to keep still
             if was_busy:
                 sw.CommandInProgress = True
 
@@ -350,7 +434,7 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
                          "normal": [float(c) for c in row[6:9]]})
         return hits
 
-    from . import batch, cavity, query, section, sketch_datum, sweep   # here: they import this package's parts
+    from . import batch, cavity, query, section, sketch_datum, sweep, tree   # here: they import this package's parts
 
     def body_box(body=None):
         """A body's TIGHT box in mm ({min_mm, max_mm, size_mm}) from its extreme points; body:
@@ -367,6 +451,9 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
 
     ns.update(
         body_box=body_box, new_assembly=new_assembly,
+        # the ways of filling a tree folder that answer True and move nothing: see rbr/tree.py
+        tree_folder=lambda name, components: tree.tree_folder(session, name, components),
+        tree_folders=lambda: tree.list_tree_folders(session),
         # AddComponent5's own x, y, z centre the component's BOX there; this puts its ORIGIN there
         insert_component=lambda path, x_mm=0.0, y_mm=0.0, z_mm=0.0, fixed=None: session.insert_component(
             path, x_mm, y_mm, z_mm, fixed),
@@ -549,6 +636,69 @@ def after_failure(session, before: dict | None, rollback: bool) -> dict:
     return report
 
 
+RPC_E_DISCONNECTED = -2147417848
+STALE_HINT = ("an object the script was holding is gone: its document was closed, reloaded or replaced earlier "
+              "in the script (CloseDoc, CloseAllDocuments, ReloadOrReplace, close_part). model, active, part, asm, "
+              "ext, fm and selmgr always mean the document that is current now - use them, or fetch your own "
+              "references again (wrap(swApp.ActiveDoc, mod.IModelDoc2), activate(title)) after closing documents")
+
+
+def _stale_reference(session, exc) -> bool:
+    """RPC_E_DISCONNECTED while SolidWorks itself still answers: one object died, not the link.
+    The script's mistake, to be told as such - not a fault that distrusts the whole session."""
+    if getattr(exc, "hresult", None) != RPC_E_DISCONNECTED:
+        return False
+    try:
+        session._sw.CommandInProgress
+    except Exception:  # noqa: BLE001 - the link is dead: a real fault
+        return False
+    try:  # a current document that went the same way is dropped, so the clean-up works on what exists
+        if session._model is not None:
+            session._model.GetTitle()
+    except Exception:  # noqa: BLE001
+        session._model = None
+    return True
+
+
+def close_all_objections(documents: list, owners: dict, own_pid: int) -> list:
+    """Why CloseAllDocuments must not run: the open documents it would take from someone else; pure.
+
+    documents: [{title, modified}]; owners: guard.owners() (title -> {pid}). A document of
+    another live server process, and unsaved changes this server did not make (the user's own
+    work in the same SolidWorks), are not a script's to throw away."""
+    out = []
+    for doc in documents:
+        title = doc.get("title")
+        owner = (owners.get(title) or {}).get("pid")
+        if owner not in (None, own_pid):
+            out.append(f"'{title}' (in use by server process {owner})")
+        elif doc.get("modified") and owner != own_pid:
+            out.append(f"'{title}' (unsaved changes this server did not make)")
+    return out
+
+
+def _check_close_all(session, code: str) -> None:
+    """A script that calls CloseAllDocuments is refused BEFORE it runs when that would discard
+    someone else's documents (see close_all_objections)."""
+    if "CloseAllDocuments" not in code:
+        return
+    import os
+    from . import guard
+    try:
+        documents = [{"title": d.GetTitle(), "modified": bool(d.GetSaveFlag())} for d in session._open_documents()]
+        blocked = close_all_objections(documents, guard.prune_owners(), os.getpid())
+    except pythoncom.com_error:
+        return
+    if blocked:
+        shown = ", ".join(blocked[:8]) + (f" and {len(blocked) - 8} more" if len(blocked) > 8 else "")
+        raise SolidWorksError(
+            f"The script calls CloseAllDocuments, which would close {len(blocked)} document(s) that are not "
+            f"this server's to discard: {shown}. Nothing was run. Close the documents you mean one by one "
+            "(swApp.CloseDoc(title), or activate(title) + session.close_part()), or use "
+            "close_hidden_documents(); CloseAllDocuments is accepted when only saved documents and this "
+            "server's own ones are open.")
+
+
 def _fault(exc) -> bool:
     """A COM error after which SolidWorks' state cannot be trusted: the guard must see it."""
     from ..session import SolidWorksSession
@@ -566,6 +716,7 @@ def run_script(session, code: str, args: dict | None = None, rollback_on_error: 
     rollback_on_error=False: nothing is undone; the reply is {ok: false, error, kept:
     {features, equations}} - the finished steps stay, the script can be continued."""
     out = []
+    _check_close_all(session, code)
     ns = namespace(session, out, args)
     before = journal.tree_state(session, names=True)
     made_before = made_state(session)
@@ -573,7 +724,8 @@ def run_script(session, code: str, args: dict | None = None, rollback_on_error: 
     try:
         exec(compile(code, "<run_script>", "exec"), ns)  # noqa: S102 - the point of the tool
     except Exception as exc:  # noqa: BLE001
-        if _fault(exc):
+        stale = _stale_reference(session, exc)
+        if not stale and _fault(exc):
             raise
         if isinstance(exc, SolidWorksError):
             message = str(exc)
@@ -582,6 +734,8 @@ def run_script(session, code: str, args: dict | None = None, rollback_on_error: 
             frames = exc.__traceback__.tb_next if exc.__traceback__ is not None else None
             tb = "".join(traceback.format_exception(type(exc), exc, frames, limit=6))
             message = f"Script failed: {type(exc).__name__}: {exc}\n{tb}"
+            if stale:
+                message = f"Script failed: {STALE_HINT}.\n{tb}"
         stdout = "".join(out)[-4000:]
         try:
             report = after_failure(session, made_before, bool(rollback_on_error))
