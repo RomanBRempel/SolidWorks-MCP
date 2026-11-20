@@ -157,6 +157,14 @@ def _open_docs(session) -> dict:
     return out
 
 
+def _front_title(session) -> str | None:
+    try:
+        active = binding.wrap(session._sw.ActiveDoc, session._mod.IModelDoc2)
+        return None if active is None else active.GetTitle()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _volumes(session) -> dict:
     return {body.Name: round(bodies_mod._volume_mm3(body), 3) for body in bodies_mod._all_bodies(session)}
 
@@ -196,6 +204,7 @@ def rebuild_chain(session, root=None, folder=None, save: bool = True, close_open
 
     mod = session._mod
     rows, loaded = [], []
+    front = _front_title(session)
     try:
         for k in order:
             path = names[k]
@@ -245,6 +254,13 @@ def rebuild_chain(session, root=None, folder=None, save: bool = True, close_open
                     closed.append(title)
                 except Exception:  # noqa: BLE001
                     pass
+        # closing a document lets SolidWorks bring any other window forward: put back the one
+        # that was in front when the call started
+        if front and _front_title(session) != front:
+            try:
+                session._sw.ActivateDoc3(front, False, assembly.SW_DONT_REBUILD_ACTIVE_DOC, 0)
+            except Exception:  # noqa: BLE001 - the chain is done; the front window is a courtesy
+                pass
     totals = summary(rows)
     result = {"ok": not totals["failed"], "root": os.path.basename(root_path),
               "chain": [os.path.basename(names[k]) for k in chain], "parts": rows, **totals, "scan": scan}
