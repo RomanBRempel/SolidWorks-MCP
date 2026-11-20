@@ -4,9 +4,18 @@ Reads one JSON request on stdin, writes one JSON line on stdout:
 {"ok": true, ...} or {"ok": false, "error": "..."}. Started by flow._run_worker
 as `python -m solidworks_mcp.rbr.flow_worker`; never imported by the server.
 
+A solve writes one extra line BEFORE it starts, {"event": "started", ...}, with
+the project's folder: the server reads the solver's progress from there while
+this process waits inside Solve.
+
 NIK traps, all met on Flow Simulation 2025 SP3:
-- reading or setting a computational-domain parameter is an access violation in
-  this process; the domain is only ever reset to automatic (Rebuild(True, ...)),
+- touching a computational-domain parameter was an access violation in this
+  process on 2026-11-02 and works on 2026-11-20 (read and set, same build), so
+  the domain is read and set in a worker call of its own: a crash there costs
+  that one answer, not the rest,
+- the minimum gap size is a parameter of the global mesh only in a project that
+  has it switched on (Global Mesh > Minimum gap size); a project made from a
+  template without it has no such parameter at all,
 - some parameters' values cannot be read (they raise); only their Type is read
   while looking one up,
 - Solve and Rebuild return False without a reason; Flow writes it to
@@ -25,7 +34,8 @@ FEATURE_TYPES = {2: "boundary_condition", 3: "surface_source", 4: "volume_source
                  8: "solid_material", 11: "fluid_subdomain", 12: "surface_goal", 13: "volume_goal",
                  14: "local_mesh"}
 BOUNDARY_CONDITION, SURFACE_GOAL = 2, 12
-P_BC_TYPE, P_MESH_LEVEL = 41, 7
+P_BC_TYPE, P_MESH_LEVEL, P_GAP = 41, 7, 8
+DOMAIN = {"xmin": 1, "xmax": 2, "ymin": 3, "ymax": 4, "zmin": 5, "zmax": 6}  # nikComputationalDomain*
 P_PRESSURE, P_TEMPERATURE, P_VX, P_VY, P_VZ = 9, 10, 11, 12, 13
 NO_ERROR = 0
 LOG = os.path.join(os.environ.get("TEMP", ""), "ngp.log")
@@ -112,6 +122,9 @@ class Flow:
     def project(self):
         proj = self.doc.GetActiveProject()
         if proj is None:
+            have = list(self.doc.GetProjectNames() or ())
+            if have:
+                raise Refused(f"No Flow project is active in the document: flow_activate one of {', '.join(have)}.")
             raise Refused("The document has no Flow project: call flow_create_project first.")
         return self.wrap(proj, "IFDAProject")
 
@@ -145,6 +158,45 @@ class Flow:
         if code != NO_ERROR:
             raise Refused(f"Flow refused {label} = {value} (error {code}).")
 
+    def read(self, owner, kind: int, integer: bool = False):
+        """A parameter's value; None when the item has no such parameter or will not tell."""
+        try:
+            p = self.parameter(owner, kind)
+            code, value = p.GetLongValue() if integer else p.GetValue()
+        except Exception:  # noqa: BLE001 - Refused (no such parameter), or a read that raises
+            return None
+        return value if code == NO_ERROR else None
+
+    def config(self):
+        conf = self.doc.ActiveConfiguration
+        if conf is None:
+            raise Refused("Flow sees no active configuration in the document.")
+        return self.wrap(conf, "IModelConfiguration")
+
+    def names(self) -> list:
+        return list(self.doc.GetProjectNames() or ())
+
+    def named(self, name: str) -> str:
+        """The project's exact name (matched without case), or a refusal listing what exists."""
+        have = self.names()
+        for n in have:
+            if n == name:
+                return n
+        for n in have:
+            if n.lower() == str(name).lower():
+                return n
+        raise Refused(f"The document has no Flow project '{name}' (it has: {', '.join(have) or 'none'}).")
+
+    def active_name(self) -> str | None:
+        active = self.doc.GetActiveProject()
+        return None if active is None else self.wrap(active, "IFDAProject").Name
+
+    def folder(self, proj) -> str | None:
+        try:
+            return self.wrap(proj.ProjectFiles, "IProjectFiles").ProjectDirectory or None
+        except Exception:  # noqa: BLE001
+            return None
+
     def rebuild_error(self, proj, offset: int, what: str) -> str:
         reasons = [r for r in [proj.GetLastRebuildError()] + log_warnings(offset) if r]
         return f"{what}: " + ("; ".join(reasons) if reasons else "Flow gave no reason (see its Messages pane).")
@@ -163,7 +215,11 @@ class Flow:
         proj = self.wrap(proj, "IFDAProject")
         if not self.doc.Rebuild(True, True, False, True, True):  # reset the template's domain to this model
             raise Refused(self.rebuild_error(proj, offset, "The new project does not rebuild"))
-        return {"project": proj.Name, "template": request["template"], "features": self.features(proj)}
+        reply = {"project": proj.Name, "template": request["template"], "features": self.features(proj)}
+        if request.get("mesh_level") is not None:
+            self.set(proj.GlobalMeshSettings, P_MESH_LEVEL, request["mesh_level"], "the mesh level", integer=True)
+            reply["mesh_level"] = request["mesh_level"]
+        return reply
 
     def add_boundary_condition(self, request: dict) -> dict:
         proj = self.project()
@@ -217,13 +273,84 @@ class Flow:
         if request.get("mesh_level") is not None:
             self.set(proj.GlobalMeshSettings, P_MESH_LEVEL, request["mesh_level"], "the mesh level", integer=True)
             done["mesh_level"] = request["mesh_level"]
+        if request.get("min_gap") is not None:
+            try:
+                self.set(proj.GlobalMeshSettings, P_GAP, request["min_gap"], "the minimum gap size")
+            except Refused as exc:
+                if "no parameter" not in str(exc):
+                    raise
+                raise Refused(
+                    f"Project '{proj.Name}' has no minimum gap size to set: it is switched off in the project "
+                    "(it came from a template without it), and the Flow API cannot switch it on. Turn it on "
+                    "once in Flow (Global Mesh > Minimum gap size) and save that project as a template "
+                    "(Flow Simulation > Project > Create Template) for flow_create_project, or flow_clone a "
+                    "project that has it." + (f" Already set: {done}." if done else "")) from None
+            done["min_gap_mm"] = request["min_gap"] * 1000.0
         return {"project": proj.Name, "set": done}
+
+    def set_domain(self, request: dict) -> dict:
+        """The computational domain's faces, metres; in a call of its own (see the module text)."""
+        proj = self.project()
+        settings = proj.ComputationalDomainSettings
+        for key, value in request["domain"].items():
+            self.set(settings, DOMAIN[key], value, f"the domain's {key}")
+        return {"project": proj.Name, "domain_m": self.domain(proj)}
+
+    def domain(self, proj) -> dict:
+        settings = proj.ComputationalDomainSettings
+        return {key: self.read(settings, kind) for key, kind in DOMAIN.items()}
+
+    def settings(self, request: dict) -> dict:
+        """Mesh level, minimum gap and domain of the active project (read-only)."""
+        proj = self.project()
+        mesh = proj.GlobalMeshSettings
+        gap = self.read(mesh, P_GAP)
+        return {"project": proj.Name, "mesh_level": self.read(mesh, P_MESH_LEVEL, integer=True),
+                "min_gap_mm": None if gap is None else gap * 1000.0, "domain_m": self.domain(proj)}
+
+    # --- projects ---------------------------------------------------------------------
+
+    def activate(self, request: dict) -> dict:
+        name = self.named(request["name"])
+        self.config().ActivateProject(name, False)
+        if self.active_name() != name:
+            raise Refused(f"Flow did not activate project '{name}'.")
+        return {"project": name, "projects": self.names(), "features": self.features(self.project())}
+
+    def clone(self, request: dict) -> dict:
+        source, new = self.named(request["name"]), request["new_name"]
+        if any(n.lower() == new.lower() for n in self.names()):
+            raise Refused(f"The document already has a Flow project '{new}'.")
+        offset = log_offset()
+        self.config().CloneProject(source, new, bool(request.get("copy_results")))
+        if new not in self.names():
+            reasons = "; ".join(log_warnings(offset))
+            raise Refused(f"Flow did not clone '{source}' to '{new}'." + (f" {reasons}" if reasons else ""))
+        if self.active_name() != new:
+            self.config().ActivateProject(new, False)
+        if self.active_name() != new:
+            raise Refused(f"'{new}' was cloned from '{source}' but did not become the active project.")
+        return {"project": new, "cloned_from": source, "projects": self.names(),
+                "features": self.features(self.project())}
+
+    def delete(self, request: dict) -> dict:
+        name = self.named(request["name"])
+        removed = self.config().RemoveProject(name)
+        if not removed or name in self.names():
+            raise Refused(f"Flow did not delete project '{name}'.")
+        left = self.names()
+        if left and self.active_name() is None:
+            # deleting the active project leaves none active, and every Flow tool works on
+            # the active one: the first that is left takes over
+            self.config().ActivateProject(left[0], False)
+        return {"deleted": name, "projects": left, "active_project": self.active_name()}
 
     def solve(self, request: dict) -> dict:
         proj = self.project()
         offset = log_offset()
         if not self.doc.Rebuild(False, False, False, True, True):
             raise Refused(self.rebuild_error(proj, offset, "The project does not rebuild"))
+        emit({"event": "started", "project": proj.Name, "directory": self.folder(proj)})
         t0 = time.time()
         if not proj.Solve(True, True, True):
             raise Refused(self.rebuild_error(proj, offset, "Flow did not solve"))
@@ -279,10 +406,41 @@ class Flow:
         if proj is not None:
             proj = self.wrap(proj, "IFDAProject")
             reply.update(active_project=proj.Name, features=self.features(proj))
+            folder = self.folder(proj)
+            if folder:
+                reply["directory"] = folder
+            last = self.last_results(proj)
+            if last:
+                reply["last_results"] = last
         return reply
 
+    def last_results(self, proj) -> dict | None:
+        """Cells and iterations of the newest result file (None before the first solve)."""
+        try:
+            files = proj.EnumFDAResultFiles()
+            best = None
+            f = files.Next() if files is not None else None
+            while f is not None:
+                f = self.wrap(f, "IFDAResultFileInfo")
+                iterations = f.GetIterationsNumber()
+                if best is None or iterations > best["iterations"]:
+                    best = {"iterations": iterations, "cells": f.GetMeshCellsCount(),
+                            "file": f.GetPathToFDAResultFile()}
+                f = files.Next()
+            return best
+        except Exception:  # noqa: BLE001 - a courtesy: the project's own data is the answer
+            return None
 
-OPS = ("create_project", "add_boundary_condition", "add_goal", "set_conditions", "solve", "goals", "info")
+
+OPS = ("create_project", "add_boundary_condition", "add_goal", "set_conditions", "set_domain", "settings",
+       "activate", "clone", "delete", "solve", "goals", "info")
+
+
+def emit(line: dict) -> None:
+    """One JSON line to the server, at once. ASCII escapes: the pipe's code page (cp1251
+    here) must not decide how names arrive."""
+    sys.stdout.write(json.dumps(line, default=repr) + "\n")
+    sys.stdout.flush()
 
 
 def main() -> None:
@@ -296,9 +454,7 @@ def main() -> None:
         reply = {"ok": False, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001 - one readable line back to the server
         reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc(limit=4)}
-    # ASCII escapes: the pipe's code page (cp1251 here) must not decide how names arrive
-    sys.stdout.write(json.dumps(reply, default=repr) + "\n")
-    sys.stdout.flush()
+    emit(reply)
 
 
 if __name__ == "__main__":

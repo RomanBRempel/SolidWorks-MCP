@@ -553,11 +553,25 @@ def register(server) -> None:
         return _local(start)
 
     @mcp.tool()
-    async def get_job(job_id: str) -> dict:
+    async def get_job(job_id: str, wait_s: float = 0.0) -> dict:
         """A background job's record: state (queued|running|done|failed), elapsed_s, the
         script's full result once done, error and traceback when failed, features_added.
-        Works across server processes and restarts; records live 24 h."""
-        return _local(jobs.get, job_id)
+        wait_s: wait up to that many seconds for the job to finish before answering (0 = answer
+        at once; capped by SWMCP_SYNC_WAIT_S, 50 s, the client's reply window) - the reply
+        comes when the job ends or when the wait is over, whichever is first, and `waited_s`
+        says how long that was. Works across server processes and restarts; records live 24 h."""
+        try:
+            limit = max(0.0, min(float(wait_s or 0.0), jobs.SYNC_WAIT_S))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "wait_s is a number of seconds."}
+        if limit <= 0:
+            return _local(jobs.get, job_id)
+        started = asyncio.get_running_loop().time()
+        try:
+            record = await jobs.wait(job_id, limit)
+        except SolidWorksError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {**record, "waited_s": round(asyncio.get_running_loop().time() - started, 1)}
 
     @mcp.tool()
     async def list_jobs(last_n: int = 10) -> dict:
@@ -607,7 +621,8 @@ def register(server) -> None:
         document window takes about 250, and at the limit SolidWorks fails with 'resource
         unavailable' and crashes) and (when the COM thread is free) the open document count,
         with a warning past 30 documents - and how many of them close_hidden_documents would
-        close - past 70% of the GDI quota, or 70% of RAM. server.sw_running false means the
+        close - past 70% of the GDI quota, or 70% of RAM. flow_solves: the Flow solves running
+        now (they do not hold SolidWorks; flow_status shows each one's progress). server.sw_running false means the
         SolidWorks this server drove is gone (server.last_call: the last call before that).
         Use it when a call is slow or SolidWorks seems stuck."""
         def build():
@@ -618,6 +633,7 @@ def register(server) -> None:
                     "queued": worker._queue.qsize() if worker is not None else 0,
                     "lock_holder": guard._lock.held_by(), "owners": guard.prune_owners(),
                     "edit_context": context.seen(),
+                    "flow_solves": flow.running_solves(),
                     "sldworks_memory": health.sldworks_memory(),
                     "sldworks_gui": health.sldworks_gui(st.get("sw_pid") if st["sw_running"] else None),
                     "recent_errors": [{k: e.get(k) for k in ("ts", "pid", "tool", "doc", "error")}
@@ -1331,14 +1347,24 @@ def register(server) -> None:
     # --- Flow Simulation ---------------------------------------------------------------
 
     @mcp.tool()
-    async def flow_create_project(name: str, template: str = "internal_water") -> dict:
+    async def flow_create_project(name: str, template: str = "internal_water", mesh_level: int = 5,
+                                  domain_m: dict | list | None = None, min_gap_mm: float | None = None) -> dict:
         """Create a Flow Simulation project on the current SAVED part or assembly from a project
         template (.fwp: a name in Flow's template folder, or a full path), and fit its
         computational domain to the model. The template fixes the analysis type and the fluid:
         'internal_water' ships with Flow; for external flow or air, make a template once in
-        Flow (Wizard, then Create Template). Then: flow_add_boundary_condition, flow_add_goal,
-        flow_set_conditions, flow_solve. Needs the Flow Simulation add-in and its API SDK."""
-        return await _timed(flow.flow_create_project, session, name, template, timeout_s=330)
+        Flow (Wizard, then Create Template).
+        mesh_level: the automatic mesh level, 1 (coarse) .. 7; 5 unless told otherwise - a
+        template's own level is not used (an external-air template left at 3 gave a lift 25 %
+        low). domain_m: the computational domain in metres, {'x': [min, max], 'y': [...],
+        'z': [...]} or [xmin, xmax, ymin, ymax, zmin, zmax]; without it Flow's automatic
+        domain, which is far larger than a hand-set one - results of the two do not compare.
+        min_gap_mm: the mesh's minimum gap size; settable only when the template has it
+        switched on (the error says how to get such a template).
+        Then: flow_add_boundary_condition, flow_add_goal, flow_set_conditions, flow_solve.
+        Needs the Flow Simulation add-in and its API SDK."""
+        return await _timed(flow.flow_create_project, session, name, template, mesh_level, domain_m,
+                            min_gap_mm, timeout_s=660)
 
     @mcp.tool()
     async def flow_add_boundary_condition(kind: str, faces: list | str, value: float | None = None,
@@ -1365,32 +1391,95 @@ def register(server) -> None:
 
     @mcp.tool()
     async def flow_set_conditions(velocity_mps: list | None = None, pressure_pa: float | None = None,
-                                  temperature_k: float | None = None, mesh_level: int | None = None) -> dict:
+                                  temperature_k: float | None = None, mesh_level: int | None = None,
+                                  domain_m: dict | list | None = None, min_gap_mm: float | None = None) -> dict:
         """Set the active project's initial/ambient conditions - for an external flow the free
-        stream: velocity_mps [vx, vy, vz], pressure_pa, temperature_k - and/or its automatic
-        mesh level 1 (coarse, fast) .. 7 (fine). Leave out what should stay."""
+        stream: velocity_mps [vx, vy, vz], pressure_pa, temperature_k - and/or its mesh and
+        domain: mesh_level 1 (coarse, fast) .. 7 (fine); domain_m, the computational domain in
+        metres as {'x': [min, max], 'y': [...], 'z': [...]} (an axis left out keeps its
+        sides) or [xmin, xmax, ymin, ymax, zmin, zmax]; min_gap_mm, the minimum gap size (only
+        in a project that has it switched on - the error says how). Leave out what should
+        stay. flow_info shows what is set."""
         return await _timed(flow.flow_set_conditions, session, velocity_mps, pressure_pa, temperature_k,
-                            mesh_level, timeout_s=330)
+                            mesh_level, domain_m, min_gap_mm, timeout_s=660)
+
+    @mcp.tool()
+    async def flow_activate(name: str) -> dict:
+        """Make another Flow project of the current document the active one (the one
+        flow_set_conditions, flow_add_*, flow_solve and flow_goals work on). flow_info lists
+        the projects."""
+        return await _timed(flow.flow_activate, session, name, timeout_s=330)
+
+    @mcp.tool()
+    async def flow_clone(name: str, new_name: str, velocity_mps: list | None = None,
+                         pressure_pa: float | None = None, temperature_k: float | None = None,
+                         mesh_level: int | None = None, domain_m: dict | list | None = None,
+                         min_gap_mm: float | None = None, copy_results: bool = False) -> dict:
+        """Copy a Flow project of the current document under a new name - boundary conditions,
+        goals, mesh, domain and all - make the copy active, and change what is given on it:
+        the next angle of attack or speed is one call, e.g. flow_clone('a4', 'a8',
+        velocity_mps=[0, 2.78, -19.8]). The other settings as in flow_set_conditions.
+        copy_results=True copies the results too. Then flow_solve."""
+        return await _timed(flow.flow_clone, session, name, new_name, velocity_mps, pressure_pa, temperature_k,
+                            mesh_level, domain_m, min_gap_mm, copy_results, timeout_s=660)
+
+    @mcp.tool()
+    async def flow_delete(name: str) -> dict:
+        """Delete a Flow project of the current document with its results (cannot be undone).
+        The reply names the project that is active afterwards."""
+        return await _timed(flow.flow_delete, session, name, timeout_s=330)
 
     @mcp.tool()
     async def flow_solve(timeout_s: float = 120.0) -> dict:
         """Save the document, mesh and solve the active Flow project, and return its goals
-        {name, value, unit} (SI). The results are then loaded into SolidWorks (Flow's Results
-        node, `results_loaded`), where the user can make cut or surface plots. A run that outlasts timeout_s (max 50 s of waiting) answers
-        {job_id, state: running}: get_job(job_id) returns the goals when it is done - never start
-        it again because the reply detached. A refused solve names Flow's reason (e.g. no
-        pressure condition on an internal flow)."""
+        {name, value, unit} (SI). SolidWorks is NOT held while it runs: the solver is a process
+        of its own, and every other tool - also on other documents - works meanwhile.
+        A run that outlasts timeout_s (max 50 s of waiting) answers {job_id, state: running}:
+        flow_status(job_id) shows the iteration, the goals' current values and the percent;
+        get_job(job_id, wait_s) returns the goals when it is done - never start it again
+        because the reply detached. When it ends the results are loaded into SolidWorks
+        (Flow's Results node, `results_loaded`). A refused solve names Flow's reason (e.g. no
+        pressure condition on an internal flow). While it runs, leave the solving document's
+        Flow project alone (no flow_set_conditions / flow_delete on it)."""
         if worker is None:
             return {"ok": False, "error": "SolidWorks tools only work on Windows with SolidWorks."}
-        busy = guard.busy_error()
-        if busy:
-            return {"ok": False, "error": busy}
-        try:
-            job = jobs.submit(worker, session, None, None, None, "flow_solve", call=flow.flow_solve)
-        except SolidWorksError as exc:
-            return {"ok": False, "error": str(exc)}
+        begun = await _timed(flow.solve_begin, session, timeout_s=120)
+        if not isinstance(begun, dict) or "op" not in begun:
+            return begun
+        request = begun
+
+        def run(job_id: str) -> dict:
+            try:
+                def on_event(event: dict) -> None:
+                    if event.get("event") == "process":
+                        jobs.update(job_id, worker_pid=event.get("pid"))
+                    elif event.get("event") == "started":
+                        jobs.update(job_id, project=event.get("project"), directory=event.get("directory"))
+                return flow.solve_run(request, on_event)
+            finally:
+                try:  # back on the COM thread, behind whatever runs there now
+                    worker.submit(lambda: flow.solve_end(session))
+                except Exception:  # noqa: BLE001 - the server is shutting down
+                    pass
+
+        job = jobs.submit_thread("flow_solve", run, {"document": os.path.basename(request["document"])})
         wait_s = max(5.0, min(float(timeout_s), jobs.SYNC_WAIT_S))
-        return jobs.answer(await jobs.wait(job["job_id"], wait_s))
+        record = await jobs.wait(job["job_id"], wait_s)
+        answer = jobs.answer(record)
+        if record.get("state") == "running":
+            answer["hint"] = (f"Still solving; SolidWorks is free meanwhile. flow_status('{job['job_id']}') shows "
+                              f"the progress, get_job('{job['job_id']}', wait_s=45) waits for the goals.")
+        return answer
+
+    @mcp.tool()
+    async def flow_status(job_id: str | None = None) -> dict:
+        """Where a flow_solve stands - answered from the solver's own files, without SolidWorks:
+        state (running | done | failed | lost), phase (preparing | meshing | meshed | solving |
+        finished), iteration, travels, cells, goals [{name, value, progress_pct, delta,
+        criteria}] with their current values, percent (the least-converged goal's progress, as
+        Flow's monitor shows it; 0 until about one travel), cpu_time_left_s. job_id: from
+        flow_solve; without it the newest flow_solve of this machine."""
+        return _local(flow.flow_status, job_id)
 
     @mcp.tool()
     async def flow_goals(service: bool = False) -> dict:
@@ -1400,8 +1489,12 @@ def register(server) -> None:
 
     @mcp.tool()
     async def flow_info() -> dict:
-        """The current document's Flow projects, the active one and its boundary conditions and goals."""
-        return await _timed(flow.flow_info, session, timeout_s=330)
+        """The current document's Flow projects and the active one: its boundary conditions and
+        goals, mesh_level, min_gap_mm (null = automatic: switched off in the project),
+        domain_m {xmin .. zmax} in metres, its folder, and from the last run the cell count
+        and iterations (last_results, last_run). Check mesh_level and domain_m before
+        comparing two projects' results."""
+        return await _timed(flow.flow_info, session, timeout_s=660)
 
     @mcp.tool()
     async def release_ui(dry_run: bool = False, clear_quarantine: bool = False) -> dict:
