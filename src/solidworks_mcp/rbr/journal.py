@@ -161,18 +161,22 @@ def write(entry: dict) -> None:
         fh.write(line + "\n")
 
 
-def record(tool: str, args: dict, result=None) -> None:
+def record(tool: str, args: dict, result=None, ms: float | None = None) -> None:
     """Journal a call that did not go through run_guarded (it never touched COM), such
-    as pressing a dialog button: what was asked and how it ended."""
+    as pressing a dialog button, or the end of a Flow solve that ran off the COM thread:
+    what was asked, how it ended and (ms) how long it took."""
     entry = {"ts": _dt.datetime.now().isoformat(timespec="milliseconds"), "pid": os.getpid(), "tool": tool,
              "args": args}
+    if ms is not None:
+        entry["ms"] = round(float(ms), 1)
     ok = result.get("ok", True) if isinstance(result, dict) else True
     entry["ok"] = ok
     if isinstance(result, dict):
         if not ok:
             entry["error"] = str(result.get("error", ""))[:2000]
         entry["result"] = _clip({k: v for k, v in result.items()
-                                 if k in ("closed", "pressed", "dialog", "method", "dialogs")})
+                                 if k in ("closed", "pressed", "dialog", "method", "dialogs", "goals", "project",
+                                          "solve_s", "warnings")})
     try:
         write(entry)
     except Exception:  # noqa: BLE001 - a full disk must not fail the call

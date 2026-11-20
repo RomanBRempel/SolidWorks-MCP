@@ -236,22 +236,20 @@ def test_w_wraps_none_lists_and_named_interfaces(fake_session):
     assert ns["W"](seg, "ISketchSegment") is seg
 
 
-def test_w_reads_type_info_and_is_loud_without_it(fake_session):
+def test_w_without_an_interface_leaves_the_members_to_resolve_on_use(fake_session):
+    """Bare W(x) used to read the object's type info and refuse without it (SolidWorks 2025
+    gives none). Now a COM object becomes a typed.Auto, whose members find their interface
+    by name when used; anything that is not a COM object passes through."""
     ns = _ns(fake_session)
-
-    class _Info:
-        def GetDocumentation(self, index):
-            return ("SketchLine", None, None, None)
 
     class _Raw:
         class _oleobj_:  # noqa: N801 - mimics pywin32's attribute
-            GetTypeInfo = staticmethod(lambda: _Info())
+            pass
 
-    raw = _Raw()
-    # 'SketchLine' resolved via mod (Ident in the fakes): wrap re-wraps the _oleobj_
-    assert ns["W"](raw) is _Raw._oleobj_
-    with pytest.raises(SolidWorksError, match="type info"):
-        ns["W"](object())
+    wrapped = ns["W"](_Raw())
+    assert isinstance(wrapped, script_tool.typed.Auto) and wrapped._oleobj_ is _Raw._oleobj_
+    plain = object()
+    assert ns["W"](plain) is plain
 
 
 def test_call_reads_properties_and_invokes_methods(fake_session):

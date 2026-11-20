@@ -22,7 +22,7 @@ from ..errors import SolidWorksError
 # `features` is aliased: namespace() has a local helper of the same name, which
 # would shadow the module inside the lambdas that need features_tools.extrude/cut.
 from . import features as features_tools
-from . import geom, journal, offset_loop, param, sketch_edit
+from . import geom, journal, offset_loop, param, sketch_edit, typed
 
 # Base class of every makepy-generated wrapper; absent in the test stubs of win32com.
 _DISPATCH_BASE = getattr(win32com.client, "DispatchBaseClass", None)
@@ -47,6 +47,8 @@ def api(obj, contains: str = "") -> dict:
     Use it before guessing a name (SW 2025 lacks some members the online help lists,
     e.g. ILoftFeatureData.StartConstraint). A raw dispatch has no list: wrap() it first.
     """
+    if isinstance(obj, typed.Auto):
+        return typed.describe(obj, contains)
     cls = type(obj)
     props = set(getattr(cls, "_prop_map_get_", {}) or {}) | set(getattr(cls, "_prop_map_put_", {}) or {})
     methods = {n for n in dir(cls) if not n.startswith("_") and callable(getattr(cls, n, None))} - props
@@ -74,14 +76,15 @@ class Namespace(dict):
     (the fast path is taken for exact dicts only); tests/rbr pins that.
     """
 
-    def __init__(self, live: dict):
+    def __init__(self, live: dict, dress=None):
         super().__init__()
         self._live = dict(live)
+        self._dress = dress   # how a resolved document object is handed to the script (typed.Auto)
 
     def __getitem__(self, key):
         resolver = self._live.get(key)
         if resolver is not None:
-            return resolver()
+            return resolver() if self._dress is None else self._dress(resolver())
         return dict.__getitem__(self, key)
 
     def __setitem__(self, key, value):
@@ -158,9 +161,12 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
     def _print(*items, sep=" ", end="\n", **_):
         out.append(sep.join(str(a) for a in items) + end)
 
-    ns = Namespace(live)
+    # Every COM object a script touches is a typed.Auto: members resolve by name over the type
+    # library, early-bound, whatever the object came from - see rbr/typed.py.
+    ns = Namespace(live, lambda obj: typed.wrap(obj, mod))
+    auto_sw = typed.Auto(sw, mod)
     ns.update({
-        "sw": sw, "swApp": sw, "mod": mod, "wrap": binding.wrap, "session": session,
+        "sw": auto_sw, "swApp": auto_sw, "mod": mod, "session": session,
         "SolidWorksError": SolidWorksError, "print": _print, "result": None,
         "MM": 0.001, "DEG": 3.141592653589793 / 180.0, "args": dict(args or {}),
     })
@@ -195,22 +201,8 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
                 raise SolidWorksError(f"The type library has no interface named '{iface}' (see mod).")
             iface = cls
         if iface is not None:
-            return binding.wrap(obj, iface)
-        if _DISPATCH_BASE is not None and isinstance(obj, _DISPATCH_BASE):
-            return obj  # already early-bound
-        oleobj = getattr(obj, "_oleobj_", obj)
-        name = None
-        try:
-            name = oleobj.GetTypeInfo().GetDocumentation(-1)[0]
-        except Exception:  # noqa: BLE001 - some SW objects expose no type info
-            pass
-        cls = getattr(mod, name, None) or getattr(mod, f"I{name}", None) if name else None
-        if cls is None:
-            raise SolidWorksError(
-                "The object exposes no usable type info"
-                + (f" ('{name}' is not in the type library)" if name else "")
-                + ": name the interface, W(x, 'ISketchSegment') or wrap(x, mod.ISketchSegment).")
-        return binding.wrap(obj, cls)
+            return typed.wrap(binding.wrap(typed.unwrap(obj), iface), mod)
+        return typed.wrap(obj, mod)   # no interface named: each member finds its own on use
 
     def call(obj, name, *call_args):
         """Read or invoke a member of a still-raw dispatch, method or property alike.
@@ -266,17 +258,64 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
             current().ClearSelection2(True)
         data = live["selmgr"]().CreateSelectData()
         count = 0
+        if typed.is_com(objs):
+            objs = [objs]   # select(obj): one object is a list of one
         for o in objs:
-            try:
-                o = W(o)
-            except SolidWorksError:
-                pass  # no type info: try it as it came
+            o = typed.wrap(o, mod)
             try:
                 ok = o.Select4(True, data, False)
             except TypeError:
                 ok = o.Select4(True, data)
             count += 1 if ok else 0
         return count
+
+    def suppress(names, on=True):
+        """Suppress (on=True) or bring back (on=False) features by tree name, all in ONE
+        SolidWorks operation: {ok, suppressed: {name: state}}. EditSuppress2 / EditUnsuppress2
+        act on the selection, which this makes first."""
+        wanted = [names] if isinstance(names, str) else list(names)
+        doc = current()
+        feats = [feature(n) for n in wanted]
+        doc.ClearSelection2(True)
+        for f in feats:
+            if not f.Select2(True, 0):
+                doc.ClearSelection2(True)
+                raise SolidWorksError(f"Could not select feature '{f.Name}'.")
+        done = bool(doc.EditSuppress2() if on else doc.EditUnsuppress2())
+        doc.ClearSelection2(True)
+        return {"ok": done, "suppressed": {n: bool(feature(n).IsSuppressed()) for n in wanted}}
+
+    def save(path=None):
+        """Save the current document: in place, or to `path` (a new file; the document
+        then lives there). Raises when SolidWorks does not save. model.Save3(1, 0, 0)
+        itself returns (ok, errors, warnings)."""
+        doc = session._require_model()
+        if path is not None:
+            return session.save_assembly(path) if int(doc.GetType()) == SW_DOC_ASSEMBLY else session.save_part(path)
+        where = doc.GetPathName()
+        if not where:
+            raise SolidWorksError(f"'{doc.GetTitle()}' was never saved: save(path).")
+        ok, errors, warnings = doc.Save3(1, 0, 0)
+        if not ok:
+            raise SolidWorksError(f"SolidWorks did not save '{where}' (errors {errors}, warnings {warnings}).")
+        return {"saved": where, "warnings": int(warnings or 0)}
+
+    def open_doc(path):
+        """Open a part or an assembly by path - or switch to it when it is open already - and
+        make it the current document; returns its IModelDoc2. (sw.OpenDoc6(path, type,
+        options, config, 0, 0) itself returns (doc, errors, warnings) and does not make
+        the document current for the tools.)"""
+        import os
+        full = os.path.normcase(os.path.abspath(path))
+        for doc in session._open_documents():
+            if os.path.normcase(doc.GetPathName() or "") == full:
+                session.activate_document(doc.GetTitle())
+                return session._model
+        if full.endswith(".sldasm"):
+            session.open_assembly(path)
+        else:
+            session.open_part(path)
+        return session._model
 
     def feature(name):
         """A feature of the current document by its tree name (early-bound IFeature)."""
@@ -434,7 +473,7 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
                          "normal": [float(c) for c in row[6:9]]})
         return hits
 
-    from . import batch, cavity, query, section, sketch_datum, sweep, tree   # here: they import this package's parts
+    from . import batch, cavity, query, section, sketch_datum, sketch_move, sweep, tree   # here: they import this package's parts
 
     def body_box(body=None):
         """A body's TIGHT box in mm ({min_mm, max_mm, size_mm}) from its extreme points; body:
@@ -471,6 +510,7 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         add_dimension=lambda sketch, entities, **kw: sketch_datum.add_dimension(session, sketch, entities, **kw),
         sketch_fillet=lambda sketch, corners, radius_mm, **kw: sketch_datum.sketch_fillet(
             session, sketch, corners, radius_mm, **kw),
+        sketch_move=lambda sketch, **kw: sketch_move.sketch_move(session, sketch, **kw),
         sketch_intersection=lambda **kw: cavity.sketch_intersection(session, **kw),
         sketch_trim_region=lambda sketch, keep_box, max_trims=80: cavity.sketch_trim_region(
             session, sketch, keep_box, max_trims),
@@ -480,8 +520,9 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         loft_cut=lambda sketches, **kw: cavity.loft_cut(session, sketches, **kw),
         cut_offset_from_surface=lambda sketch, face, offset_mm, toward, **kw: cavity.cut_offset_from_surface(
             session, sketch, face, offset_mm, toward, **kw))
-    ns.update(comp=comp, select=select, feature=feature, features=features, api=api, swapp=sw,
-              W=W, call=call, segments=segments, relations=relations,
+    ns.update(comp=comp, select=select, feature=feature, features=features, api=api, swapp=auto_sw,
+              W=W, wrap=W, call=call, segments=segments, relations=relations,
+              suppress=suppress, save=save, open_doc=open_doc,
               vec=vec, pt=pt, ui_unlocked=ui_unlocked, tree_before=tree_before,
               features_added=features_added, rename_new=rename_new, combine=combine,
               new_part=new_part, activate=activate, rays=rays,
@@ -508,6 +549,12 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
               mirror_features=lambda feats, plane, name="Mirror": param.mirror_features(session, feats, plane, name),
               mirror_body=lambda body, plane, merge=True: geom.mirror_body(session, body, plane, merge),
               whats_wrong=lambda: geom.whats_wrong(session))
+    # the helpers hand out and take the same Auto objects as the rest of the script
+    import types
+    keep = {"print", "api", "W", "wrap", "call", "ui_unlocked", "vec"}
+    for key, value in list(dict.items(ns)):
+        if isinstance(value, types.FunctionType) and key not in keep:
+            dict.__setitem__(ns, key, typed.returning(value, mod))
     try:
         import numpy as np  # optional: present when installed with `--with numpy`
         ns["np"] = np
@@ -562,7 +609,11 @@ def _close_open_sketch(session) -> str | None:
             return None
         name = None
         try:
-            name = binding.wrap(sketch, session._mod.IFeature).Name
+            # the sketch AS a feature, asked for by interface: binding it as IFeature without
+            # asking read another member under the same number (the "name" was a matrix)
+            name = typed.Auto(sketch, session._mod).Name
+            if not isinstance(name, str):
+                name = None
         except Exception:  # noqa: BLE001
             pass
         model.ClearSelection2(True)

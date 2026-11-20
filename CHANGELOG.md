@@ -5,6 +5,83 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Added / Fixed (rbr 1.12.0) - Flow off the COM thread, one COM typing for scripts, sketch_move, chains
+Verified on a live SolidWorks 2025 SP3 + Flow Simulation 2025 (2026-11-20), each
+with a scenario run through the real FastMCP server object from a separate
+process: Flow 37 + 14 checks, COM typing 29 + 6, sketch_move 27, chain and static
+body 30 + 7 (the second figures: on a real 0.86 M cell model and while its
+solve was running).
+- flow_solve no longer holds SolidWorks. The solve ran as a job ON the COM
+  thread, which waited for the Flow worker process: for the 20-25 minutes of a
+  1.3 M cell run every other call answered "SolidWorks is busy". SolidWorks
+  itself was never busy - measured during a solve: 6-70 ms per API call, a part
+  built in another document. Now the document is saved and Flow's questions are
+  switched off on the COM thread (solve_begin), the worker is waited for on a
+  thread of its own (jobs.submit_thread), and the questions come back when it
+  ends. Other tools, other documents included, work meanwhile.
+- flow_status(job_id=None): state, phase, iteration, travels, cells, every
+  goal's current value / progress / delta / criteria, percent, CPU time left -
+  read from the solver's own <n>.info.json in the project folder, no SolidWorks
+  call. server_health lists the running solves (flow_solves).
+- Computational domain: flow_create_project / flow_set_conditions / flow_clone
+  take domain_m ({'x': [min, max], ...} or six numbers); flow_info reports it.
+  The access violation that kept the domain "automatic only" (2026-11-02) did
+  not reproduce on the same build; the domain is read and set in a worker call
+  of its own, so a crash there costs that one answer.
+- Minimum gap size: min_gap_mm is set where the project has it switched on (a
+  cloned project, a template made with it); the Flow API has no way to switch
+  it on, and the refusal says how to get such a template.
+- Projects: flow_activate(name), flow_clone(name, new_name, velocity_mps, ...)
+  (the next angle of attack in one call), flow_delete(name) (the first project
+  left becomes active).
+- Mesh level: flow_create_project(mesh_level=5) - a template's own level is no
+  longer used silently (an external-air template left at 3 gave a lift 25 %
+  low). flow_info shows mesh_level, min_gap_mm, domain_m, the project folder
+  and the last run's cells and iterations.
+- run_script: one behaviour for every COM object (rbr/typed.py). Objects the
+  type library only calls IDispatch (swApp.ActiveDoc, items of GetParents /
+  GetFaces / GetComponents, GetSpecificFeature2) arrived late-bound: a method
+  without arguments ran when merely named (doc.GetTitle was the string), and
+  Select4 / SelectByID2 / Save3 / OpenDoc6 refused plain arguments with "type
+  mismatch" - so the same line worked on one object and failed on the next.
+  Every object a script touches is now a typed.Auto: a member is resolved by
+  name over the type library's interfaces (the object is asked by
+  QueryInterface which of them it supports) and called early-bound; results
+  are wrapped the same way. Methods take parentheses, out-parameters return a
+  tuple - or fill the VARIANT(VT_BYREF) a late-bound style call passes. A
+  member of another interface of the same object is found too
+  (model.GetBodies2 on a part). Objects that are not SolidWorks' own - an
+  add-in's API from swApp.GetAddInObject (Flow, SolidCAM) - support none of
+  those interfaces and keep late binding, so scripts written against them run
+  unchanged (checked with a saved Flow sampling script). New helpers:
+  suppress(names, on), save(), open_doc(path); select(obj) takes one object.
+- sketch_move(sketch, delta_mm | target_mm, filter, anchor, break_relations):
+  moves sketch geometry as ONE Move Entities operation and compares every point
+  before and after. SetCoords per point moved a constrained rectangle 14 mm for
+  7. Geometry placed by dimensions is moved by releasing the driving dimensions
+  for the move and locking them at what they measure then; a shortfall (a
+  relation to the origin, a dimension set by an equation) puts the sketch back
+  and names the cause.
+- rebuild_chain(root, folder, save, close_opened, dry_run): finds the parts
+  derived from root - through any number of levels - from the files on disk
+  (GetDocumentDependencies2), and rebuilds and saves them sources first,
+  loading each without a window and activating nothing; returns every body's
+  volume before and after and the seconds each part took. A part whose links
+  to the chain are broken (a static copy) is skipped; a part that came out
+  unchanged is not rewritten; the document in front stays in front.
+- export_static_body(body, path, suppress, unsuppress): a body as a part file
+  with no link back, in one call; features are switched for the moment and the
+  source part is left exactly as it was (checked: suppression states and body
+  volumes).
+- get_job(job_id, wait_s): waits up to wait_s (capped at the reply window) for
+  the job to finish. It had no way to wait at all, and a job of another server
+  process could not be waited for.
+- Fixed: a script queued behind another one was silently dropped when its
+  synchronous wait ran out before its turn (asyncio.wait_for cancelled the
+  job's future, and the COM worker skips a cancelled job).
+- Fixed: the name of a sketch a failed script had left open was read through
+  the wrong interface and came out as a transform matrix.
+
 ### Fixed (rbr 1.11.0) - SolidWorks running out of GDI objects and crashing
 Verified on a live SolidWorks 2025 SP3 with `scripts/live_crash_scenario.py` (a
 cube, two assemblies of 70 components, 6 tree folders each, ReorderComponents,

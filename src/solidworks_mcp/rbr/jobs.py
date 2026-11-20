@@ -137,6 +137,86 @@ def submit(worker, session, code: str | None, args: dict | None = None,
     return dict(job)
 
 
+def submit_thread(tool: str, run, extra: dict | None = None) -> dict:
+    """A job that runs in a thread of its own and NOT on the COM worker: work that waits
+    on another process (a Flow solve), during which SolidWorks must stay usable.
+
+    `run(job_id)` returns the result dict or raises; it may call update(job_id, ...) to
+    add fields (the solver's folder) while it runs. Same record, file and get/wait as
+    the COM jobs."""
+    import concurrent.futures
+    cleanup()
+    job_id = uuid.uuid4().hex[:12]
+    job = {"job_id": job_id, "state": "running", "tool": tool, "script": None, "pid": os.getpid(),
+           "submitted": _now(), "started": _now(), **(extra or {})}
+    fut = concurrent.futures.Future()
+    with _lock:
+        _jobs[job_id] = job
+        _futures[job_id] = fut
+    _write(job)
+    try:  # latest(tool) finds it without reading every record
+        with open(os.path.join(jobs_dir(), f"latest-{tool}.txt"), "w", encoding="utf-8") as fh:
+            fh.write(job_id)
+    except OSError:
+        pass
+
+    def body():
+        t0 = time.perf_counter()
+        end = {}
+        try:
+            result = run(job_id)
+        except SolidWorksError as exc:
+            end.update(state="failed", error=str(exc))
+        except Exception as exc:  # noqa: BLE001 - the job must end in a readable record
+            end.update(state="failed", error=f"{type(exc).__name__}: {exc}",
+                       traceback=traceback.format_exc(limit=6))
+        else:
+            failed = isinstance(result, dict) and not result.get("ok", True)
+            end.update(state="failed" if failed else "done", result=result)
+            if failed:
+                end["error"] = str(result.get("error", "failed"))
+        finally:
+            end.update(finished=_now(), elapsed_s=round(time.perf_counter() - t0, 3))
+            _write({**job, **end})
+            job.update(end)
+            fut.set_result(job)
+
+    threading.Thread(target=body, name=f"job-{job_id}", daemon=True).start()
+    return dict(job)
+
+
+def update(job_id: str, **fields) -> None:
+    """Add fields to a running job's record (memory and file)."""
+    with _lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return
+        job.update(fields)
+        _write(dict(job))   # under the lock: whoever sees the field in memory finds it in the file too
+
+
+def latest(tool: str) -> dict | None:
+    """The newest thread job of `tool` over all server processes (None when there is none
+    within KEEP_H): the one submit_thread last noted in latest-<tool>.txt."""
+    try:
+        with open(os.path.join(jobs_dir(), f"latest-{tool}.txt"), encoding="utf-8") as fh:
+            job_id = fh.read().strip()
+        return get(job_id) if job_id else None
+    except (OSError, SolidWorksError):
+        return None
+
+
+def running(tool: str) -> list:
+    """The jobs of `tool` still running: this process' own, and the newest one of the
+    machine when another server process runs it. Memory and one small file: for server_health."""
+    with _lock:
+        out = [dict(j) for j in _jobs.values() if j.get("tool") == tool and j.get("state") == "running"]
+    newest = latest(tool)
+    if newest and newest.get("state") == "running" and all(newest["job_id"] != j["job_id"] for j in out):
+        out.append(newest)
+    return out
+
+
 def get(job_id: str) -> dict:
     """The job record: this process' memory first, then the file another process wrote."""
     with _lock:
@@ -171,18 +251,38 @@ def list_jobs(last_n: int = 10) -> dict:
     return {"ok": True, "count": len(records), "jobs": records}
 
 
+POLL_S = 0.5
+
+
+def finished(record: dict) -> bool:
+    return record.get("state") in ("done", "failed")
+
+
 async def wait(job_id: str, wait_s: float) -> dict:
-    """Wait up to wait_s for the job to finish; returns its record either way."""
+    """Wait up to wait_s for the job to finish; returns its record either way.
+
+    A job of this process is awaited on its future. A job of ANOTHER server process (the
+    record came from its file) is polled until its file says done or failed: get_job used
+    to answer such a job at once, whatever wait it was given."""
     with _lock:
         fut = _futures.get(job_id)
-    if fut is not None and wait_s > 0:
+    if wait_s <= 0:
+        return get(job_id)
+    if fut is not None:
         try:
-            await asyncio.wait_for(asyncio.wrap_future(fut), wait_s)
+            # shield: the timeout must not cancel the job's own future
+            await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(fut)), wait_s)
         except asyncio.TimeoutError:
             pass
         except Exception:  # noqa: BLE001 - the record carries the error
             pass
-    return get(job_id)
+        return get(job_id)
+    deadline = time.monotonic() + wait_s
+    record = get(job_id)
+    while not finished(record) and time.monotonic() < deadline:
+        await asyncio.sleep(min(POLL_S, max(0.0, deadline - time.monotonic())))
+        record = get(job_id)
+    return record
 
 
 def answer(record: dict) -> dict:
