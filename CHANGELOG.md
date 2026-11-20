@@ -8,7 +8,9 @@ All notable changes to this project are documented here. This project follows
 ### Added / Fixed (rbr 1.12.0) - Flow off the COM thread, one COM typing for scripts, sketch_move, chains
 Verified on a live SolidWorks 2025 SP3 + Flow Simulation 2025 (2026-11-20), each
 with a scenario run through the real FastMCP server object from a separate
-process: Flow 37 checks, COM typing 29, sketch_move 27, chain and static body 30.
+process: Flow 37 + 14 checks, COM typing 29 + 6, sketch_move 27, chain and static
+body 30 + 7 (the second figures: on a real 0.86 M cell model and while its
+solve was running).
 - flow_solve no longer holds SolidWorks. The solve ran as a job ON the COM
   thread, which waited for the Flow worker process: for the 20-25 minutes of a
   1.3 M cell run every other call answered "SolidWorks is busy". SolidWorks
@@ -48,8 +50,11 @@ process: Flow 37 checks, COM typing 29, sketch_move 27, chain and static body 30
   are wrapped the same way. Methods take parentheses, out-parameters return a
   tuple - or fill the VARIANT(VT_BYREF) a late-bound style call passes. A
   member of another interface of the same object is found too
-  (model.GetBodies2 on a part). New helpers: suppress(names, on), save(),
-  open_doc(path); select(obj) takes one object.
+  (model.GetBodies2 on a part). Objects that are not SolidWorks' own - an
+  add-in's API from swApp.GetAddInObject (Flow, SolidCAM) - support none of
+  those interfaces and keep late binding, so scripts written against them run
+  unchanged (checked with a saved Flow sampling script). New helpers:
+  suppress(names, on), save(), open_doc(path); select(obj) takes one object.
 - sketch_move(sketch, delta_mm | target_mm, filter, anchor, break_relations):
   moves sketch geometry as ONE Move Entities operation and compares every point
   before and after. SetCoords per point moved a constrained rectangle 14 mm for
@@ -61,7 +66,9 @@ process: Flow 37 checks, COM typing 29, sketch_move 27, chain and static body 30
   derived from root - through any number of levels - from the files on disk
   (GetDocumentDependencies2), and rebuilds and saves them sources first,
   loading each without a window and activating nothing; returns every body's
-  volume before and after.
+  volume before and after and the seconds each part took. A part whose links
+  to the chain are broken (a static copy) is skipped; a part that came out
+  unchanged is not rewritten; the document in front stays in front.
 - export_static_body(body, path, suppress, unsuppress): a body as a part file
   with no link back, in one call; features are switched for the moment and the
   source part is left exactly as it was (checked: suppression states and body

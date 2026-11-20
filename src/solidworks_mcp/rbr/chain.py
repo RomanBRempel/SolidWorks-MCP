@@ -90,13 +90,23 @@ def objections(chain: list, open_docs: dict, owners: dict, own_pid: int, save: b
     return out
 
 
+def follows(references: list, chain_keys) -> bool:
+    """Does a part with these external references (derive._refs rows) take anything from the
+    chain through a link that is alive? Pure."""
+    members = set(chain_keys)
+    return any(r.get("file") and key(r["file"]) in members and r.get("status") not in derive.DEAD
+               for r in references)
+
+
 def summary(rows: list) -> dict:
     """Totals over the per-part rows; pure."""
     changed = [r["part"] for r in rows if r.get("changed")]
     failed = [r["part"] for r in rows if r.get("error") or r.get("failing_features") or r.get("rebuild_ok") is False]
-    return {"count": len(rows), "changed": changed, "unchanged": [r["part"] for r in rows
-                                                                 if not r.get("changed") and r["part"] not in failed],
-            "failed": failed, "saved": [r["part"] for r in rows if r.get("saved")]}
+    skipped = [r["part"] for r in rows if r.get("skipped")]
+    return {"count": len(rows), "changed": changed,
+            "unchanged": [r["part"] for r in rows
+                          if not r.get("changed") and r["part"] not in failed and r["part"] not in skipped],
+            "failed": failed, "saved": [r["part"] for r in rows if r.get("saved")], "skipped": skipped}
 
 
 # --- SolidWorks ---------------------------------------------------------------------------------
@@ -220,7 +230,15 @@ def rebuild_chain(session, root=None, folder=None, save: bool = True, close_open
                     loaded.append(doc.GetTitle())
                     row["loaded_here"] = True
                 with derive.as_current(session, doc):
+                    if k != root_key and not follows(derive._refs(session, doc), order):
+                        # e.g. what export_static_body wrote: the file still names its source,
+                        # but the link is cut - rebuilding and saving it would change nothing
+                        row["skipped"] = ("its references to the chain are broken or locked: it does not "
+                                          "follow the master")
+                        row["seconds"] = round(time.perf_counter() - started, 1)
+                        continue
                     before = _volumes(session)
+                    unsaved_before = bool(doc.GetSaveFlag())
                     row["rebuild_ok"] = bool(doc.ForceRebuild3(False))
                     after = _volumes(session)
                     row["bodies"] = derive.volume_changes(before, after)
@@ -234,7 +252,9 @@ def rebuild_chain(session, root=None, folder=None, save: bool = True, close_open
                         note = derive.verdict(refs)
                         if note:
                             row["warning"] = note
-                    if save and bool(doc.GetSaveFlag()):
+                    # a rebuild alone marks a document as changed: a part whose bodies came out
+                    # the same and that had nothing unsaved is left as it is on disk
+                    if save and (row["changed"] or unsaved_before):
                         got = doc.Save3(SW_SAVE_SILENT, 0, 0)
                         ok = got[0] if isinstance(got, tuple) else got
                         if not ok:

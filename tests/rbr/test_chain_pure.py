@@ -64,9 +64,10 @@ def test_the_summary_sorts_the_parts():
             {"part": "F1", "changed": True, "rebuild_ok": True, "saved": True},
             {"part": "F2", "changed": True, "rebuild_ok": True, "failing_features": [{"name": "Cut1"}]},
             {"part": "F3", "error": "SolidWorks did not save it"}]
+    rows.append({"part": "frozen", "skipped": "its references to the chain are broken"})
     got = chain.summary(rows)
-    assert got == {"count": 4, "changed": ["F1", "F2"], "unchanged": ["fuselage"], "failed": ["F2", "F3"],
-                   "saved": ["F1"]}
+    assert got == {"count": 5, "changed": ["F1", "F2"], "unchanged": ["fuselage"], "failed": ["F2", "F3"],
+                   "saved": ["F1"], "skipped": ["frozen"]}
     assert "parts" not in got        # the reply's `parts` is the table itself
 
 
@@ -104,3 +105,12 @@ def test_unknown_and_contradictory_features_are_refused():
         derive.state_changes(STATES, ["Nope"], None)
     with pytest.raises(SolidWorksError, match="both to suppress and to unsuppress"):
         derive.state_changes(STATES, ["Boss"], ["Boss"])
+
+
+def test_a_part_follows_only_through_a_live_link_to_the_chain():
+    refs = [{"file": "C:/proj/fuselage.SLDPRT", "status": "broken"}, {"file": "C:/other/x.SLDPRT", "status": "in context"}]
+    assert chain.follows(refs, [FUS, F1]) is False                    # what export_static_body leaves
+    assert chain.follows([{"file": "c:/proj/FUSELAGE.sldprt", "status": "in context"}], [FUS]) is True
+    assert chain.follows([{"file": "C:/proj/fuselage.SLDPRT", "status": "out of context"}], [FUS]) is True
+    assert chain.follows([{"file": "C:/proj/fuselage.SLDPRT", "status": "locked"}], [FUS]) is False
+    assert chain.follows([], [FUS]) is False and chain.follows([{"file": None, "status": "in context"}], [FUS]) is False
