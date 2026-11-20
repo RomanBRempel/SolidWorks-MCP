@@ -273,14 +273,10 @@ def sketch_move(session, sketch: str, delta_mm=None, target_mm=None, filter=None
         # (a dimension an equation sets does not report itself as driving: look at them all)
         tied = {name: by_equation[name.lower()] for name, _dim in dims if name.lower() in by_equation}
 
-        def rest() -> tuple:
-            """What the first selected point still lacks of the move, and the points that are off."""
+        def off() -> tuple:
+            """(the selected points that are not at before + vector, all points now)."""
             now = _all_points(session, open_sketch)
-            missing = shortfall(before, now, ids, du, dv)
-            if not ids:
-                return 0.0, 0.0, missing, now
-            key = ids[0]
-            return before[key][0] + du - now[key][0], before[key][1] + dv - now[key][1], missing, now
+            return shortfall(before, now, ids, du, dv), now
 
         def release(on: bool) -> None:
             for name, dim in driving:
@@ -289,7 +285,7 @@ def sketch_move(session, sketch: str, delta_mm=None, target_mm=None, filter=None
 
         how = "free"
         _move(session, segments, du, dv, True)
-        rest_u, rest_v, missing, after = rest()
+        missing, after = off()
         if missing and driving:
             # dimensions hold the selection: release them, move the rest of the way, lock them again
             # (from where it started: a first move that went part of the way may have bent the shape)
@@ -300,7 +296,7 @@ def sketch_move(session, sketch: str, delta_mm=None, target_mm=None, filter=None
                 _move(session, segments, du, dv, True)
             finally:
                 release(False)
-            rest_u, rest_v, missing, after = rest()
+            missing, after = off()
         if missing and break_relations:
             how = "relations to the rest broken"
             release(True)
@@ -309,7 +305,7 @@ def sketch_move(session, sketch: str, delta_mm=None, target_mm=None, filter=None
                 _move(session, segments, du, dv, False)
             finally:
                 release(False)
-            rest_u, rest_v, missing, after = rest()
+            missing, after = off()
         changed = {}
         for name, dim in dims:
             now_value = float(dim.SystemValue)

@@ -121,6 +121,7 @@ def mod(monkeypatch):
     module = types.SimpleNamespace(**{c.__name__: c for c in CLASSES})
     typed.index(module, CLASSES)
     monkeypatch.setattr(typed.pythoncom, "com_error", _NoInterface, raising=False)
+    monkeypatch.setattr(typed, "_late_bound", lambda oleobj: oleobj)   # a fake dispatch has no members
     yield module
     typed._INDEX.pop(id(module), None)
     typed._KNOWN.pop(id(module), None)
@@ -203,9 +204,49 @@ def test_an_unsupported_member_names_the_interfaces_that_have_it(mod):
         feat.Nope
 
 
-def test_an_object_that_answers_no_interface_id_is_bound_as_the_likeliest(mod):
-    doc = typed.Auto(_Dispatch(), mod)      # QueryInterface refuses everything
-    assert doc.GetTitle() == "Part1"         # the first candidate, on the dispatch as it is
+class _AddIn:
+    """An add-in's API object as win32com shows it late-bound: its own members, by name."""
+
+    Version = "2025"
+
+    def __init__(self):
+        self.calls = []
+        self.silent = False
+
+    def GetAPI(self):
+        return _Dispatch()                    # another object of the add-in
+
+    def GetDocument(self, doc):
+        self.calls.append(doc)
+        return "flow-doc"
+
+    def GetTitle(self):                       # the same NAME as a SolidWorks member: still the add-in's
+        return "add-in title"
+
+
+def test_an_add_ins_object_resolves_its_members_itself(mod, monkeypatch):
+    """swApp.GetAddInObject('FloWorks.App') supports no interface of the SolidWorks type
+    library: binding one of them to it would call the wrong member. Its own lookup decides."""
+    addin = _AddIn()
+    monkeypatch.setattr(typed, "_late_bound", lambda oleobj: addin)
+    obj = typed.Auto(_Dispatch(), mod)        # QueryInterface refuses every SolidWorks interface
+    assert obj.GetTitle() == "add-in title"   # not IModelDoc2.GetTitle bound blindly
+    assert obj.Version == "2025"
+    assert isinstance(obj.GetAPI(), typed.Auto)                       # results stay wrapped
+    model = typed.Auto(IModelDoc2(_Dispatch("doc2")), mod)
+    assert obj.GetDocument(model) == "flow-doc" and type(addin.calls[0]) is IModelDoc2   # arguments unwrapped
+    obj.silent = True
+    assert addin.silent is True
+    with pytest.raises(AttributeError, match="No SolidWorks interface has a member 'Nope'"):
+        obj.Nope
+
+
+def test_an_auto_answers_the_dispatch_calls_a_wrapper_class_makes(mod):
+    raw = _Dispatch("feat")
+    raw.InvokeTypes = lambda *a: ("invoked", a)
+    auto = typed.Auto(raw, mod)
+    assert auto.InvokeTypes(5, 0, 1) == ("invoked", (5, 0, 1))        # mod.IFeature(auto) works on it
+    assert auto.QueryInterface("feat") is raw
 
 
 def test_auto_arguments_are_unwrapped_also_inside_lists(mod):

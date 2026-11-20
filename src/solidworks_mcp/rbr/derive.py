@@ -20,6 +20,7 @@ status, referenced entity, feature component, configuration option and name);
 status 3 = in context for a body saved from an open master.
 """
 
+import contextlib
 import os
 
 from .. import binding
@@ -83,6 +84,18 @@ def volume_changes(before: dict, after: dict) -> list:
 
 
 # --- reading ----------------------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def as_current(session, doc):
+    """The session's helpers read `session._model`: point them at `doc` for a while. Nothing
+    is activated in SolidWorks, so the document in front stays in front."""
+    held = session._model
+    session._model = doc
+    try:
+        yield
+    finally:
+        session._model = held
 
 
 def _open_by_path(session) -> dict:
@@ -248,4 +261,151 @@ def update_external_refs(session, load_sources: bool = True) -> dict:
                                                   "in memory - save the source too")
     if note:
         result["warning"] = note
+    return result
+
+
+# --- a static copy of a body --------------------------------------------------------------------
+
+
+def state_changes(states: dict, suppress, unsuppress) -> tuple:
+    """(to suppress, to unsuppress) among the named features, given {name: suppressed now};
+    pure. A feature already in the wanted state is left out; an unknown name, or one named
+    in both lists, is refused."""
+    off = [suppress] if isinstance(suppress, str) else list(suppress or ())
+    on = [unsuppress] if isinstance(unsuppress, str) else list(unsuppress or ())
+    unknown = [n for n in [*off, *on] if n not in states]
+    if unknown:
+        raise SolidWorksError(f"No feature named {', '.join(repr(n) for n in unknown)} (list_features shows them).")
+    both = [n for n in off if n in on]
+    if both:
+        raise SolidWorksError(f"{', '.join(both)}: named both to suppress and to unsuppress.")
+    return [n for n in dict.fromkeys(off) if not states[n]], [n for n in dict.fromkeys(on) if states[n]]
+
+
+def _suppression(session) -> dict:
+    return {feat.Name: bool(feat.IsSuppressed()) for feat in session._history()}
+
+
+def _set_suppressed(session, names: list, on: bool) -> None:
+    """Suppress / unsuppress the named features in one SolidWorks operation."""
+    if not names:
+        return
+    model = session._require_model()
+    wanted = set(names)
+    feats = [feat for feat in session._history() if feat.Name in wanted]
+    model.ClearSelection2(True)
+    for feat in feats:
+        if not feat.Select2(True, 0):
+            model.ClearSelection2(True)
+            raise SolidWorksError(f"Could not select feature '{feat.Name}'.")
+    done = model.EditSuppress2() if on else model.EditUnsuppress2()
+    model.ClearSelection2(True)
+    if not done:
+        raise SolidWorksError(f"SolidWorks did not {'suppress' if on else 'unsuppress'} {', '.join(names)}.")
+
+
+def export_static_body(session, body, path: str, suppress=None, unsuppress=None) -> dict:
+    """A body (or several) of the current part as a part file of its own WITHOUT a link back:
+    a plain solid that no later change of this part reaches - for a print, a hand-over, a
+    frozen revision. One call for what took six: the features named in `suppress` /
+    `unsuppress` are switched for the moment (a body that a later feature deletes or
+    merges exists only with that feature suppressed), the body is saved to `path`, the new
+    part's external references are broken, it is saved and closed, and this part is put
+    back exactly as it was - the same features suppressed, the same bodies and volumes,
+    and saved again only if it had no unsaved changes before.
+    The current part must have been saved once (SolidWorks writes the new part from it)."""
+    model = session._require_model()
+    session._require_part()
+    title = model.GetTitle()
+    if not model.GetPathName():
+        raise SolidWorksError("Save this part first (save_part): SolidWorks writes the new part from its file.")
+    names = bodies_mod.as_names(body)
+    target = os.path.abspath(path)
+    if not target.lower().endswith(".sldprt"):
+        target += ".SLDPRT"
+    if os.path.exists(target):
+        raise SolidWorksError(f"{target} exists; give a new file name.")
+    was_modified = bool(model.GetSaveFlag())
+    states = _suppression(session)
+    volumes_before = _volumes(session)
+    to_suppress, to_unsuppress = state_changes(states, suppress, unsuppress)
+    result = {"ok": True, "source": title}
+    switched = False
+    try:
+        if to_suppress or to_unsuppress:
+            switched = True
+            _set_suppressed(session, to_suppress, True)
+            _set_suppressed(session, to_unsuppress, False)
+            model.ForceRebuild3(False)
+        available = _volumes(session)
+        missing = [n for n in names if n not in available]
+        if missing:
+            raise SolidWorksError(
+                f"No body {', '.join(repr(n) for n in missing)} in this state of the part (bodies now: "
+                f"{', '.join(available) or 'none'}). Name in suppress / unsuppress the features that must be "
+                "switched for the body to exist.")
+        source_volume = round(sum(available[n] or 0.0 for n in names), 3)
+        # the new part is loaded without a window of its own (a window costs SolidWorks about
+        # 250 GDI objects) and is never activated: this part stays in front throughout
+        session._sw.DocumentVisible(False, SW_DOC_PART)
+        try:
+            made = bodies_mod.save_bodies(session, names, target, False)
+        finally:
+            session._sw.DocumentVisible(True, SW_DOC_PART)
+        new_doc = _open_by_path(session).get(os.path.normcase(made["path"]))
+        if new_doc is None:
+            raise SolidWorksError(f"SolidWorks wrote {made['path']} but did not keep it open: its link to this "
+                                  "part could not be broken. Delete the file and try again.")
+        new_title = new_doc.GetTitle()
+        try:
+            with as_current(session, new_doc):
+                ext = binding.wrap(new_doc.Extension, session._mod.IModelDocExtension)
+                ext.BreakAllExternalFileReferences2(False)
+                new_doc.ForceRebuild3(False)
+                refs = _refs(session, new_doc)
+                alive = [r for r in refs if r["status"] not in DEAD]
+                volumes = _volumes(session)
+                got = new_doc.Save3(1, 0, 0)
+            if not (got[0] if isinstance(got, tuple) else got):
+                raise SolidWorksError(f"SolidWorks did not save {made['path']} (answer {got}).")
+            result.update(path=made["path"], bodies=made["bodies"], size_bytes=os.path.getsize(made["path"]),
+                          volume_mm3=round(sum(v or 0.0 for v in volumes.values()), 3),
+                          source_volume_mm3=source_volume, references_broken=len(refs) - len(alive),
+                          static=not alive)
+            if alive:
+                result["warning"] = (f"{len(alive)} external reference(s) are still alive "
+                                     f"({', '.join(str(r['feature']) for r in alive)}): the part still follows "
+                                     "this one.")
+            if abs(result["volume_mm3"] - source_volume) > 1e-3 * max(1.0, source_volume):
+                result["warning"] = ((result.get("warning") + "; ") if result.get("warning") else "") + \
+                    "the exported volume differs from the body's"
+        finally:
+            try:
+                session._sw.CloseDoc(new_title)
+            except Exception:  # noqa: BLE001
+                pass
+    finally:
+        if switched:
+            model = session._require_model()
+            now = _suppression(session)
+            _set_suppressed(session, [n for n, was in states.items() if was and now.get(n) is False], True)
+            _set_suppressed(session, [n for n, was in states.items() if not was and now.get(n) is True], False)
+            model.ForceRebuild3(False)
+    model = session._require_model()
+    left = {n: s for n, s in _suppression(session).items() if states.get(n) != s}
+    volumes_after = _volumes(session)
+    same = not left and volumes_after == volumes_before
+    source = {"unchanged": same, "had_unsaved_changes": was_modified}
+    if left:
+        source["suppression_differs"] = left
+    if volumes_after != volumes_before:
+        source["bodies"] = volume_changes(volumes_before, volumes_after)
+    if switched and same and not was_modified:
+        got = model.Save3(1, 0, 0)      # it was clean before: it is clean again, with the same content
+        source["saved_again"] = bool(got[0] if isinstance(got, tuple) else got)
+    result["source_part"] = source
+    if not same:
+        result["ok"] = False
+        result["error"] = ("The body was exported, but this part is not as it was (source_part shows the "
+                           "difference): check it before saving.")
     return result

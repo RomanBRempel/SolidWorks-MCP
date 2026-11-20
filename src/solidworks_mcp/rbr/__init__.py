@@ -11,9 +11,10 @@ instead of `solidworks-mcp`.
 import asyncio
 import functools
 import os
+import time
 
 from ..errors import SolidWorksError
-from . import (apiref, assembly, batch, bodies as bodies_mod, cavity, context, derive, dialogs, equations,
+from . import (apiref, assembly, batch, bodies as bodies_mod, cavity, chain, context, derive, dialogs, equations,
                export_check,
                fastpath,
                features,
@@ -24,12 +25,12 @@ from . import (apiref, assembly, batch, bodies as bodies_mod, cavity, context, d
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.11.0"
+RBR_VERSION = "1.12.0"
 
 INSTRUCTIONS = """
 
 RBR extension (solidworks-mcp-rbr)
-- Batch work goes in ONE run_script call (sw, model, ext, fm, asm/part, comp(), feature(), select(), segments(), W(), args, MM, DEG; set `result`). Prefer it over many granular calls on big parts. Items from Get* collections are late-bound and misbehave (GetType() -> "'int' object is not callable", Select4 type mismatch): take them from segments()/relations() or W() them first.
+- Batch work goes in ONE run_script call (sw, model, ext, fm, asm/part, comp(), feature(), select(), segments(), W(), args, MM, DEG; set `result`). Prefer it over many granular calls on big parts. In a script every SolidWorks object behaves as the API help says, whatever it came from (swApp.ActiveDoc, GetParents / GetFaces / GetComponents items, GetSpecificFeature2): methods are called with parentheses (doc.GetTitle(), feat.GetTypeName2()), out-parameters come back as a tuple (ok, errors, warnings = doc.Save3(1, 0, 0); doc, e, w = sw.OpenDoc6(path, 1, 1, "", 0, 0)), Select4 / SelectByID2 take plain arguments and None for no object, and a member of another interface of the same object is found by its name (model.GetBodies2 on a part). No W() / wrap() needed. Shortcuts: select(obj or list), suppress(names, on=True), save(), open_doc(path).
 - Proven scripts: list_scripts / get_script / save_script / run_saved_script(name, args).
 - Every call is journalled with its arguments and full script code: get_journal. tool_source(name) shows the code any tool runs.
 - Telemetry: get_journal(since='HH:MM', entries=False) gives per-tool stats from the journal file without touching SolidWorks; never read the journal through run_script. server_health shows what the server is doing right now, also while a call runs.
@@ -38,11 +39,11 @@ RBR extension (solidworks-mcp-rbr)
 - Before a shell on a curved/lofted body: shell_check(thickness_mm).
 - On a big part every modelling call rebuilds the whole tree (3-10 s each on 100+ features). Prefer one run_script doing several sketch/cut/dimension steps over many separate calls; rebuild_profile shows which features make rebuilds slow (suppress them while iterating). Use the library's tree_summary instead of writing your own feature walk. A refused fillet is diagnosed within 15 s; pass the edges it names, not the whole set again. A thickness above the smallest convex radius makes the shell fail, sometimes after a long computation.
 - New parts and assemblies are switched to MMGS (mm, g) at creation. Also: set_units, get/set_custom_properties, list/activate/add_configuration, export_face_dxf (flat part -> DXF 1:1 for milling), assembly_bom (BOM + mass budget, CSV).
-- A script that may run long: run_script answers {job_id, state: running} after ~50 s instead of dying, run_script_async / run_saved_script_async answer {job_id} at once; the work keeps running and get_job(job_id) returns its result (kept 24 h), list_jobs the recent ones. Never resubmit a script because the reply detached.
+- A script that may run long: run_script answers {job_id, state: running} after ~50 s instead of dying, run_script_async / run_saved_script_async answer {job_id} at once; the work keeps running and get_job(job_id, wait_s=45) waits for it (up to 50 s a call) and returns its result (kept 24 h), list_jobs the recent ones. Never resubmit a script because the reply detached.
 - After editing the linked global-variables file: sync_equation_file() adds the new names, updates the changed ones and names what the file no longer has, with a reason for every refused line.
 - server_health warns when open documents or SLDWORKS.exe memory run high and says how many documents close_hidden_documents would close; close_hidden_documents(keep=[...], dry_run=True) lists them, without dry_run closes the invisible, saved, unowned ones. Its lock_holder is null when nothing runs; owners lists live server processes only.
 - check_containment(envelope, keepout) measures how much of each body sits inside another part's envelope body (master-model parts sharing an origin).
-- Flow Simulation on a saved part: flow_create_project(name, template) -> flow_add_boundary_condition(kind, faces, value) (an internal flow needs an inlet and a pressure condition on the inner faces of its lids) -> flow_add_goal(kind, faces) -> optionally flow_set_conditions -> flow_solve (detaches like run_script; get_job) -> flow_goals. Check each goal against a hand estimate (pressure drop, drag) as you would a mass.
+- Flow Simulation on a saved part: flow_create_project(name, template, mesh_level=5, domain_m=...) -> flow_add_boundary_condition(kind, faces, value) (an internal flow needs an inlet and a pressure condition on the inner faces of its lids) -> flow_add_goal(kind, faces) -> flow_set_conditions(velocity_mps, mesh_level, domain_m, min_gap_mm) -> flow_solve -> flow_goals. flow_solve does NOT hold SolidWorks: it answers {job_id}, every other tool works meanwhile (other documents too), flow_status(job_id) shows iteration, current goal values and percent, get_job(job_id, wait_s=45) returns the goals at the end. The next case is flow_clone(name, new_name, velocity_mps=...) - one call, same mesh, domain, conditions and goals; flow_activate(name) switches projects, flow_delete(name) removes one. Before comparing two projects check flow_info: mesh_level, domain_m and min_gap_mm must match (Flow's automatic domain is several times a hand-set one and shifts forces by percents; a coarse mesh by tens of percents). Check each goal against a hand estimate (pressure drop, drag) as you would a mass.
 - More script names: vec(*doubles) / pt(x,y,z) (COM-ready VARIANTs), ui_unlocked() (lift the UI freeze for InsertSketch/EditSketch), tree_before() + features_added(before) + rename_new(before, name), combine(op, main, tools), mirror_body(body, plane, merge=True), whats_wrong(), new_part(), activate(title), rays(bodies, points, dirs), export(path, fmt), split_segment / trim_to_intersection (in the sketch being edited).
 - Parametric building on SolidWorks objects, no tool bodies: set_global / link_dimension / feature_dimensions; sketch_circles (also centred on a profile's mean line at a station) / sketch_rect; convert_entities, add_relation; offset_face_loop (a wall-thick contour inside a face, also where SolidWorks' own offset refuses); extrude_toward / cut_toward (explicit direction, depth / through_all / up_to, also one region of a sketch); plane_normal_to_line; mirror_features. Drive every size and position by a global variable.
 - A cavity following a curved skin, section by section: sketch_intersection(plane=..., body/faces) -> sketch_trim_region(sketch, keep_box) (one closed contour) -> sketch_offset_chain(sketch, wall_mm) (inside, original to construction) -> loft_cut([sections]) or cut_offset_from_surface(sketch, face, wall_mm, toward) ending a wall short of the skin; split_line_project(sketch, faces) cuts the skin patch such a cut ends on. Check region_area_mm2 and the removed volume against a hand estimate.
@@ -54,7 +55,8 @@ RBR extension (solidworks-mcp-rbr)
 - Sketches that follow the model: sketch_rect / sketch_circles / add_sketch take datum_x / datum_y (an edge, a planar face seen edge-on, a vertex '@x,y,z') - positions are then measured from that geometry, not from the origin. For a sketch that exists: fully_define_sketch(sketch, datum_x, datum_y) moves its origin dimensions to the datums and defines what is still free; add_dimension adds one dimension (also to a model edge or vertex); sketch_fillet rounds a corner with a radius dimension.
 - Routes: add_sketch3d(points_mm, bend_radius_mm) + sweep_cut(path, diameter_mm) / sweep_boss - a channel or a rod along a route in the existing body, one feature, the bend radius a dimension. Many at once: read_sketches([names]) (no sketch opened, no rebuild), set_dimensions({name: value}) (one rebuild).
 - run_script(rollback_on_error=False) keeps what the script finished before an error (`kept`); the default removes exactly what the script created (by feature ID - a renamed feature stays) and restores changed equations.
-- Derived parts: derive_part(body, path) gives a body its own part file that follows the master; list_external_refs shows what a part takes from other files and whether each link is alive; update_external_refs loads the sources, rebuilds and reports each body's volume before / after.
+- Derived parts: derive_part(body, path) gives a body its own part file that follows the master; list_external_refs shows what a part takes from other files and whether each link is alive; update_external_refs loads the sources, rebuilds and reports each body's volume before / after. After changing a master: rebuild_chain(root) rebuilds and saves every part derived from it, through any number of levels, in dependency order, without activating anything, and returns each body's volume before / after. export_static_body(body, path, suppress=[...]) writes a body as a part with NO link back (a frozen copy), switching features for the moment and leaving this part exactly as it was.
+- Moving sketch geometry: sketch_move(sketch, delta_mm | target_mm, filter) shifts the whole selection in one move and checks every point; geometry placed by dimensions gets those dimensions changed. Never loop SetCoords over the points of a constrained shape: each point drags the others and the shape travels twice the distance.
 - A call that answers DIALOG_BLOCKING ran into a modal SolidWorks dialog: the reply holds its text and buttons. dialog_respond(button) presses one ('yes' / 'no' / 'ok' / 'cancel' or the caption); the interrupted call is NOT cancelled and goes on then - never send it again. dialog_list shows the open dialogs at any time. Read the text before answering; when it asks about the user's data (save changes?), ask the user.
 - Assemblies: insert_component loads the part without a window of its own (a document window costs SolidWorks about 250 of its 10 000 GDI objects; at the limit it fails with 'resource unavailable', error 61704, and crashes). server_health.sldworks_gui shows the count; new_part / open_part / new_assembly / open_assembly are refused when no window fits any more; close_hidden_documents(windows=True) closes saved document windows. tree_folder(name, components) puts components into a FeatureManager folder and verifies it (raw InsertFeatureTreeFolder2(1) makes an empty folder; ReorderComponents with where 1 or 2 puts them next to the folder).
 - In run_script, model / active / part / asm / ext / fm / selmgr always mean the document that is current NOW: after closing, reloading or opening documents in the script they follow. Objects the script itself keeps (md = swApp.ActiveDoc) die with their document - fetch them again. swApp.CloseAllDocuments is refused while documents with unsaved changes that this server did not make, or documents of another server process, are open.
@@ -426,9 +428,20 @@ def register(server) -> None:
         the rest run without redoing the first steps. The full code is written
         to the journal.
 
-        Namespace: sw/swApp/swapp (ISldWorks, early-bound), mod (typelib wrapper
-        module, e.g. mod.IComponent2), wrap(obj, mod.IFace2) to early-bind a raw
-        dispatch, model (current or active IModelDoc2), active, ext
+        Every SolidWorks object in a script behaves as the API help describes, whatever it
+        came from - swApp, model, the items of a Get* collection, what a method returns:
+        methods take parentheses (doc.GetTitle(), feat.GetTypeName2(), sketch.
+        GetSketchPoints2(), doc.EditRebuild3()); a method with out-parameters returns a
+        tuple (ok, errors, warnings = doc.Save3(1, 0, 0); doc, errors, warnings =
+        sw.OpenDoc6(path, 1, 1, "", 0, 0)) - or, given VARIANT(VT_BYREF | VT_I4, 0) for them,
+        fills those and returns the value alone; Select4(append, None) and SelectByID2(...,
+        None, 0) take None for "no object"; a member of another interface of the same
+        object is found by name (model.GetBodies2(0, True) on a part, face.Select4 through
+        IEntity). A member the object does not have is an error naming the interfaces that
+        do. Naming a method without calling it (doc.GetTitle) gives the method, not its value.
+        Namespace: sw/swApp/swapp (ISldWorks), mod (typelib wrapper
+        module, e.g. mod.IComponent2), wrap(obj, mod.IFace2) / W(obj, 'IFace2') to bind an
+        object to one interface by hand (rarely needed), model (current or active IModelDoc2), active, ext
         (IModelDocExtension), fm (IFeatureManager), selmgr (ISelectionMgr), asm
         (IAssemblyDoc) or part (IPartDoc), comp(name) -> IComponent2 by
         list_components name, feature(name) -> IFeature, features(type=None) ->
@@ -471,18 +484,16 @@ def register(server) -> None:
         a part - reads data = [x, y, z, dx, dy, dz, width, length, height] (m): (x, y, z) is the
         CENTRE OF THE BOTTOM FACE, (dx, dy, dz) the direction of the HEIGHT; then width runs
         along Z, length along Y, height along that direction (verified on SW 2025).
-        Sketch geometry comes early-bound through segments(sketch=None, construction=False)
-        -> ISketchSegment list of the active or named sketch, and relations(sketch=None)
-        -> its ISketchRelation list: use them instead of raw GetSketchSegments()/
-        GetRelations(), whose late-bound items resolve methods as properties
-        (seg.GetType() dies with "'int' object is not callable") and reject Select4's
-        arguments. Any other Get* collection item: W(x, 'IFace2') re-binds it (name the
-        interface - this SolidWorks exposes no type info on them); call(obj, 'Name',
-        *args) reads or invokes a member of a still-raw dispatch either way it is exposed.
+        segments(sketch=None, construction=False) -> the ISketchSegment list of the active
+        or named sketch (construction geometry filtered), relations(sketch=None) -> its
+        ISketchRelation list. More shortcuts: suppress(names, on=True) suppresses or brings
+        back features in one operation; save() saves the current document in place
+        (save(path): to a new file) and raises when SolidWorks does not; open_doc(path)
+        opens a part or assembly - or switches to it - and makes it current; sketch_move(
+        sketch, delta_mm=[dx, dy, dz]) moves sketch geometry in one checked move (never
+        SetCoords point by point on a constrained shape: it travels twice as far).
         COM rules: methods with out-parameters return a tuple (retval, out1, out2...):
-        unpack it, do not call methods on it; objects from Get* calls are often raw
-        dispatches: W(x) / segments() / wrap(x, mod.IFeature) before using them;
-        lengths in metres.
+        unpack it, do not call methods on it; lengths in metres.
         The result also gives `features` {before, after, added} when the tree changed.
         Example (delete 3 components with their mates in one step):
             n = select([comp(c) for c in ["Bolt-1", "Bolt-2", "Nut-1"]])
@@ -1228,6 +1239,41 @@ def register(server) -> None:
         and failing_features. A locked or broken reference does not update and is named."""
         return await _timed(derive.update_external_refs, session, load_sources, timeout_s=600)
 
+    @mcp.tool()
+    async def rebuild_chain(root: str | None = None, folder: str | list | None = None, save: bool = True,
+                            close_opened: bool = True, dry_run: bool = False) -> dict:
+        """Carry a change of a master part through every part derived from it, in ONE call:
+        finds the parts that reference root - directly or through other derived parts - among
+        the part files of root's folder (folder= for other folders), and for each, sources
+        first: loads it without a window if it is not open, rebuilds it, reports each body's
+        volume before and after, saves it, and closes it again if it was loaded here. No
+        document is activated; the current document stays current.
+        root: a file path or the title of an open part (default: the current document).
+        Returns chain (the order), parts [{part, bodies: [{body, before_mm3, after_mm3,
+        delta_mm3}], changed, rebuild_ok, saved, failing_features}] with root first, and the
+        lists changed / unchanged / failed / saved. dry_run=True only lists the chain and what
+        would be loaded. A part that fails stops the chain there (not_reached names the rest).
+        Refused before anything is touched when a part of the chain is in use by another
+        server process or has unsaved changes this server did not make (save=False rebuilds
+        without saving)."""
+        return await _timed(chain.rebuild_chain, session, root, folder, save, close_opened, dry_run,
+                            timeout_s=1800)
+
+    @mcp.tool()
+    async def export_static_body(body: str | list, path: str, suppress: list | str | None = None,
+                                 unsuppress: list | str | None = None) -> dict:
+        """Save a body (or several) of the current part as a part file of its own with NO link
+        back - a plain solid that later changes of this part do not reach (a print, a
+        hand-over, a frozen revision). derive_part is the linked counterpart.
+        suppress / unsuppress: features to switch for the moment, when the body only exists in
+        that state (e.g. suppress the delete-body features that remove it at the end of the
+        tree). One call does it all: switch, save the body to path, break the new part's
+        external references, save and close it, and put this part back exactly as it was -
+        source_part.unchanged confirms the same features suppressed and the same body
+        volumes. Returns path, volume_mm3 against source_volume_mm3, static (true when no
+        live reference is left). The current part must have been saved once."""
+        return await _timed(derive.export_static_body, session, body, path, suppress, unsuppress, timeout_s=900)
+
     # --- SolidCAM (1.8.0) -------------------------------------------------------------
 
     @mcp.tool()
@@ -1464,26 +1510,41 @@ def register(server) -> None:
         Flow project alone (no flow_set_conditions / flow_delete on it)."""
         if worker is None:
             return {"ok": False, "error": "SolidWorks tools only work on Windows with SolidWorks."}
-        begun = await _timed(flow.solve_begin, session, timeout_s=120)
+        def begin(s):
+            return flow.solve_begin(s)
+        begin.__name__ = "flow_solve"      # the journal's and the guard's name for the call
+
+        begun = await _timed(begin, session, timeout_s=120)
         if not isinstance(begun, dict) or "op" not in begun:
             return begun
         request = begun
+        document = os.path.basename(request["document"])
 
         def run(job_id: str) -> dict:
+            t0 = time.perf_counter()
+            outcome = {"ok": False, "error": "the solve did not return"}
             try:
                 def on_event(event: dict) -> None:
                     if event.get("event") == "process":
                         jobs.update(job_id, worker_pid=event.get("pid"))
                     elif event.get("event") == "started":
                         jobs.update(job_id, project=event.get("project"), directory=event.get("directory"))
-                return flow.solve_run(request, on_event)
+                reply = flow.solve_run(request, on_event)
+                outcome = reply
+                return reply
+            except Exception as exc:  # noqa: BLE001 - journalled, then the job records it
+                outcome = {"ok": False, "error": str(exc)}
+                raise
             finally:
+                # the solve itself never passes run_guarded: its end goes to the journal here
+                journal.record("flow_solve_finished", {"job_id": job_id, "document": document}, outcome,
+                               ms=(time.perf_counter() - t0) * 1000.0)
                 try:  # back on the COM thread, behind whatever runs there now
                     worker.submit(lambda: flow.solve_end(session))
                 except Exception:  # noqa: BLE001 - the server is shutting down
                     pass
 
-        job = jobs.submit_thread("flow_solve", run, {"document": os.path.basename(request["document"])})
+        job = jobs.submit_thread("flow_solve", run, {"document": document})
         wait_s = max(5.0, min(float(timeout_s), jobs.SYNC_WAIT_S))
         record = await jobs.wait(job["job_id"], wait_s)
         answer = jobs.answer(record)

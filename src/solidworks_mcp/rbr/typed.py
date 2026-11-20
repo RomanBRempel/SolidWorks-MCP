@@ -23,6 +23,14 @@ A call written the late-bound way - a VARIANT(VT_BYREF | ...) passed for each
 out-parameter - is honoured as such: the VARIANTs are filled and the call
 returns the return value alone.
 
+Objects that are not SolidWorks' own - an add-in's API reached through
+swApp.GetAddInObject("FloWorks.App"), SolidCAM, Simulation - support none of
+the type library's interfaces. Their members are resolved by the object itself
+(late binding, as before this module existed), so scripts written against
+those APIs run unchanged; such objects describe themselves (they carry type
+info), which is what makes late binding dependable there and not on
+SolidWorks' own objects.
+
 Everything here runs on the COM thread. index(), ranked(), Member's argument
 handling and the fallbacks are pure and unit-tested with stand-in classes.
 """
@@ -41,6 +49,15 @@ if not isinstance(_VARIANT, type):   # the import stub of the non-Windows tests
 _IID_IDISPATCH = getattr(pythoncom, "IID_IDispatch", None)
 _VT_BYREF = getattr(pythoncom, "VT_BYREF", 0x4000)
 E_NOINTERFACE = -2147467262
+# What a makepy class or win32com itself calls on the dispatch it holds: an Auto handed to
+# mod.IFeature(obj) or win32com.client.Dispatch(obj) must answer these as the dispatch does.
+DISPATCH_MEMBERS = frozenset({"InvokeTypes", "Invoke", "GetIDsOfNames", "QueryInterface", "GetTypeInfo",
+                              "GetTypeInfoCount"})
+
+
+def _late_bound(oleobj):
+    """The dispatch as win32com's dynamic (late-bound) object; replaced in the tests."""
+    return win32com.client.dynamic.Dispatch(oleobj)
 
 # Asked first when several interfaces have the member: the ones scripts live on.
 PREFERRED = (
@@ -237,25 +254,27 @@ class Auto:
         return faces[cls]
 
     def _face_(self, name: str):
-        """The early-bound instance that has member `name`."""
+        """The early-bound instance that has member `name`; None when the object supports no
+        interface of the type library with that member (an add-in's object, or a wrong name)."""
         bound = self._bound_
         if bound is not None and has(type(bound), name):
             return bound
         for cls, instance in self._faces_.items():
             if has(cls, name):
                 return instance
-        candidates = index(self._mod_).get(name, ())
-        for cls in candidates:
+        for cls in index(self._mod_).get(name, ()):
             instance = self._ask_(cls)
             if instance is not None:
                 return instance
-        if candidates and not self._faces_:
-            # an object that answers to no interface by its ID (none seen so far): bind the
-            # likeliest one to the dispatch as it is, the way wrap() always did
-            cls = candidates[0]
-            self._faces_[cls] = cls(self._oleobj_)
-            return self._faces_[cls]
-        raise AttributeError(self._missing_(name, candidates))
+        return None
+
+    def _late_(self):
+        """The object late-bound: for what the SolidWorks type library does not describe."""
+        late = self.__dict__.get("_dyn_")
+        if late is None:
+            late = _late_bound(self._oleobj_)
+            self.__dict__["_dyn_"] = late
+        return late
 
     def _missing_(self, name: str, candidates) -> str:
         known = ", ".join(c.__name__ for c in self._faces_) or "no interface identified yet"
@@ -269,14 +288,33 @@ class Auto:
     def __getattr__(self, name: str):
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
+        if name in DISPATCH_MEMBERS:
+            return getattr(self._oleobj_, name)
         face = self._face_(name)
-        value = getattr(face, name)
+        if face is not None:
+            value = getattr(face, name)
+            if callable(value) and not is_com(value):
+                return Member(self, name, value, type(face).__name__)
+            return self._wrap_(value)
+        # not a member of any SolidWorks interface this object supports: the object's own
+        # name lookup decides (an add-in's API); a name it does not know either is the error
+        try:
+            value = getattr(self._late_(), name)
+        except Exception:  # noqa: BLE001 - AttributeError, or the COM error of an unknown name
+            raise AttributeError(self._missing_(name, index(self._mod_).get(name, ()))) from None
         if callable(value) and not is_com(value):
-            return Member(self, name, value, type(face).__name__)
+            return Member(self, name, value, "late-bound")
         return self._wrap_(value)
 
     def __setattr__(self, name: str, value):
-        setattr(self._face_(name), name, bare(value))
+        face = self._face_(name)
+        if face is not None:
+            setattr(face, name, bare(value))
+            return
+        try:
+            setattr(self._late_(), name, bare(value))
+        except Exception:  # noqa: BLE001
+            raise AttributeError(self._missing_(name, index(self._mod_).get(name, ()))) from None
 
     # --- behaving like the object ---------------------------------------------------
 

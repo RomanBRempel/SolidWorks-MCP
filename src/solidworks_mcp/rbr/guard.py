@@ -652,7 +652,8 @@ def _guarded(self, fn, *args, **kwargs):
 DOCS_WARN = int(os.environ.get("SWMCP_DOCS_WARN", "30"))
 
 # Tools that load documents or build on many of them: their reply carries the load warnings.
-HEAVY = SWITCHERS | {"insert_component", "insert_part", "run_script", "derive_part", "make_drawing", "export",
+HEAVY = SWITCHERS | {"insert_component", "insert_part", "run_script", "derive_part", "rebuild_chain",
+                     "export_static_body", "make_drawing", "export",
                      "tree_folder", "rebuild"}
 # Session methods that open a document WINDOW (about 250 GDI objects each), also from a script.
 WINDOW_MAKERS = ("new_part", "new_assembly", "open_part", "open_assembly")
