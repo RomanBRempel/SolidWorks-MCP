@@ -473,7 +473,7 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
                          "normal": [float(c) for c in row[6:9]]})
         return hits
 
-    from . import batch, cavity, query, section, sketch_datum, sweep, tree   # here: they import this package's parts
+    from . import batch, cavity, query, section, sketch_datum, sketch_move, sweep, tree   # here: they import this package's parts
 
     def body_box(body=None):
         """A body's TIGHT box in mm ({min_mm, max_mm, size_mm}) from its extreme points; body:
@@ -510,6 +510,7 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         add_dimension=lambda sketch, entities, **kw: sketch_datum.add_dimension(session, sketch, entities, **kw),
         sketch_fillet=lambda sketch, corners, radius_mm, **kw: sketch_datum.sketch_fillet(
             session, sketch, corners, radius_mm, **kw),
+        sketch_move=lambda sketch, **kw: sketch_move.sketch_move(session, sketch, **kw),
         sketch_intersection=lambda **kw: cavity.sketch_intersection(session, **kw),
         sketch_trim_region=lambda sketch, keep_box, max_trims=80: cavity.sketch_trim_region(
             session, sketch, keep_box, max_trims),
@@ -608,7 +609,11 @@ def _close_open_sketch(session) -> str | None:
             return None
         name = None
         try:
-            name = binding.wrap(sketch, session._mod.IFeature).Name
+            # the sketch AS a feature, asked for by interface: binding it as IFeature without
+            # asking read another member under the same number (the "name" was a matrix)
+            name = typed.Auto(sketch, session._mod).Name
+            if not isinstance(name, str):
+                name = None
         except Exception:  # noqa: BLE001
             pass
         model.ClearSelection2(True)

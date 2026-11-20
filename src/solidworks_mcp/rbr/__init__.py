@@ -19,7 +19,8 @@ from . import (apiref, assembly, batch, bodies as bodies_mod, cavity, context, d
                features,
                flow, geom, guard, health, image, instance, jobs, journal, library, offset_loop, param, query,
                render, scope,
-               script_tool, section, sketch_datum, solidcam, speed, sweep, tools, tree)
+               script_tool, section, sketch_datum, sketch_move as sketch_move_mod, solidcam, speed, sweep, tools,
+               tree)
 
 __all__ = ["register"]
 
@@ -1056,6 +1057,26 @@ def register(server) -> None:
         dimensions on it hold; the radius is one dimension for all corners given
         (dimensions.radius), changed by set_dimension, linked by var."""
         return await call(sketch_datum.sketch_fillet, session, sketch, corners, radius_mm, name, var)
+
+    @mcp.tool()
+    async def sketch_move(sketch: str, delta_mm: list | None = None, target_mm: list | None = None,
+                          filter: list | dict | str | None = None, anchor: str | None = None,  # noqa: A002
+                          break_relations: bool = False) -> dict:
+        """Move geometry of an existing 2D sketch within its plane, as ONE move, and check where
+        it landed. delta_mm [dx, dy, dz]: the shift in model mm; or target_mm [x, y, z]: where
+        the anchor point goes (anchor '#3.start' / '#3.end' / '#3.center'; default the first
+        point of the selection). filter: nothing = the whole sketch; ['#0', '#3'] segments
+        (read_sketch order); or {'type': 'line'|'arc'|'circle'|'spline', 'construction':
+        bool, 'within_mm': [[x, y, z], [x, y, z]]}.
+        Geometry held only by relations is shifted as it is; geometry placed by dimensions
+        gets those dimensions changed by the shift (dimensions_changed {name: {was, now}}) -
+        sizes stay. Every moved point is compared before and after: a shortfall (a relation
+        to the origin or an edge holds it, an equation sets the dimension) undoes the move
+        and is refused with the reason; break_relations=True cuts the relations between the
+        moved and the rest instead. Do not move a constrained shape with SetCoords point by
+        point in a script: each point drags the others and the shape goes twice as far."""
+        return await call(sketch_move_mod.sketch_move, session, sketch, delta_mm, target_mm, filter, anchor,
+                          break_relations)
 
     @mcp.tool()
     async def convert_entities(sketch: str | None = None, on: str | None = None, face: str | None = None,
