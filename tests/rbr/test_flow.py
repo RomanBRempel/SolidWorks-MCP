@@ -270,3 +270,134 @@ def test_the_worker_knows_the_new_operations():
         assert op in flow_worker.OPS and callable(getattr(flow_worker.Flow, op))
     assert flow_worker.DOMAIN == {"xmin": 1, "xmax": 2, "ymin": 3, "ymax": 4, "zmin": 5, "zmax": 6}
     assert flow_worker.P_GAP == 8 and flow_worker.P_MESH_LEVEL == 7
+
+
+# --- 1.12.1: a template that brings another model's goals; a project that cannot be finished ------
+
+
+class _Item:
+    """A Flow project item: `references` None = it sits on no geometry at all (not face-bound)."""
+
+    def __init__(self, project, name, kind=12, references=()):
+        self.project, self.Name, self.Type, self.references = project, name, kind, references
+
+    def GetInterface(self, name):
+        return self if name == "ITopologyBasedFeature" and self.references is not None else None
+
+    def GetReferencesNames(self):
+        return tuple(self.references)
+
+    def Delete(self):
+        self.project.items.remove(self)
+
+
+class _Enum:
+    def __init__(self, items):
+        self.items = list(items)
+
+    def Next(self):
+        return self.items.pop(0) if self.items else None
+
+
+class _Project:
+    def __init__(self, name):
+        self.Name, self.items = name, []
+        self.GlobalMeshSettings = object()
+
+    def EnumFeatures(self):
+        return _Enum(self.items) if self.items else None
+
+    def GetLastRebuildError(self):
+        return "Cannot find the bodies this item refers to." if any(i.references == () for i in self.items) else ""
+
+
+class _Config:
+    def __init__(self, doc):
+        self.doc = doc
+
+    def RemoveProject(self, name):
+        self.doc.projects = [p for p in self.doc.projects if p.Name != name]
+        if self.doc.active is not None and self.doc.active.Name == name:
+            self.doc.active = None
+        return True
+
+    def ActivateProject(self, name, _window):
+        self.doc.active = next(p for p in self.doc.projects if p.Name == name)
+        return self.doc.active
+
+
+class _FlowDoc:
+    """Rebuilds only while no item is left without references - like Flow with foreign goals."""
+
+    def __init__(self, template_items=(), never_rebuilds=False):
+        self.projects, self.template_items, self.never_rebuilds = [_Project("P1")], template_items, never_rebuilds
+        self.active = self.projects[0]
+        self.ActiveConfiguration = _Config(self)
+
+    def GetProjectNames(self):
+        return tuple(p.Name for p in self.projects)
+
+    def GetActiveProject(self):
+        return self.active
+
+    def CreateProjectFromTemplate(self, _template, name):
+        project = _Project(name)
+        project.items = [_Item(project, n, kind, refs) for n, kind, refs in self.template_items]
+        self.projects.append(project)
+        self.active = project
+        return project
+
+    def Rebuild(self, *_flags):
+        return not self.never_rebuilds and all(i.references != () for i in self.active.items)
+
+
+def _worker(doc):
+    worker = object.__new__(flow_worker.Flow)
+    worker.doc = doc
+    worker.wrap = lambda obj, _iface: obj
+    worker.set = lambda owner, kind, value, label, integer=False: None
+    return worker
+
+
+def test_a_template_without_items_makes_the_project_as_before():
+    doc = _FlowDoc()
+    reply = _worker(doc).create_project({"name": "T", "template": "air.fwp", "mesh_level": 5})
+    assert reply["project"] == "T" and reply["features"] == [] and reply["mesh_level"] == 5
+    assert "template_items_removed" not in reply and doc.active.Name == "T"
+
+
+def test_goals_a_template_brought_from_another_model_are_removed_and_named():
+    doc = _FlowDoc([("FY_all", 12, ()), ("FZ_all", 12, ()), ("Inlet", 2, ())])
+    reply = _worker(doc).create_project({"name": "T", "template": "air_gap.fwp"})
+    assert reply["template_items_removed"] == [{"name": "FY_all", "type": "surface_goal"},
+                                               {"name": "FZ_all", "type": "surface_goal"},
+                                               {"name": "Inlet", "type": "boundary_condition"}]
+    assert reply["features"] == [] and "flow_add_goal" in reply["note"] and doc.active.Name == "T"
+
+
+def test_only_the_items_that_hold_nothing_go_when_others_are_bound():
+    doc = _FlowDoc([("FY_all", 12, ()), ("Wall", 2, ("Face<1>",)), ("Global", 99, None)])
+    reply = _worker(doc).create_project({"name": "T", "template": "air_gap.fwp"})
+    assert [d["name"] for d in reply["template_items_removed"]] == ["FY_all"]
+    assert [f["name"] for f in reply["features"]] == ["Wall", "Global"]   # a bound one and one that is not face-bound
+
+
+def test_a_project_that_cannot_be_finished_is_not_left_in_the_document():
+    doc = _FlowDoc(never_rebuilds=True)
+    with pytest.raises(flow_worker.Refused, match="does not rebuild.*not kept; the document is as it was"):
+        _worker(doc).create_project({"name": "T", "template": "internal_water.fwp"})
+    assert doc.GetProjectNames() == ("P1",) and doc.active.Name == "P1"      # the earlier project is active again
+
+
+def test_removing_the_templates_items_to_no_avail_says_so_and_discards():
+    doc = _FlowDoc([("FY_all", 12, ())], never_rebuilds=True)
+    with pytest.raises(flow_worker.Refused, match=r"Removed from it first, to no avail: \['FY_all'\].*not kept"):
+        _worker(doc).create_project({"name": "T", "template": "air_gap.fwp"})
+    assert doc.GetProjectNames() == ("P1",) and doc.active.Name == "P1"
+
+
+def test_an_existing_project_name_is_refused_before_anything_is_made():
+    doc = _FlowDoc()
+    with pytest.raises(flow_worker.Refused, match="already has a Flow project 'P1'"):
+        _worker(doc).create_project({"name": "P1", "template": "air.fwp"})
+    assert doc.GetProjectNames() == ("P1",)

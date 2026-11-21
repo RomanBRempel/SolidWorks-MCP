@@ -16,6 +16,10 @@ NIK traps, all met on Flow Simulation 2025 SP3:
 - the minimum gap size is a parameter of the global mesh only in a project that
   has it switched on (Global Mesh > Minimum gap size); a project made from a
   template without it has no such parameter at all,
+- a template carries the goals and boundary conditions of the project it was
+  made from, bound to THAT model's faces. On another model they find nothing
+  ("cannot find the bodies this item refers to") and the new project does not
+  rebuild: create_project removes them and says which,
 - some parameters' values cannot be read (they raise); only their Type is read
   while looking one up,
 - Solve and Rebuild return False without a reason; Flow writes it to
@@ -203,19 +207,93 @@ class Flow:
 
     # --- operations -----------------------------------------------------------------
 
+    def face_bound(self, proj) -> list:
+        """[(IFeature, reference names)] of the project's items that sit on geometry."""
+        out = []
+        e = proj.EnumFeatures()
+        f = e.Next() if e is not None else None
+        while f is not None:
+            f = self.wrap(f, "IFeature")
+            try:
+                topo = f.GetInterface("ITopologyBasedFeature")
+            except Exception:  # noqa: BLE001
+                topo = None
+            if topo is not None:
+                try:
+                    names = list(self.wrap(topo, "ITopologyBasedFeature").GetReferencesNames() or ())
+                except Exception:  # noqa: BLE001 - an item whose references cannot even be read
+                    names = []
+                out.append((f, [str(n) for n in names]))
+            f = e.Next()
+        return out
+
+    def drop_unbound(self, proj) -> list:
+        """Delete the items a template brought along that hold no geometry of THIS model -
+        or, when every one of them claims references and the project still does not
+        rebuild, all of them: they came with the template, not from this model."""
+        items = self.face_bound(proj)
+        loose = [(f, names) for f, names in items if not names] or items
+        dropped = []
+        for f, names in loose:
+            entry = {"name": f.Name, "type": FEATURE_TYPES.get(f.Type, f"type {f.Type}")}
+            try:
+                f.Delete()
+            except Exception as exc:  # noqa: BLE001
+                entry["not_removed"] = str(exc)
+            dropped.append(entry)
+        left = {x["name"] for x in self.features(proj)}
+        for entry in dropped:
+            if entry["name"] in left and "not_removed" not in entry:
+                entry["not_removed"] = "Flow kept it"
+        return dropped
+
+    def discard(self, name: str, activate: str | None) -> bool:
+        """Remove a project that could not be finished and put the earlier one back; True when gone."""
+        try:
+            self.config().RemoveProject(name)
+        except Exception:  # noqa: BLE001
+            pass
+        gone = name not in self.names()
+        try:
+            if activate and activate in self.names() and self.active_name() != activate:
+                self.config().ActivateProject(activate, False)
+        except Exception:  # noqa: BLE001
+            pass
+        return gone
+
     def create_project(self, request: dict) -> dict:
         offset = log_offset()
         if request["name"] in (self.doc.GetProjectNames() or ()):
             raise Refused(f"The document already has a Flow project '{request['name']}'.")
+        active_before = self.active_name()
         proj = self.doc.CreateProjectFromTemplate(request["template"], request["name"])
         if proj is None:
             raise Refused(self.rebuild_error(self.project(), offset, "Flow did not create the project")
                           if self.doc.GetActiveProject() is not None else
                           f"Flow did not create the project from '{request['template']}'.")
         proj = self.wrap(proj, "IFDAProject")
-        if not self.doc.Rebuild(True, True, False, True, True):  # reset the template's domain to this model
-            raise Refused(self.rebuild_error(proj, offset, "The new project does not rebuild"))
+        rebuilt = self.doc.Rebuild(True, True, False, True, True)  # reset the template's domain to this model
+        dropped = []
+        if not rebuilt:
+            # the template's own goals and conditions sit on faces of the model it was made from
+            first_reason = self.rebuild_error(proj, offset, "The new project does not rebuild")
+            dropped = self.drop_unbound(proj)
+            if dropped:
+                offset = log_offset()
+                rebuilt = self.doc.Rebuild(True, True, False, True, True)
+        if not rebuilt:
+            reason = self.rebuild_error(proj, offset, "The new project does not rebuild") if dropped else first_reason
+            gone = self.discard(request["name"], active_before)
+            raise Refused(reason + (f" Removed from it first, to no avail: {[d['name'] for d in dropped]}." if dropped
+                                    else "")
+                          + (" The project was not kept; the document is as it was." if gone else
+                             f" The half-made project '{request['name']}' could not be removed: flow_delete it."))
         reply = {"project": proj.Name, "template": request["template"], "features": self.features(proj)}
+        if dropped:
+            reply["template_items_removed"] = dropped
+            reply["note"] = ("The template brought goals / conditions bound to the model it was made from; they "
+                             "found no faces here and were removed. Add this model's own with flow_add_goal / "
+                             "flow_add_boundary_condition.")
         if request.get("mesh_level") is not None:
             self.set(proj.GlobalMeshSettings, P_MESH_LEVEL, request["mesh_level"], "the mesh level", integer=True)
             reply["mesh_level"] = request["mesh_level"]
