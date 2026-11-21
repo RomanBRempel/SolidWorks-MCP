@@ -223,7 +223,7 @@ def test_compare_allows_one_way_of_calculating_and_refuses_another(tmp_path, pri
     folder_with(tmp_path, "4", text=config(velocity=(0, 2.8, -19.8), cells_x="9 18 18 11 1", nx=56), info=INFO,
                 goals=GOALS)
     same = flow.flow_compare("1", "2")
-    assert same["ok"] and same["comparable"] and same["same_free_stream"]
+    assert same["ok"] and same["comparable"] and same["same_run"]
     assert same["goals"]["F1"]["averaged"]["delta_pct"] == pytest.approx((21.4 - 21.2) / 21.2 * 100, abs=1e-3)
     with pytest.raises(SolidWorksError, match="not comparable - 2 setting"):
         flow.flow_compare("1", "3")
@@ -231,7 +231,7 @@ def test_compare_allows_one_way_of_calculating_and_refuses_another(tmp_path, pri
     assert forced["comparable"] is False and "NOT comparable" in forced["warning"] and len(forced["differences"]) == 2
     # another angle of attack: another derived base mesh, the same way of calculating
     polar = flow.flow_compare("1", "4")
-    assert polar["comparable"] and polar["same_free_stream"] is False
+    assert polar["comparable"] and polar["same_run"] is False
     with pytest.raises(SolidWorksError, match="not a Flow project folder"):
         flow.flow_compare("1", "9")
 
@@ -260,3 +260,20 @@ def test_templates_follow_the_private_shared_folder(tmp_path, private_dir):
     assert flow.shared_template("air")["source"] == "shared"
     with pytest.raises(SolidWorksError, match="allow_local"):
         flow.shared_template("something_local")
+
+
+def test_another_geometry_calculated_the_same_way_compares(tmp_path, private_dir):
+    """The control planes sit on the model's box: another geometry has other planes and
+    cell counts at the same settings - not a difference of the way of calculating."""
+    private_dir(compare_runs_dir=str(tmp_path))
+    moved = config().replace("-1.5 -0.6 0 0.6 1.5", "-1.5 -0.58 0 0.58 1.5").replace("10 20 20 12 1", "11 19 19 13 1")
+    folder_with(tmp_path, "1", info=INFO, goals=GOALS)
+    folder_with(tmp_path, "2", text=moved, info=INFO, goals=GOALS)
+    folder_with(tmp_path, "3", text=moved.replace('<MaxThinChannelRefinementLevel value="2"/>',
+                                                  '<MaxThinChannelRefinementLevel value="5"/>'), info=INFO, goals=GOALS)
+    out = flow.flow_compare("1", "2")
+    assert out["comparable"] and out["same_run"] is False
+    with pytest.raises(SolidWorksError, match="MaxThinChannelRefinementLevel"):
+        flow.flow_compare("1", "3")
+    case = fc.make_case(fc.read_config(fc.config_path(str(tmp_path / "1"))), "C")
+    assert fc.check_case(fc.read_config(fc.config_path(str(tmp_path / "2"))), case, "all") == []

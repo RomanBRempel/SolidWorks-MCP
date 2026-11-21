@@ -440,13 +440,27 @@ def case_settings(case: dict) -> dict:
     return {ROOT + k: v for k, v in case["settings"].items()}
 
 
+def same_box(flat: dict, other: dict, tolerance: float = 1e-9) -> bool:
+    """True when both settings have the same control-plane positions on every axis: the
+    planes sit on the domain's faces and on the model's box, so with equal domains they
+    differ exactly when the geometry does."""
+    for i in range(3):
+        key = f"{MESH}ControlPoints[{i}]/Points"
+        mine, theirs = _numbers(flat.get(key)), _numbers(other.get(key))
+        if len(mine) != len(theirs) or any(abs(float(p) - float(q)) > tolerance for p, q in zip(mine, theirs)):
+            return False
+    return True
+
+
 def same_run(flat: dict, case: dict, tolerance: float = 1e-9) -> bool:
-    """True when the run has the case's own free stream (then its derived base mesh must be
-    the case's to the last plane; another angle of attack derives another)."""
-    mine, theirs = velocity_of(flat), velocity_of(case_settings(case))
+    """True when the run has the case's own free stream AND the case's model box: then its
+    derived base mesh must be the case's to the last plane. Another angle of attack, or
+    another geometry calculated the same way, derives another - and is not held to it."""
+    want = case_settings(case)
+    mine, theirs = velocity_of(flat), velocity_of(want)
     if mine is None or theirs is None:
         return False
-    return all(abs(float(a) - float(b)) <= tolerance for a, b in zip(mine, theirs))
+    return all(abs(float(a) - float(b)) <= tolerance for a, b in zip(mine, theirs)) and same_box(flat, want)
 
 
 def check_case(flat: dict, case: dict, scope: str = "mesh", exact: bool | None = None) -> list:
@@ -564,7 +578,7 @@ def result_record(folder: str, case: dict | None = None, geometry: dict | None =
         mesh_diff = check_case(flat, case, "mesh", exact)
         all_diff = check_case(flat, case, "all", exact)
         record["case"] = {"name": case.get("case"), "fingerprint": case.get("fingerprint"),
-                          "same_free_stream": exact,
+                          "same_run": exact,
                           "mesh_matches": not mesh_diff, "settings_match": not all_diff,
                           "differences": (mesh_diff or all_diff)[:40],
                           "expected_cells": (case.get("expect") or {}).get("cells") if exact else None}

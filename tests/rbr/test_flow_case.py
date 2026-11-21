@@ -277,7 +277,7 @@ def test_result_record_against_a_case_and_the_registry_line(tmp_path):
                       info=dict(INFO, project_name="P2"), goals=GOALS)
     record = fc.result_record(run, case, geometry={"fingerprint": "abc", "volume_m3": 1.0}, extra={"server": "x.y"})
     assert record["cells"] == 12345 and record["goals"]["F1"]["averaged"] == 21.2
-    assert record["case"]["mesh_matches"] is False and record["case"]["same_free_stream"] is True
+    assert record["case"]["mesh_matches"] is False and record["case"]["same_run"] is True
     assert record["case"]["differences"][0]["key"] == "BaseMeshSettings[0]/ControlPoints[0]/Ratio"
     assert record["fingerprint"]["geometry"] == "abc"
     registry = str(tmp_path / "reg" / "runs.csv")

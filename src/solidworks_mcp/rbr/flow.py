@@ -1217,7 +1217,7 @@ def flow_create_from_case(session, case, name: str, alpha_deg: float | None = No
                               "was solved.")
     out = {"ok": True, "project": name, **made_by, "case": loaded.get("case"), "case_path": case_path,
            "verified": True,
-           "same_free_stream": exact, "directory": os.path.dirname(config),
+           "same_run": exact, "directory": os.path.dirname(config),
            "velocity_mps": flow_case.velocity_of(flat),
            "fingerprint": {"settings": flow_case.fingerprint(flat), "mesh": flow_case.fingerprint(flat, "mesh")},
            "cells_expected": (loaded.get("expect") or {}).get("cells") if exact else None}
@@ -1276,7 +1276,7 @@ def flow_compare(run_a: str, run_b: str, force: bool = False) -> dict:
                    "cells": rec_a.get("cells"), "fingerprint": rec_a["fingerprint"]},
              "b": {"folder": b, "project": rec_b.get("project"), "model": rec_b.get("model"),
                    "cells": rec_b.get("cells"), "fingerprint": rec_b["fingerprint"]},
-             "same_free_stream": same_stream, "comparable": not found}
+             "same_run": same_stream, "comparable": not found}
     if found:
         reply["differences"] = [{"key": d["key"], "b": d["have"], "a": d["want"]} for d in found[:40]]
         if not force:
