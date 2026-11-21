@@ -25,7 +25,7 @@ from . import (apiref, assembly, batch, bodies as bodies_mod, cavity, chain, con
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.12.1"
+RBR_VERSION = "1.13.0"
 
 INSTRUCTIONS = """
 
@@ -44,6 +44,7 @@ RBR extension (solidworks-mcp-rbr)
 - server_health warns when open documents or SLDWORKS.exe memory run high and says how many documents close_hidden_documents would close; close_hidden_documents(keep=[...], dry_run=True) lists them, without dry_run closes the invisible, saved, unowned ones. Its lock_holder is null when nothing runs; owners lists live server processes only.
 - check_containment(envelope, keepout) measures how much of each body sits inside another part's envelope body (master-model parts sharing an origin).
 - Flow Simulation on a saved part: flow_create_project(name, template, mesh_level=5, domain_m=...) -> flow_add_boundary_condition(kind, faces, value) (an internal flow needs an inlet and a pressure condition on the inner faces of its lids) -> flow_add_goal(kind, faces) -> flow_set_conditions(velocity_mps, mesh_level, domain_m, min_gap_mm) -> flow_solve -> flow_goals. flow_solve does NOT hold SolidWorks: it answers {job_id}, every other tool works meanwhile (other documents too), flow_status(job_id) shows iteration, current goal values and percent, get_job(job_id, wait_s=45) returns the goals at the end. The next case is flow_clone(name, new_name, velocity_mps=...) - one call, same mesh, domain, conditions and goals; flow_activate(name) switches projects, flow_delete(name) removes one. Before comparing two projects check flow_info: mesh_level, domain_m and min_gap_mm must match (Flow's automatic domain is several times a hand-set one and shifts forces by percents; a coarse mesh by tens of percents). Check each goal against a hand estimate (pressure drop, drag) as you would a mass.
+- Flow runs that must compare with earlier ones: level, gap and domain are NOT the whole mesh (control-plane ratios and the thin-channel level come with the project or template a project was made from, and no API writes them). flow_mesh_get shows all of it; flow_case_from_project(name, results_dir=...) keeps a reference run as a case; flow_create_from_case(case, name, alpha_deg | velocity_mps) makes a project and verifies every solver setting against the case before handing it back; flow_solve(case=...) refuses a project that is not the case before meshing and writes result.json + a registry line; flow_compare(run_a, run_b) refuses runs of different setups. Compare goals by `averaged`, not by the last value (the parallel solver is not bit-repeatable). flow_solve / flow_delete refuse a folder that holds another model's or PC's calculation (force=True overrides).
 - More script names: vec(*doubles) / pt(x,y,z) (COM-ready VARIANTs), ui_unlocked() (lift the UI freeze for InsertSketch/EditSketch), tree_before() + features_added(before) + rename_new(before, name), combine(op, main, tools), mirror_body(body, plane, merge=True), whats_wrong(), new_part(), activate(title), rays(bodies, points, dirs), export(path, fmt), split_segment / trim_to_intersection (in the sketch being edited).
 - Parametric building on SolidWorks objects, no tool bodies: set_global / link_dimension / feature_dimensions; sketch_circles (also centred on a profile's mean line at a station) / sketch_rect; convert_entities, add_relation; offset_face_loop (a wall-thick contour inside a face, also where SolidWorks' own offset refuses); extrude_toward / cut_toward (explicit direction, depth / through_all / up_to, also one region of a sketch); plane_normal_to_line; mirror_features. Drive every size and position by a global variable.
 - A cavity following a curved skin, section by section: sketch_intersection(plane=..., body/faces) -> sketch_trim_region(sketch, keep_box) (one closed contour) -> sketch_offset_chain(sketch, wall_mm) (inside, original to construction) -> loft_cut([sections]) or cut_offset_from_surface(sketch, face, wall_mm, toward) ending a wall short of the skin; split_line_project(sketch, faces) cuts the skin patch such a cut ends on. Check region_area_mm2 and the removed volume against a hand estimate.
@@ -613,15 +614,26 @@ def register(server) -> None:
 
     @mcp.tool()
     async def get_journal(last_n: int = 20, tool: str | None = None, date: str | None = None,
-                          errors_only: bool = False, since: str | None = None, entries: bool = True) -> dict:
+                          errors_only: bool = False, since: str | None = None, entries: bool = True,
+                          sanitized: bool = False) -> dict:
         """Telemetry and history of tool calls, read from the journal file (never from SolidWorks).
 
         Each entry: time, pid, tool, arguments (full script code), document, ms,
         ok/error, feature-tree change. stats per tool: calls, total_s, p50/p95/max
         ms, errors - over all matching calls. since 'HH:MM' limits to calls from
         then; date 'YYYY-MM-DD' (today by default); entries=False for stats only.
+        sanitized=True for text that goes into a report, an issue or a PR: private names
+        (the private settings' leak_denylist), user-profile paths and e-mail addresses are
+        replaced with <private>, <path>, <email>.
         """
-        return _local(journal.read, last_n, tool, date, errors_only, since, entries)
+        answer = _local(journal.read, last_n, tool, date, errors_only, since, entries)
+        if sanitized:
+            from . import leak
+            try:
+                answer = leak.sanitize_obj(answer)
+            except ValueError as exc:   # a private file that cannot be read is not "nothing private"
+                return {"ok": False, "error": f"Not sanitized, so not returned: {exc}"}
+        return answer
 
     @mcp.tool()
     async def server_health() -> dict:
@@ -646,6 +658,7 @@ def register(server) -> None:
                     "lock_holder": guard._lock.held_by(), "owners": guard.prune_owners(),
                     "edit_context": context.seen(),
                     "flow_solves": flow.running_solves(),
+                    "flow_setup": flow.health(),
                     "sldworks_memory": health.sldworks_memory(),
                     "sldworks_gui": health.sldworks_gui(st.get("sw_pid") if st["sw_running"] else None),
                     "recent_errors": [{k: e.get(k) for k in ("ts", "pid", "tool", "doc", "error")}
@@ -1415,7 +1428,8 @@ def register(server) -> None:
 
     @mcp.tool()
     async def flow_create_project(name: str, template: str = "internal_water", mesh_level: int = 5,
-                                  domain_m: dict | list | None = None, min_gap_mm: float | None = None) -> dict:
+                                  domain_m: dict | list | None = None, min_gap_mm: float | None = None,
+                                  allow_local: bool = False) -> dict:
         """Create a Flow Simulation project on the current SAVED part or assembly from a project
         template (.fwp: a name in Flow's template folder, or a full path), and fit its
         computational domain to the model. The template fixes the analysis type and the fluid:
@@ -1433,9 +1447,15 @@ def register(server) -> None:
         cannot be finished is not left in the document: the error gives Flow's reason and
         the project that was active before is active again.
         Then: flow_add_boundary_condition, flow_add_goal, flow_set_conditions, flow_solve.
+        When the private settings name a shared templates folder (templates_dir), the template
+        is taken from THERE only and its MD5 must be the one its templates_manifest.json
+        records: a template is a whole setup (domain, gap, hidden mesh switches), and the
+        same name on two PCs was two setups. A PC-local template needs allow_local=True and
+        is reported (warnings). template_source / template_md5 say what was used. To repeat
+        an earlier calculation use flow_create_from_case instead.
         Needs the Flow Simulation add-in and its API SDK."""
         return await _timed(flow.flow_create_project, session, name, template, mesh_level, domain_m,
-                            min_gap_mm, timeout_s=660)
+                            min_gap_mm, allow_local, timeout_s=660)
 
     @mcp.tool()
     async def flow_add_boundary_condition(kind: str, faces: list | str, value: float | None = None,
@@ -1495,16 +1515,30 @@ def register(server) -> None:
                             mesh_level, domain_m, min_gap_mm, copy_results, timeout_s=660)
 
     @mcp.tool()
-    async def flow_delete(name: str) -> dict:
+    async def flow_delete(name: str, force: bool = False) -> dict:
         """Delete a Flow project of the current document with its results (cannot be undone).
-        The reply names the project that is active afterwards."""
-        return await _timed(flow.flow_delete, session, name, timeout_s=330)
+        The reply names the project that is active afterwards. Refused when the project's
+        folder holds the calculation of another model or another PC (a file copy of a model
+        still points at the original's result folders; a synced folder is shared): deleting
+        would take their results. force=True deletes anyway."""
+        return await _timed(flow.flow_delete, session, name, force, timeout_s=330)
 
     @mcp.tool()
-    async def flow_solve(timeout_s: float = 120.0) -> dict:
+    async def flow_solve(timeout_s: float = 120.0, case: str | None = None, force: bool = False,
+                         cpus: int | None = None) -> dict:
         """Save the document, mesh and solve the active Flow project, and return its goals
         {name, value, unit} (SI). SolidWorks is NOT held while it runs: the solver is a process
         of its own, and every other tool - also on other documents - works meanwhile.
+        case: a case file (path, or a name in the private cases folder) - the project's solver
+        settings are held against it BEFORE meshing and the solve is refused with the list of
+        differences when they are not the case's (so an incomparable run costs seconds, not an
+        hour). Refused too when the project's folder holds the calculation of another model or
+        another PC (a file copy of a model shares the original's Flow folders): flow_clone and
+        solve the clone, or force=True. cpus: solver threads (default: Flow's choice).
+        When it ends, `run` names the result.json written into the project's folder (settings,
+        mesh and geometry fingerprints, cells, each goal's last and averaged value, the case
+        verdict) and the registry line appended. A goal that still swings is sampled at a
+        random phase by its last value: compare runs by `averaged`.
         A run that outlasts timeout_s (max 50 s of waiting) answers {job_id, state: running}:
         flow_status(job_id) shows the iteration, the goals' current values and the percent;
         get_job(job_id, wait_s) returns the goals when it is done - never start it again
@@ -1515,7 +1549,7 @@ def register(server) -> None:
         if worker is None:
             return {"ok": False, "error": "SolidWorks tools only work on Windows with SolidWorks."}
         def begin(s):
-            return flow.solve_begin(s)
+            return flow.solve_begin(s, force, case, cpus)
         begin.__name__ = "flow_solve"      # the journal's and the guard's name for the call
 
         begun = await _timed(begin, session, timeout_s=120)
@@ -1533,7 +1567,15 @@ def register(server) -> None:
                         jobs.update(job_id, worker_pid=event.get("pid"))
                     elif event.get("event") == "started":
                         jobs.update(job_id, project=event.get("project"), directory=event.get("directory"))
-                reply = flow.solve_run(request, on_event)
+                seen = {}
+
+                def on_event_seen(event: dict) -> None:
+                    if event.get("event") == "started":
+                        seen.update(event)
+                    on_event(event)
+                reply = flow.solve_run(request, on_event_seen)
+                if request.get("record"):
+                    reply["run"] = flow.record_run(seen.get("directory"), request)
                 outcome = reply
                 return reply
             except Exception as exc:  # noqa: BLE001 - journalled, then the job records it
@@ -1578,9 +1620,102 @@ def register(server) -> None:
         """The current document's Flow projects and the active one: its boundary conditions and
         goals, mesh_level, min_gap_mm (null = automatic: switched off in the project),
         domain_m {xmin .. zmax} in metres, its folder, and from the last run the cell count
-        and iterations (last_results, last_run). Check mesh_level and domain_m before
-        comparing two projects' results."""
+        and iterations (last_results, last_run). Level, gap and domain are NOT the whole
+        mesh: flow_mesh_get shows all of it, flow_compare says whether two runs compare."""
         return await _timed(flow.flow_info, session, timeout_s=660)
+
+    @mcp.tool()
+    async def flow_mesh_get(prepare: bool = True, force: bool = False) -> dict:
+        """The active Flow project's whole mesh setup - what decides the cell count and moves
+        the results, beyond level, gap and domain:
+        live (from the add-in): automatic or manual, min_gap_mm and whether it is switched
+        on, domain_m, base_mesh {x|y|z: {cells, intervals: [{from_m, to_m, cells, first_m,
+        last_m, ratio}]}} - the base mesh between its control planes; ratio = first cell /
+        last cell of an interval (1 = even), base_mesh_even.
+        solver (from the solver's settings file, which Flow writes here without meshing):
+        result_resolution (the level, counted from 0), min_gap_m, min_wall_m, domain_m,
+        cells [nx, ny, nz], planes {x|y|z: {points_m, cells, ratios, manual}} (the control
+        planes), refinement {CaptureLevel, CellPerGap, EnableThinChannelRefinement,
+        MaxThinChannelRefinementLevel, CurvatureRefinementCriteria,
+        ToleranceCriteriaRefinementLevel, ...}; fingerprint {settings, mesh}: equal
+        fingerprints = the same setup. local_meshes: the project's local mesh items.
+        prepare=False reads the file as the last solve left it. In the automatic mode the
+        base mesh follows the free stream: another angle of attack has other planes."""
+        return await _timed(flow.flow_mesh_get, session, prepare, force, timeout_s=660)
+
+    @mcp.tool()
+    async def flow_mesh_set(spec: dict, force: bool = False) -> dict:
+        """Set the active project's mesh and CHECK it by reading the solver's settings file
+        back. spec: {mesh_level: 1..7, min_gap_mm: number | null (null = automatic, i.e.
+        switched off - this tool can switch it on, flow_set_conditions cannot), domain_m:
+        as in flow_set_conditions, automatic: true | false (false = manual: the mesh as it
+        is now is kept and no longer follows the free stream)} - and/or the 'solver' block
+        of flow_mesh_get or the 'mesh' block of a case, whose cells, planes (points, cell
+        counts, ratios) and refinement levels are then HELD: a difference is an error that
+        names each one. Those cannot be written - no Flow API writes a control plane's
+        ratio or the thin-channel level; they follow from switches a project inherits from
+        the project or template it was made from. To get them right make the project with
+        flow_create_from_case."""
+        return await _timed(flow.flow_mesh_set, session, spec, force, timeout_s=900)
+
+    @mcp.tool()
+    async def flow_case_from_project(name: str, path: str | None = None, results_dir: str | None = None,
+                                     note: str | None = None, template: str | None = None) -> dict:
+        """Write a case file: the complete solver settings of a reference calculation (type,
+        fluid, ambient conditions, turbulence, the whole mesh, goals, convergence criteria),
+        their fingerprints, and what the run gave (cells, each goal's last and averaged
+        value) - to make later projects from (flow_create_from_case) and hold them against
+        (flow_solve(case=...), flow_compare).
+        Source: results_dir - a finished run's folder, read only, no document needed; else
+        the active project (its finished run's settings as solved, or - not solved yet - as
+        Flow writes them now). name: e.g. 'CASE-a_v01', written to the private cases folder
+        (or path). A case is never overwritten: an existing name is refused with the next
+        free version. template: the shared template (made from the reference project) to
+        create projects from on other models; recorded with its MD5."""
+        if results_dir:
+            return _local(flow.flow_case_from_results, name, results_dir, path, note, template)
+        return await _timed(flow.flow_case_from_project, session, name, path, note, template, timeout_s=660)
+
+    @mcp.tool()
+    async def flow_create_from_case(case: str, name: str, alpha_deg: float | None = None,
+                                    velocity_mps: list | None = None, clone_of: str | None = None,
+                                    template: str | None = None) -> dict:
+        """Create a Flow project that calculates the way a case does, and verify it before
+        handing it back. case: a case file (path, or name in the private cases folder).
+        The project is a CLONE of the case's reference project when the document has it
+        (a file copy of the reference model does; clone_of names another project to
+        clone), else it is made from the case's shared template (template=... overrides)
+        with the case's level, gap and domain. The free stream: velocity_mps [vx, vy, vz],
+        or alpha_deg (the case's speed turned: vy = V sin a, vz = -V cos a), else the
+        case's own. Then Flow writes the solver's settings file (no meshing) and every
+        setting is held against the case; with the case's own free stream also the derived
+        base mesh, plane by plane. Any difference removes the new project and is listed -
+        so a project you get back is comparable (verified: true). Then
+        flow_solve(case=<same>)."""
+        return await _timed(flow.flow_create_from_case, session, case, name, alpha_deg, velocity_mps,
+                            clone_of, template, timeout_s=900)
+
+    @mcp.tool()
+    async def flow_compare(run_a: str, run_b: str, force: bool = False) -> dict:
+        """Compare two finished Flow runs (project folders by path, or folder names in the
+        private compare_runs_dir) - no SolidWorks, nothing written. First whether they are
+        the same way of calculating: every solver setting but names, ids and the free
+        stream (and, at different free streams, the base mesh derived from it). If not,
+        the answer is an error listing the differing settings - deltas between runs of
+        different meshes or domains are not results; force=True gives them anyway, with a
+        warning. Comparable runs: per goal the last and the averaged value of both and
+        the delta in %, and with the private reduction parameters the lift, drag and
+        moment coefficients. Use `averaged`: a goal that still swings is sampled at a
+        random phase by its last value, and the solver is not bit-repeatable in parallel."""
+        return _local(flow.flow_compare, run_a, run_b, force)
+
+    @mcp.tool()
+    async def flow_template_record(file_name: str, source: str | None = None, status: str | None = None) -> dict:
+        """Enter a template (.fwp) lying in the shared templates folder into its
+        templates_manifest.json with the file's MD5 (source, status: free text) - only
+        recorded templates are used by flow_create_project / flow_create_from_case. Returns
+        the entry and the folder's state (ok / mismatch / unlisted / missing)."""
+        return _local(flow.flow_template_record, file_name, source, status)
 
     @mcp.tool()
     async def release_ui(dry_run: bool = False, clear_quarantine: bool = False) -> dict:

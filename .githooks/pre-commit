@@ -1,0 +1,3 @@
+#!/bin/sh
+# Leak guard: refuse a commit whose staged changes add private text (Docs/LEAK_GUARD.md).
+exec sh "$(dirname "$0")/leak-guard.sh" staged

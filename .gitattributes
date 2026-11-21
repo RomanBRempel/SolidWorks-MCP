@@ -1,0 +1,2 @@
+# The git hooks are POSIX sh: a CRLF checkout (core.autocrlf on Windows) would break them.
+/.githooks/* text eol=lf

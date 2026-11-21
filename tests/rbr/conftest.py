@@ -269,3 +269,11 @@ def swmcp_home(tmp_path, monkeypatch):
     monkeypatch.setenv("SWMCP_HOME", str(tmp_path))
     monkeypatch.delenv("SWMCP_SCRIPTS", raising=False)
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _no_developer_private_settings(tmp_path_factory, monkeypatch):
+    """Tests never read the private settings of the machine they run on (rbr/private.py):
+    the private folder is an empty one unless a test sets its own."""
+    monkeypatch.setenv("SWMCP_PRIVATE_DIR", str(tmp_path_factory.mktemp("private_none")))
+    monkeypatch.delenv("SWMCP_LEAK_DENYLIST", raising=False)
