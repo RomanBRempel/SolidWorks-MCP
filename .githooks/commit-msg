@@ -1,0 +1,3 @@
+#!/bin/sh
+# Leak guard: refuse a commit whose message holds private text (Docs/LEAK_GUARD.md).
+exec sh "$(dirname "$0")/leak-guard.sh" message "$1"

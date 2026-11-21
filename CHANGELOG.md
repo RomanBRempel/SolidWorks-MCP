@@ -5,6 +5,110 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Added (rbr 1.13.0) - reproducible Flow runs: the whole mesh, cases, fingerprints, folder guard, leak guard
+Verified on a live SolidWorks 2025 SP3 + Flow Simulation 2025 (2026-11-21) through
+the real server object in a separate process, on file copies in a sandbox; unit
+tests are pure and synthetic. What was measured first, because it decided the design:
+
+- Level, minimum gap and domain are NOT the whole mesh. Two projects equal in all
+  three differed in the solver's settings file in the control planes' stretch
+  ratios (stretched towards the domain against even) and in the thin-channel
+  refinement level - and a force goal moved by several percent.
+- No Flow API writes those, and none reads them from the project: NIK lists two
+  mesh parameters in the automatic mode (level, gap); the classic add-in API's
+  GlobalMeshSettings.GetParameter answers E_FAIL for every parameter type, in the
+  automatic and in the manual mode. They follow from switches of the automatic
+  mesh that a project inherits from the project it was cloned from or the template
+  it was created from. Writing the domain, the gap or the level (NIK or classic)
+  does not change them.
+- Flow writes the solver's settings file on demand, without meshing
+  (UpdateConfigAndDataFiles, ~3 s): that file is the ground truth and is what the
+  new tools read and compare.
+- The solver is not bit-repeatable in parallel: the same project solved twice gave
+  identical goal histories for the first iterations and then drifted apart; the
+  goals' LAST values differed by about half a percent (the goal still swings when
+  the convergence criterion stops the run, and the last value samples a random
+  phase), their AVERAGED values by a few hundredths of a percent. Runs are
+  compared by `averaged`.
+- Flow numbers a new project's folder from a counter kept in the document and
+  skips numbers whose folder exists; a file copy of a model keeps pointing at the
+  original's folders, and two PCs sharing a synced folder take the same number.
+- The classic CopyParameters(project) does carry the hidden switches from one
+  project to another, also across documents - but the target then moves into
+  another project folder, and deleting it emptied that folder. Not used.
+
+New and changed:
+
+- flow_mesh_get(prepare=True): the active project's whole mesh - live from the
+  add-in (automatic / manual, gap and whether it is on, domain, the base mesh as
+  intervals between control planes with cell counts and ratios) and as the solver
+  gets it (cells per axis, control planes: points, cells, ratios; refinement
+  levels; gap, wall, domain), with fingerprints of the settings and of the mesh.
+- flow_mesh_set(spec): writes what an API writes - level, gap (also switching it
+  on and off through the classic API, which NIK cannot), domain, automatic /
+  manual (manual keeps the present mesh when the free stream changes) - then reads
+  the solver file back and HOLDS the rest of the specification (the `solver` block
+  of flow_mesh_get or a case's `mesh` block): a difference is an error naming each
+  place and saying how to get it right.
+- Cases. flow_case_from_project(name, results_dir=...) writes a case file: every
+  solver setting of a reference run that is not a name, an id or a path, the
+  readable mesh / conditions / goals, fingerprints, and what the run gave (cells,
+  each goal's last and averaged value). From a finished run's folder it needs no
+  document and writes nothing there. A case is never overwritten (the error names
+  the next version). flow_create_from_case(case, name, alpha_deg | velocity_mps)
+  makes a project by cloning the case's reference project when the document has
+  it (a file copy of a model that still holds it does), else from the case's
+  shared template; sets the free stream; has Flow write the solver file and holds
+  EVERY setting against the case - at the case's own free stream also the derived
+  base mesh, plane by plane. A project that differs is removed and the differences
+  are listed.
+- flow_solve(case=..., force=False, cpus=None): with a case the settings are held
+  against it before any meshing, and a difference refuses the solve in seconds.
+  After a solve, result.json is written into the project's folder (settings / mesh
+  / geometry fingerprints, cells, iterations, each goal's last, averaged, min, max,
+  delta; the case verdict; solver, CAD and server versions, computer, cores) and a
+  line is appended to the run registry (CSV, append-only).
+- flow_compare(run_a, run_b, force=False): two finished runs, no SolidWorks.
+  Different ways of calculating are refused with the list of differing settings
+  (force compares anyway, with a warning); another free stream alone is not a
+  difference (the base mesh derived from it is left out, even against stretched
+  is not). Goal deltas by last and by averaged value, and lift / drag / moment
+  coefficients when the private settings give the reduction parameters.
+- Folder guard. flow_solve and flow_delete refuse when the project's folder holds
+  the calculation of another model, another project or another computer (the
+  solver's own files say whose), or carries another PC's claim; flow_create_project
+  and flow_clone write a claim into the new folder, take a lock file beside the
+  model while they work, and refuse a new project whose folder already holds
+  someone's calculation. With `flow_folder_slot: "k/M"` in the private settings a
+  PC takes only folder numbers n with n % M == k (placeholders are made before and
+  removed after), so two PCs creating at the same moment get different folders.
+- Templates from one shared folder. With `templates_dir` in the private settings
+  flow_create_project takes a template from there only and checks its MD5 against
+  templates_manifest.json; a PC-local template needs allow_local=True and is
+  reported. flow_template_record enters a template into the manifest.
+  server_health.flow_setup: which private keys are set (never their values), the
+  shared templates against the manifest, cores, the folder slot.
+- Private settings (rbr/private.py): one JSON file outside the repository
+  (%LOCALAPPDATA%\solidworks-mcp\private, or SWMCP_PRIVATE_DIR) with templates_dir,
+  cases_dir, runs_registry, sandbox_dir, compare_runs_dir, flow_folder_slot,
+  reference {...} and leak_denylist. Tools name a missing key, never a value.
+- Leak guard (rbr/leak.py, .githooks, a CI workflow, Docs/LEAK_GUARD.md): commits,
+  commit messages and PR text are scanned for the private denylist and for generic
+  classes (user-profile paths, drive paths with Cyrillic folders, e-mail
+  addresses); findings are reported as file:line and kind, never the text.
+  get_journal(sanitized=True) replaces the same in what goes into a report.
+- scripts/cfd_regression.py: the local acceptance run - a copy of the reference
+  model, a project from the case, solved twice; cells, goals against the reference
+  by last and by averaged value, repeat against repeat. Everything about the
+  reference comes from the private settings. scripts/cfd_grid_convergence.py: three
+  mesh levels of the case, Richardson extrapolation of the coefficients.
+
+Not done, and why: a project's hidden mesh switches cannot be repaired in place
+(no API; see above) - the way is a clone of a project that has them or a template
+made from one in Flow's own dialog (there is no API to save a template). The
+add-in is loaded by the Flow tools when it is off (LoadAddIn) - written from the
+documentation, not exercised (the add-in was on).
+
 ### Fixed (rbr 1.12.1) - flow_create_project from a template made on another model
 Found the day after 1.12.0 with a template saved from a real project, checked live
 on SolidWorks 2025 SP3 + Flow Simulation 2025 (9 checks) except where said.

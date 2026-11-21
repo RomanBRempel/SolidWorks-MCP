@@ -1,0 +1,54 @@
+# Leak guard (Docs/LEAK_GUARD.md): no commit and no PR text may carry private strings.
+# Prints `commit file:line kind` only - never the text that matched.
+name: Leak check
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  leak:
+    runs-on: ubuntu-latest   # the scanner is stdlib only and runs by file path: no pywin32, no SolidWorks
+    env:
+      # Optional repository secret: the denylist, one entry per line (or separated by |).
+      # Without it (and on PRs from forks) the generic patterns alone are checked.
+      SWMCP_LEAK_DENYLIST: ${{ secrets.LEAK_DENYLIST }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - name: Commits
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ -n "$BEFORE" ] && [ -z "$(printf %s "$BEFORE" | tr -d 0)" ]; then
+            range="origin/$DEFAULT_BRANCH..$AFTER"    # a new branch: what the default branch does not have
+          elif [ -n "$BEFORE" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range="$BEFORE..$AFTER"
+          else
+            range="origin/$DEFAULT_BRANCH..$AFTER"    # a forced push: the old tip is gone
+          fi
+          uv run --no-project --python 3.12 python src/solidworks_mcp/rbr/leak.py range "$range"
+      - name: PR title and description
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        shell: bash
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY" > "$RUNNER_TEMP/pr-text.txt"
+          uv run --no-project --python 3.12 python src/solidworks_mcp/rbr/leak.py text "$RUNNER_TEMP/pr-text.txt"

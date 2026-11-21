@@ -31,7 +31,13 @@ import os
 import sys
 import time
 import traceback
-import winreg
+
+try:
+    import winreg
+except ImportError:  # not Windows: the pure parts are still importable (tests)
+    winreg = None
+
+from . import flow_case
 
 NIK_TYPELIB = ("{CB182AE6-7258-43F3-B058-25ACFBD58535}", 0, 1, 0)
 FEATURE_TYPES = {2: "boundary_condition", 3: "surface_source", 4: "volume_source", 5: "rotating_region",
@@ -201,6 +207,66 @@ class Flow:
         except Exception:  # noqa: BLE001
             return None
 
+    # --- whose folder (a file copy of a model shares the original's Flow folders; a synced
+    #     folder is written by more than one PC) ----------------------------------------------
+
+    def refusal(self, proj, request: dict, doing: str) -> str | None:
+        """Why this project's folder is not ours to `doing` (solve into / delete), or None."""
+        folder = self.folder(proj)
+        reason = folder_refusal(folder, request.get("document"), request.get("computer"), proj.Name)
+        if reason is None:
+            return None
+        return (f"Refused to {doing} project '{proj.Name}': {reason}. flow_clone the project and work on the "
+                "clone (a clone gets a folder of its own), or repeat with force=True to go ahead.")
+
+    def claim(self, proj, request: dict) -> dict | None:
+        folder = self.folder(proj)
+        if not folder:
+            return None
+        try:
+            uuid = proj.UUID
+        except Exception:  # noqa: BLE001
+            uuid = None
+        return write_claim(folder, request.get("document"), request.get("computer"), proj.Name, uuid,
+                           request.get("server"))
+
+    def make_room(self, request: dict) -> dict:
+        """Before a project is made: take the folder's lock and, when this PC has a slot,
+        fill the free numbers that are not its own, so Flow's next folder number is."""
+        folder = os.path.dirname(request.get("document") or "")
+        if not folder:
+            return {"placeholders": [], "folder": ""}
+        reason = flow_case.lock(folder, request.get("computer"), str(request.get("op")))
+        if reason:
+            raise Refused(reason + ".")
+        try:
+            room = flow_case.reserve(folder, flow_case.parse_slot(request.get("slot")), request.get("computer"))
+        except flow_case.CaseError as exc:
+            flow_case.unlock(folder, request.get("computer"))
+            raise Refused(str(exc)) from None
+        room["folder"] = folder
+        return room
+
+    def room_done(self, request: dict, room: dict) -> None:
+        flow_case.release(room.get("placeholders"))
+        if room.get("folder"):
+            flow_case.unlock(room["folder"], request.get("computer"))
+
+    def taken(self, proj, request: dict) -> str | None:
+        """A project that was just made must sit in a folder nobody else calculated in."""
+        folder = self.folder(proj)
+        holder = flow_case.owner(folder) if folder else None
+        other = read_claim(folder) if folder else None
+        mine = str(request.get("computer") or "").lower()
+        if holder is not None:
+            return (f"Flow gave the new project the folder '{os.path.basename(folder)}', which already holds a "
+                    f"calculation (project '{holder.get('project')}' of '{holder.get('model')}', made on "
+                    f"{holder.get('computer')})")
+        if other and str(other.get("computer") or "").lower() not in ("", mine):
+            return (f"Flow gave the new project the folder '{os.path.basename(folder)}', which "
+                    f"{other.get('computer')} claimed at {other.get('claimed')}")
+        return None
+
     def rebuild_error(self, proj, offset: int, what: str) -> str:
         reasons = [r for r in [proj.GetLastRebuildError()] + log_warnings(offset) if r]
         return f"{what}: " + ("; ".join(reasons) if reasons else "Flow gave no reason (see its Messages pane).")
@@ -266,7 +332,11 @@ class Flow:
         if request["name"] in (self.doc.GetProjectNames() or ()):
             raise Refused(f"The document already has a Flow project '{request['name']}'.")
         active_before = self.active_name()
-        proj = self.doc.CreateProjectFromTemplate(request["template"], request["name"])
+        room = self.make_room(request)
+        try:
+            proj = self.doc.CreateProjectFromTemplate(request["template"], request["name"])
+        finally:
+            self.room_done(request, room)
         if proj is None:
             raise Refused(self.rebuild_error(self.project(), offset, "Flow did not create the project")
                           if self.doc.GetActiveProject() is not None else
@@ -288,7 +358,14 @@ class Flow:
                                     else "")
                           + (" The project was not kept; the document is as it was." if gone else
                              f" The half-made project '{request['name']}' could not be removed: flow_delete it."))
-        reply = {"project": proj.Name, "template": request["template"], "features": self.features(proj)}
+        taken = self.taken(proj, request)
+        if taken:
+            raise Refused(f"{taken}: another PC or a copy of this model works in the same folder. The project "
+                          f"'{request['name']}' was left in the document unsolved - flow_delete(name, force=True) "
+                          "it only if that folder's results are not needed.")
+        self.claim(proj, request)
+        reply = {"project": proj.Name, "template": request["template"], "directory": self.folder(proj),
+                 "features": self.features(proj)}
         if dropped:
             reply["template_items_removed"] = dropped
             reply["note"] = ("The template brought goals / conditions bound to the model it was made from; they "
@@ -383,8 +460,27 @@ class Flow:
         proj = self.project()
         mesh = proj.GlobalMeshSettings
         gap = self.read(mesh, P_GAP)
-        return {"project": proj.Name, "mesh_level": self.read(mesh, P_MESH_LEVEL, integer=True),
+        try:
+            uuid = proj.UUID
+        except Exception:  # noqa: BLE001
+            uuid = None
+        return {"project": proj.Name, "project_uuid": uuid, "directory": self.folder(proj),
+                "mesh_level": self.read(mesh, P_MESH_LEVEL, integer=True),
                 "min_gap_mm": None if gap is None else gap * 1000.0, "domain_m": self.domain(proj)}
+
+    def prepare(self, request: dict) -> dict:
+        """Write the solver's settings file from the project as it stands, without meshing
+        or solving: what flow_mesh_get and the check against a case read."""
+        proj = self.project()
+        refusal = self.refusal(proj, request, "prepare")
+        if refusal and not request.get("force"):
+            raise Refused(refusal)
+        offset = log_offset()
+        if request.get("rebuild", True) and not self.doc.Rebuild(False, False, False, True, True):
+            raise Refused(self.rebuild_error(proj, offset, "The project does not rebuild"))
+        proj.UpdateConfigAndDataFiles()
+        folder = self.folder(proj)
+        return {"project": proj.Name, "directory": folder, "config": flow_case.config_path(folder)}
 
     # --- projects ---------------------------------------------------------------------
 
@@ -400,7 +496,11 @@ class Flow:
         if any(n.lower() == new.lower() for n in self.names()):
             raise Refused(f"The document already has a Flow project '{new}'.")
         offset = log_offset()
-        self.config().CloneProject(source, new, bool(request.get("copy_results")))
+        room = self.make_room(request)
+        try:
+            self.config().CloneProject(source, new, bool(request.get("copy_results")))
+        finally:
+            self.room_done(request, room)
         if new not in self.names():
             reasons = "; ".join(log_warnings(offset))
             raise Refused(f"Flow did not clone '{source}' to '{new}'." + (f" {reasons}" if reasons else ""))
@@ -408,11 +508,28 @@ class Flow:
             self.config().ActivateProject(new, False)
         if self.active_name() != new:
             raise Refused(f"'{new}' was cloned from '{source}' but did not become the active project.")
-        return {"project": new, "cloned_from": source, "projects": self.names(),
-                "features": self.features(self.project())}
+        proj = self.project()
+        taken = self.taken(proj, request)
+        if taken:
+            raise Refused(f"{taken}: another PC or a copy of this model works in the same folder. The clone "
+                          f"'{new}' was left in the document unsolved - flow_delete(name, force=True) it only "
+                          "if that folder's results are not needed, or clone again once the folders are synced.")
+        self.claim(proj, request)
+        return {"project": new, "cloned_from": source, "projects": self.names(), "directory": self.folder(proj),
+                "features": self.features(proj)}
 
     def delete(self, request: dict) -> dict:
         name = self.named(request["name"])
+        if not request.get("force"):
+            # the folder is only known of the active project: look, and put the earlier one back
+            before = self.active_name()
+            if before != name:
+                self.config().ActivateProject(name, False)
+            refusal = self.refusal(self.project(), request, "delete") if self.active_name() == name else None
+            if refusal:
+                if before and before != name:
+                    self.config().ActivateProject(before, False)
+                raise Refused(refusal + " Deleting a project deletes its folder.")
         removed = self.config().RemoveProject(name)
         if not removed or name in self.names():
             raise Refused(f"Flow did not delete project '{name}'.")
@@ -425,12 +542,25 @@ class Flow:
 
     def solve(self, request: dict) -> dict:
         proj = self.project()
+        refusal = self.refusal(proj, request, "solve")
+        if refusal and not request.get("force"):
+            raise Refused(refusal + " Solving overwrites the results in the folder.")
         offset = log_offset()
         if not self.doc.Rebuild(False, False, False, True, True):
             raise Refused(self.rebuild_error(proj, offset, "The project does not rebuild"))
+        self.claim(proj, request)
+        if request.get("case_path"):
+            self.hold_to_case(proj, request)
         emit({"event": "started", "project": proj.Name, "directory": self.folder(proj)})
         t0 = time.time()
-        if not proj.Solve(True, True, True):
+        if request.get("cpus"):
+            params = self.wrap(proj.CreateSolveParameters(), "ISolveParameters")
+            params.BuildMesh, params.Recalculate, params.CloseMonitor = True, True, True
+            params.cpus = int(request["cpus"])
+            solved = proj.Solve3(params)
+        else:
+            solved = proj.Solve(True, True, True)
+        if not solved:
             raise Refused(self.rebuild_error(proj, offset, "Flow did not solve"))
         reply = self.goals({"service": False}, proj)
         reply["solve_s"] = round(time.time() - t0, 1)
@@ -441,6 +571,23 @@ class Flow:
         if warnings:
             reply["warnings"] = warnings
         return reply
+
+    def hold_to_case(self, proj, request: dict) -> None:
+        """Before any meshing: the settings Flow would hand the solver, against the case.
+        A difference refuses the solve and names itself - a run that is not comparable is
+        not worth its hour."""
+        case = flow_case.load_case(request["case_path"])
+        proj.UpdateConfigAndDataFiles()
+        path = flow_case.config_path(self.folder(proj))
+        if not path:
+            raise Refused("Flow wrote no solver settings file for the project, so it cannot be held against "
+                          "the case.")
+        found = flow_case.check_case(flow_case.read_config(path), case, "all")
+        if found and not request.get("force_case"):
+            shown = "; ".join(f"{d['key']}: {d['have']} (case: {d['want']})" for d in found[:12])
+            raise Refused(f"Project '{proj.Name}' is not the case '{case.get('case')}' - {len(found)} setting(s) "
+                          f"differ: {shown}{' ...' if len(found) > 12 else ''}. Nothing was meshed or solved. "
+                          "flow_mesh_get shows the mesh; make the project from the case (flow_create_from_case).")
 
     def load_in_solidworks(self, proj) -> str | None:
         """Load the final result file into Flow's Results in SolidWorks, so plots can be made
@@ -511,7 +658,45 @@ class Flow:
 
 
 OPS = ("create_project", "add_boundary_condition", "add_goal", "set_conditions", "set_domain", "settings",
-       "activate", "clone", "delete", "solve", "goals", "info")
+       "activate", "clone", "delete", "solve", "goals", "info", "prepare")
+
+CLAIM_FILE = "mcp_owner.json"
+
+
+def read_claim(folder: str | None) -> dict | None:
+    """Who made the project of a folder (written by this server at create / clone / solve)."""
+    try:
+        with open(os.path.join(folder or "", CLAIM_FILE), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def write_claim(folder: str, document, computer, project, uuid=None, server=None) -> dict | None:
+    claim = {"computer": computer, "model": os.path.basename(str(document or "")), "project": project,
+             "project_uuid": uuid, "claimed": time.strftime("%Y-%m-%d %H:%M:%S"), "server": server}
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, CLAIM_FILE), "w", encoding="utf-8") as fh:
+            json.dump(claim, fh, ensure_ascii=False, indent=1)
+    except OSError:
+        return None
+    return claim
+
+
+def folder_refusal(folder, document, computer, project) -> str | None:
+    """Why a project folder is not this document's on this PC: the solver's own files say so
+    (another model, another project, another computer), or another PC's claim does."""
+    if not folder:
+        return None
+    reason = flow_case.foreign(flow_case.owner(folder), document, computer, project)
+    if reason:
+        return reason
+    claim = read_claim(folder)
+    if claim and computer and claim.get("computer") and str(claim["computer"]).lower() != str(computer).lower():
+        return f"the folder was claimed by another computer, {claim.get('computer')}, at {claim.get('claimed')}"
+    return None
 
 
 def emit(line: dict) -> None:
