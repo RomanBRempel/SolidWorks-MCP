@@ -12,7 +12,9 @@ What it does, on a file copy of the reference model in the private sandbox_dir:
    (flow_solve(case=...)), `--runs` times (default 2),
 3. checks: the cell count is the reference's; each goal is within the private tolerance of
    the reference - by its last value AND by its averaged value; the repeats agree with each
-   other within --repeat-tolerance (default 0.1 %).
+   other within --repeat-tolerance (default 0.1 %). The private key reference.compare
+   ('averaged' | 'value' | 'both', default 'both') says which of the two decides; the
+   other is shown as [info].
 
 Run it with the server's interpreter, from the repository:
 
@@ -51,9 +53,14 @@ def call(tool: str, **args) -> dict:
         return {"ok": False, "error": text}
 
 
-def check(label: str, passed: bool, detail="") -> bool:
-    CHECKS.append((label, bool(passed)))
-    print(f"  [{'PASS' if passed else 'FAIL'}] {label}" + (f" - {detail}" if detail != "" else ""), flush=True)
+def check(label: str, passed: bool, detail="", gate: bool = True) -> bool:
+    """A check that counts (gate) or one that is only shown: [info] with ok / off."""
+    if gate:
+        CHECKS.append((label, bool(passed)))
+        mark = "PASS" if passed else "FAIL"
+    else:
+        mark = "info: ok" if passed else "info: off"
+    print(f"  [{mark}] {label}" + (f" - {detail}" if detail != "" else ""), flush=True)
     return bool(passed)
 
 
@@ -107,6 +114,13 @@ def main() -> int:
         return 2
     register(server)
     tolerance = ref.get("tolerance") or {}
+    # which goal value decides: 'averaged' (over the solver's analysis interval), 'value' (the
+    # last iteration) or 'both'. The parallel solver is not bit-repeatable and a goal that
+    # still swings is sampled at a random phase by its last value, so 'value' may fail a
+    # tight tolerance on a correct setup; the other kind is still shown.
+    decides = str(ref.get("compare") or "both").lower()
+    gate = {"value": decides in ("value", "both"), "averaged": decides in ("averaged", "both")}
+    print(f"goal values that decide: {decides}", flush=True)
     expected = ref["expected"]
     case_path = os.path.join(cases, ref["case_name"] + ".json")
     if not os.path.isfile(case_path):
@@ -155,10 +169,11 @@ def main() -> int:
             for goal, numbers in stored.get("goals", {}).items():
                 if goal in expected:
                     passed, text = within(numbers.get("value"), expected[goal], tolerance, goal)
-                    check(f"run {i}: {goal} last value against the reference", passed, text)
+                    check(f"run {i}: {goal} last value against the reference", passed, text, gate["value"])
                 if goal in reference_goals:
                     passed, text = within(numbers.get("averaged"), reference_goals[goal].get("averaged"), tolerance, goal)
-                    check(f"run {i}: {goal} averaged against the reference's averaged", passed, text)
+                    check(f"run {i}: {goal} averaged against the reference's averaged", passed, text,
+                          gate["averaged"])
         for i in range(1, len(runs)):
             a, b = runs[0], runs[i]
             check(f"repeat {i + 1}: the same cells as run 1", a.get("cells") == b.get("cells"), f"{a.get('cells')} / {b.get('cells')}")
@@ -175,7 +190,7 @@ def main() -> int:
                     else:
                         pct = (vb - va) / abs(va) * 100.0 if va else float("nan")
                         passed, text = abs(vb - va) <= args.repeat_tolerance * abs(va), f"{va:.6g} / {vb:.6g}: {pct:+.3f} %"
-                    check(f"repeat {i + 1}: {goal} {which} against run 1", passed, text)
+                    check(f"repeat {i + 1}: {goal} {which} against run 1", passed, text, gate[which])
     finally:
         if not args.keep:
             call("close_part", save=False)
