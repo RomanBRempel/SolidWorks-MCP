@@ -25,7 +25,7 @@ from . import (apiref, assembly, batch, bodies as bodies_mod, cavity, chain, con
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.12.0"
+RBR_VERSION = "1.12.1"
 
 INSTRUCTIONS = """
 
@@ -1427,7 +1427,11 @@ def register(server) -> None:
         'z': [...]} or [xmin, xmax, ymin, ymax, zmin, zmax]; without it Flow's automatic
         domain, which is far larger than a hand-set one - results of the two do not compare.
         min_gap_mm: the mesh's minimum gap size; settable only when the template has it
-        switched on (the error says how to get such a template).
+        switched on (the error says how to get such a template). A template also carries the
+        goals and boundary conditions of the project it was made from: those that find no
+        faces on this model are removed and listed (template_items_removed). A project that
+        cannot be finished is not left in the document: the error gives Flow's reason and
+        the project that was active before is active again.
         Then: flow_add_boundary_condition, flow_add_goal, flow_set_conditions, flow_solve.
         Needs the Flow Simulation add-in and its API SDK."""
         return await _timed(flow.flow_create_project, session, name, template, mesh_level, domain_m,

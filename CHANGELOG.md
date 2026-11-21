@@ -5,6 +5,23 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Fixed (rbr 1.12.1) - flow_create_project from a template made on another model
+Found the day after 1.12.0 with a template saved from a real project, checked live
+on SolidWorks 2025 SP3 + Flow Simulation 2025 (9 checks) except where said.
+- A template carries the minimum gap size (a project made from one saved with a
+  10 mm gap has the gap parameter and takes a new value) - and also the goals
+  and boundary conditions of its source project, bound to that model's faces.
+  On another model the new project did not rebuild ("cannot find the bodies this
+  item refers to"): flow_create_project failed and left the half-made project in
+  the document, active. Now the items that hold no geometry of this model are
+  removed and listed (template_items_removed) and the project is rebuilt again.
+  This removal is covered by unit tests with stand-in objects only: the
+  template that showed the failure was replaced by a clean one before the fix
+  could be run against it.
+- A project that cannot be finished (an internal-flow template on a solid body)
+  is removed again and the project that was active before is re-activated; the
+  error gives Flow's reason and says the document is as it was (live).
+
 ### Added / Fixed (rbr 1.12.0) - Flow off the COM thread, one COM typing for scripts, sketch_move, chains
 Verified on a live SolidWorks 2025 SP3 + Flow Simulation 2025 (2026-11-20), each
 with a scenario run through the real FastMCP server object from a separate
