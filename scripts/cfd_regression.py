@@ -101,6 +101,9 @@ def main() -> int:
     parser.add_argument("--cpus", type=int, default=None, help="solver threads (default: Flow's choice)")
     parser.add_argument("--repeat-tolerance", type=float, default=0.001, help="between repeats, a fraction")
     parser.add_argument("--keep", action="store_true", help="leave the copy open and its projects in place")
+    parser.add_argument("--template", default=None,
+                        help="make the projects from this shared template (flow_template_record) instead of "
+                             "cloning the model's reference project")
     args = parser.parse_args()
     try:
         settings = private.load()
@@ -147,7 +150,9 @@ def main() -> int:
     try:
         for i in range(1, max(1, args.runs) + 1):
             name = f"REG_{stamp[-6:]}_{i}"
-            made = call("flow_create_from_case", case=ref["case_name"], name=name, velocity_mps=ref["velocity_mps"])
+            extra = {"template": args.template} if args.template else {}
+            made = call("flow_create_from_case", case=ref["case_name"], name=name, velocity_mps=ref["velocity_mps"],
+                        **extra)
             if not check(f"run {i}: project from the case, settings verified equal", made.get("ok") and made.get("verified"),
                          made.get("error", "")):
                 break

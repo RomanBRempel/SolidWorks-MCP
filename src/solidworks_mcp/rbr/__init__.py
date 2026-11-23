@@ -1738,7 +1738,8 @@ def register(server) -> None:
         handing it back. case: a case file (path, or name in the private cases folder).
         The project is a CLONE of the case's reference project when the document has it
         (a file copy of the reference model does; clone_of names another project to
-        clone), else it is made from the case's shared template (template=... overrides)
+        clone), else it is made from the case's shared template; template=... given explicitly is used
+        even when the document has that project (a project's hidden mesh switches can drift; a template's cannot)
         with the case's level, gap and domain. The free stream: velocity_mps [vx, vy, vz],
         or alpha_deg (the case's speed turned: vy = V sin a, vz = -V cos a), else the
         case's own. Then Flow writes the solver's settings file (no meshing) and every

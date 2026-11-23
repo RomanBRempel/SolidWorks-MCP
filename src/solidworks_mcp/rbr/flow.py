@@ -1170,7 +1170,9 @@ def flow_create_from_case(session, case, name: str, alpha_deg: float | None = No
         raise SolidWorksError(f"The document already has a Flow project '{name}'.")
     source = clone_of or (loaded.get("source") or {}).get("project")
     made_by = None
-    if source and any(p.lower() == str(source).lower() for p in projects):
+    if source and not (template and not clone_of) and any(p.lower() == str(source).lower() for p in projects):
+        # an explicit template wins over the implicit clone: a project in a model file can
+        # change its hidden mesh switches (seen twice), a recorded template cannot
         reply = _call(session, _request(session, "clone", name=source, new_name=name, copy_results=False,
                                         slot=private.get("flow_folder_slot")))
         made_by = {"cloned_from": reply.get("cloned_from")}

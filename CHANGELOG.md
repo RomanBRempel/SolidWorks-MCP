@@ -43,6 +43,12 @@ the session in a separate process (`tests/test_rbr_s36_live.py`).
 - `rays(..., component=name)` in a script: rays against an assembly component's part, points,
   directions and hits in assembly space; the transform's matrix convention is checked against
   SolidWorks' own MultiplyTransform on every call (`rbr/xform.py`).
+- `flow_create_from_case(template=...)`: a template given explicitly is used even when the
+  document has the case's source project (the clone route took a project whose hidden mesh
+  switches had drifted again: even base mesh, thin-channel level 5 - refused before meshing).
+  `scripts/cfd_regression.py --template NAME` makes its projects that way; so run, the
+  regression passed 20/20 (cells equal, settings and mesh fingerprints equal, averaged goals
+  within the private tolerance of the reference and of each other).
 
 ### Added (rbr 1.13.0) - reproducible Flow runs: the whole mesh, cases, fingerprints, folder guard, leak guard
 Verified on a live SolidWorks 2025 SP3 + Flow Simulation 2025 (2026-11-21) through
