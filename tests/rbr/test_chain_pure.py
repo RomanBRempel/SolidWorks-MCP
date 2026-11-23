@@ -114,3 +114,48 @@ def test_a_part_follows_only_through_a_live_link_to_the_chain():
     assert chain.follows([{"file": "C:/proj/fuselage.SLDPRT", "status": "out of context"}], [FUS]) is True
     assert chain.follows([{"file": "C:/proj/fuselage.SLDPRT", "status": "locked"}], [FUS]) is False
     assert chain.follows([], [FUS]) is False and chain.follows([{"file": None, "status": "in context"}], [FUS]) is False
+
+
+# --- O-60: references whose stored path leads nowhere ----------------------------------------------
+
+
+def test_resolve_keeps_a_stored_path_that_exists():
+    by_name = chain.names_of([r"D:\w\a.sldprt"])
+    assert chain.resolve(r"E:\old\a.sldprt", r"D:\w\b.sldprt", by_name, exists=lambda p: True) == \
+        (chain.key(r"E:\old\a.sldprt"), False)
+
+
+def test_resolve_finds_a_moved_file_by_name_beside_the_referrer_first():
+    files = [r"D:\w\a.sldprt", r"D:\other\a.sldprt", r"D:\w\b.sldprt"]
+    by_name = chain.names_of(files)
+    assert chain.resolve(r"I:\gone\A.SLDPRT", r"D:\w\b.sldprt", by_name, exists=lambda p: False) == \
+        (chain.key(r"D:\w\a.sldprt"), True)
+
+
+def test_resolve_takes_the_only_file_of_that_name_elsewhere_and_refuses_to_guess():
+    by_name = chain.names_of([r"D:\x\a.sldprt"])
+    assert chain.resolve(r"C:\gone\a.sldprt", r"D:\w\b.sldprt", by_name, exists=lambda p: False) == \
+        (chain.key(r"D:\x\a.sldprt"), True)
+    two = chain.names_of([r"D:\x\a.sldprt", r"D:\y\a.sldprt"])
+    assert chain.resolve(r"C:\gone\a.sldprt", r"D:\w\b.sldprt", two, exists=lambda p: False) == \
+        (chain.key(r"C:\gone\a.sldprt"), False)
+
+
+def test_a_moved_chain_is_found_whole():
+    """master -> a -> b moved together: b stores a's old path; it must still follow the master."""
+    files = [r"D:\new\m.sldprt", r"D:\new\a.sldprt", r"D:\new\b.sldprt"]
+    by_name = chain.names_of(files)
+    stored = {r"D:\new\a.sldprt": [r"C:\old\m.sldprt"], r"D:\new\b.sldprt": [r"C:\old\a.sldprt"],
+              r"D:\new\m.sldprt": []}
+    graph = {chain.key(f): [chain.resolve(p, f, by_name, exists=lambda p: False)[0] for p in stored[f]]
+             for f in files}
+    root = chain.key(r"D:\new\m.sldprt")
+    assert chain.in_order(graph, chain.dependents(graph, root)) == [chain.key(r"D:\new\a.sldprt"),
+                                                                     chain.key(r"D:\new\b.sldprt")]
+
+
+def test_follows_uses_the_resolver():
+    refs = [{"file": r"C:\old\a.sldprt", "status": "ok"}]
+    members = [chain.key(r"D:\new\a.sldprt")]
+    assert not chain.follows(refs, members)
+    assert chain.follows(refs, members, lambda p: chain.key(r"D:\new\a.sldprt"))

@@ -5,6 +5,22 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Fixed (rbr 1.14.1) - O-60: rebuild_chain did not update derived parts
+- A part file stores the full path of the part it is derived from. Made on another PC, or
+  synced to another drive letter or folder, that path leads nowhere; SolidWorks then finds
+  the source by its name, but rebuild_chain matched by the stored path only. Such parts
+  never entered the chain, or were skipped as "references broken", and stayed as they were
+  on disk. Reproduced live: master -> A -> B moved to another folder: A was rebuilt, B kept
+  its old volume. In a real project folder 16 of 134 derived-part references stored a path
+  on another drive. Now a stored path that does not exist is matched by file name - beside
+  the referencing part first, else the only scanned file of that name; several candidates
+  keep the stored path. The answer lists those parts in `relinked`. After the fix, B is
+  rebuilt and saved (live test `tests/test_rbr_chain_live.py`).
+- `save_bodies` / `derive_part` refuse a part loaded without a window: SaveToFile3 on it
+  killed SolidWorks (access violation, then heap corruption) instead of failing.
+- `load_hidden` (insert_component, rebuild_chain, open_part(visible=False)) no longer fails
+  when the server's current document was closed meanwhile.
+
 ### Added (rbr 1.14.0) - safe files on a synced drive, a complete run registry, GDI, batch globals, guided lofts
 Verified with unit tests (pure, synthetic) and live on SolidWorks 2025 SP3 (2026-11-23) through
 the session in a separate process (`tests/test_rbr_s36_live.py`).
