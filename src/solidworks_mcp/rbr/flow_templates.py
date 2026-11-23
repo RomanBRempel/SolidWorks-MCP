@@ -21,6 +21,8 @@ import hashlib
 import json
 import os
 
+from . import safefile
+
 MANIFEST = "templates_manifest.json"
 LOCAL_DIRS = (r"C:\ProgramData\COSMOS Applications",)
 
@@ -187,9 +189,5 @@ def record(shared_dir: str, file_name: str, **fields) -> dict:
     entry.update({k: v for k, v in fields.items() if v is not None})
     entry["md5"] = md5_of(path)
     manifest["templates"] = items
-    tmp = os.path.join(shared_dir, MANIFEST + ".tmp")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(manifest, fh, ensure_ascii=False, indent=1)
-        fh.write("\n")
-    os.replace(tmp, os.path.join(shared_dir, MANIFEST))
+    safefile.write_json(os.path.join(shared_dir, MANIFEST), manifest)
     return entry

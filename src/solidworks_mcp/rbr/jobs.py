@@ -26,7 +26,7 @@ import traceback
 import uuid
 
 from ..errors import SolidWorksError
-from . import journal, script_tool
+from . import journal, safefile, script_tool
 
 KEEP_H = 24.0
 SYNC_WAIT_S = float(os.environ.get("SWMCP_SYNC_WAIT_S", "50"))
@@ -54,10 +54,7 @@ def _path(job_id: str) -> str:
 def _write(job: dict) -> None:
     """Persist atomically; a full disk must not fail the job itself."""
     try:
-        tmp = _path(job["job_id"]) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(job, fh, ensure_ascii=False, default=repr)
-        os.replace(tmp, _path(job["job_id"]))
+        safefile.write_json(_path(job["job_id"]), job, indent=None, default=repr)
     except OSError:
         pass
 
@@ -224,8 +221,7 @@ def get(job_id: str) -> dict:
     if job is not None:
         return {"ok": True, **job}
     try:
-        with open(_path(job_id), encoding="utf-8") as fh:
-            return {"ok": True, **json.load(fh)}
+        return {"ok": True, **safefile.read_json(_path(job_id))}
     except (OSError, ValueError):
         raise SolidWorksError(f"No job '{job_id}': it never existed, or its record is older than {KEEP_H:.0f} h.")
 
@@ -240,8 +236,7 @@ def list_jobs(last_n: int = 10) -> dict:
         names = []
     for name in names:
         try:
-            with open(os.path.join(jobs_dir(), name), encoding="utf-8") as fh:
-                rec = json.load(fh)
+            rec = safefile.read_json(os.path.join(jobs_dir(), name))
         except (OSError, ValueError):
             continue
         records.append({k: rec.get(k) for k in ("job_id", "state", "tool", "script", "pid",

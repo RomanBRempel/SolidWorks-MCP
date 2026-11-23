@@ -32,6 +32,8 @@ import os
 import re
 import time
 
+from . import safefile
+
 SCHEMA = 1
 
 _TAG = re.compile(r'<(/?)([A-Za-z_][\w.\-]*)((?:\s+[\w.\-]+\s*=\s*"[^"]*")*)\s*(/?)>', re.S)
@@ -268,20 +270,82 @@ def environment_of(flat: dict) -> dict:
 # --- whose results a folder holds ----------------------------------------------------------------------
 
 
-def read_info(folder: str) -> dict:
-    """<folder>/<n>.info.json (the solver's progress and summary file); {} when there is none."""
+def read_info(folder: str, attempts: int = 1, wait_s: float = 0.5) -> dict:
+    """<folder>/<n>.info.json (the solver's progress and summary file); {} when there is none.
+
+    Bytes after the JSON (NUL padding, the tail of a longer older version) are ignored;
+    a file caught mid-write is read again up to `attempts` times."""
     if not folder or not os.path.isdir(folder):
         return {}
+    for attempt in range(max(1, int(attempts))):
+        if attempt:
+            time.sleep(wait_s)
+        try:
+            names = [n for n in os.listdir(folder) if n.lower().endswith(".info.json")]
+            if not names:
+                return {}
+            path = max((os.path.join(folder, n) for n in names), key=os.path.getmtime)
+            data = safefile.read_json(path)
+            if isinstance(data, dict):
+                return data
+        except (OSError, ValueError):
+            continue
+    return {}
+
+
+_INFO_CELLS = re.compile(r"^\s*Total cells:\s*([\d \t]+?)\s*$", re.M)
+_INFO_FLUID = re.compile(r"^\s*Fluid cells:\s*([\d \t]+?)\s*$", re.M)
+_INFO_ITER = re.compile(r"^\s*Iterations:\s*(\d+)\s*$", re.M)
+_INFO_TRAVELS = re.compile(r"^\s*Travels:\s*([-+0-9.,eE]+)\s*$", re.M)
+
+
+def parse_info_text(text: str) -> dict:
+    """cells, cells_fluid, iterations, travels from the solver's plain-text <n>.info; pure."""
+    out = {}
+    for key, rx, cast in (("cells", _INFO_CELLS, int), ("cells_fluid", _INFO_FLUID, int),
+                          ("iterations", _INFO_ITER, int), ("travels", _INFO_TRAVELS, float)):
+        m = rx.search(text or "")
+        if m:
+            try:
+                out[key] = cast(re.sub(r"\s", "", m.group(1)).replace(",", "."))
+            except ValueError:
+                pass
+    return out
+
+
+def read_info_text(folder: str) -> dict:
+    """parse_info_text of <folder>/<n>.info (the newest); {} when there is none."""
     try:
-        names = [n for n in os.listdir(folder) if n.lower().endswith(".info.json")]
+        names = [n for n in os.listdir(folder or "") if n.lower().endswith(".info")]
         if not names:
             return {}
         path = max((os.path.join(folder, n) for n in names), key=os.path.getmtime)
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+        return parse_info_text(safefile.read_text(path, "utf-8-sig"))
+    except OSError:
         return {}
+
+
+def run_size(folder: str, info: dict | None = None, goals: dict | None = None) -> dict:
+    """{cells, cells_fluid, iterations, travels, source}: from <n>.info.json, else from the
+    plain-text <n>.info, the iterations at last from Goals.DAT - a registry line always
+    says how big the run was and how long it ran when the solver left any trace of it."""
+    info = read_info(folder) if info is None else info
+    mesh = info.get("mesh") or {}
+    tel = info.get("telemetry") or {}
+    out = {"cells": mesh.get("cells_total"), "cells_fluid": mesh.get("cells_fluid"),
+           "iterations": tel.get("iteration"), "travels": tel.get("travel")}
+    source = {k: "info.json" for k, v in out.items() if v is not None}
+    if any(v is None for v in out.values()):
+        for k, v in read_info_text(folder).items():
+            if out.get(k) is None:
+                out[k], source[k] = v, "info"
+    if out["iterations"] is None:
+        goals = goal_stats(folder) if goals is None else goals
+        its = [g.get("iterations") for g in goals.values() if isinstance(g, dict) and g.get("iterations")]
+        if its:
+            out["iterations"], source["iterations"] = max(its), "Goals.DAT"
+    out["source"] = source
+    return out
 
 
 def owner(folder: str) -> dict | None:
@@ -411,8 +475,7 @@ def make_case(flat: dict, name: str, folder: str | None = None, note: str | None
 
 def load_case(path: str) -> dict:
     try:
-        with open(path, encoding="utf-8-sig") as fh:
-            case = json.load(fh)
+        case = safefile.read_json(path)
     except OSError as exc:
         raise CaseError(f"Cannot read the case file '{path}': {exc.strerror or exc}.") from None
     except ValueError as exc:
@@ -426,13 +489,7 @@ def load_case(path: str) -> dict:
 
 
 def save_json(path: str, data: dict) -> str:
-    folder = os.path.dirname(os.path.abspath(path))
-    os.makedirs(folder, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=1)
-        fh.write("\n")
-    os.replace(tmp, path)
+    safefile.write_json(path, data)
     return path
 
 
@@ -549,9 +606,11 @@ def result_record(folder: str, case: dict | None = None, geometry: dict | None =
     if not path:
         raise CaseError(f"'{folder}' holds no prepared calculation (no .xmlconfig).")
     flat = read_config(path)
-    info = read_info(folder)
+    info = read_info(folder, attempts=6)
     system = info.get("system_info") or {}
     telemetry = info.get("telemetry") or {}
+    goals = goal_stats(folder)
+    size = run_size(folder, info, goals)
     record = {
         "schema": SCHEMA,
         "written": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -560,15 +619,16 @@ def result_record(folder: str, case: dict | None = None, geometry: dict | None =
         "solver": system.get("product_name"),
         "cores": system.get("number_of_cores"),
         "finished": info.get("finished"),
-        "cells": (info.get("mesh") or {}).get("cells_total"),
-        "cells_fluid": (info.get("mesh") or {}).get("cells_fluid"),
-        "iterations": telemetry.get("iteration"),
-        "travels": telemetry.get("travel"),
+        "cells": size["cells"],
+        "cells_fluid": size["cells_fluid"],
+        "iterations": size["iterations"],
+        "travels": size["travels"],
+        "size_source": size["source"],
         "cpu_time_s": telemetry.get("cpu_time_solver_total"),
         "fingerprint": {"settings": fingerprint(flat), "mesh": fingerprint(flat, "mesh")},
         "mesh": mesh_of(flat),
         "conditions": conditions_of(flat),
-        "goals": goal_stats(folder),
+        "goals": goals,
     }
     if geometry:
         record["geometry"] = geometry
@@ -651,17 +711,48 @@ REGISTRY_COLUMNS = ("written", "computer", "model", "project", "case", "comparab
                     "folder", "solver", "cad", "server")
 
 
+NO_CASE = "none"
+
+
+def match_case(record: dict, cases_dir: str | None) -> dict | None:
+    """The case in cases_dir whose fingerprint a run has (settings first, else mesh):
+    {name, settings: bool}; None when no case matches or there is no folder."""
+    prints = record.get("fingerprint") or {}
+    if not cases_dir or not os.path.isdir(cases_dir) or not prints.get("settings"):
+        return None
+    mesh_only = None
+    for name in sorted(os.listdir(cases_dir)):
+        if not name.lower().endswith(".json"):
+            continue
+        try:
+            case = load_case(os.path.join(cases_dir, name))
+        except CaseError:
+            continue
+        theirs = case.get("fingerprint") or {}
+        if theirs.get("settings") == prints["settings"]:
+            return {"name": case.get("case"), "settings": True}
+        if mesh_only is None and prints.get("mesh") and theirs.get("mesh") == prints["mesh"]:
+            mesh_only = {"name": case.get("case"), "settings": False}
+    return mesh_only
+
+
 def registry_row(record: dict) -> dict:
     case = record.get("case") or {}
     prints = record.get("fingerprint") or {}
     goals = "; ".join(f"{name}={g.get('value'):.6g} (avg {g.get('averaged'):.6g})"
                       for name, g in (record.get("goals") or {}).items()
                       if g.get("value") is not None and g.get("averaged") is not None)
-    comparable = ""
+    matched = record.get("case_match") or {}
     if case:
+        name = case.get("name") or "?"
         comparable = "yes" if case.get("settings_match") else ("mesh only" if case.get("mesh_matches") else "NO")
+    elif matched.get("name"):
+        name = matched["name"]
+        comparable = "yes (fingerprint)" if matched.get("settings") else "mesh only (fingerprint)"
+    else:
+        name, comparable = NO_CASE, "n/a"
     return {"written": record.get("written"), "computer": record.get("computer"), "model": record.get("model"),
-            "project": record.get("project"), "case": case.get("name") or "", "comparable": comparable,
+            "project": record.get("project"), "case": name, "comparable": comparable,
             "cells": record.get("cells"), "iterations": record.get("iterations"),
             "travels": None if record.get("travels") is None else round(record["travels"], 4),
             "fingerprint_settings": prints.get("settings"), "fingerprint_mesh": prints.get("mesh"),
@@ -672,15 +763,15 @@ def registry_row(record: dict) -> dict:
 def register_run(registry: str, record: dict) -> str:
     """Append the run to the registry CSV (made with its header when new). One line per run;
     lines are only ever added, so two PCs writing the same synced file lose nothing but order."""
-    row = registry_row(record)
-    new = not os.path.isfile(registry)
-    os.makedirs(os.path.dirname(os.path.abspath(registry)), exist_ok=True)
-    with open(registry, "a", encoding="utf-8-sig" if new else "utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=REGISTRY_COLUMNS, delimiter=";", extrasaction="ignore")
-        if new:
-            writer.writeheader()
-        writer.writerow({k: "" if v is None else v for k, v in row.items()})
+    safefile.append_csv_row(registry, REGISTRY_COLUMNS, registry_row(record))
     return registry
+
+
+def read_registry(registry: str) -> list:
+    """The registry's rows as dicts; a garbage tail (NULs, a torn line) is skipped."""
+    if not os.path.isfile(registry):
+        return []
+    return safefile.csv_rows(safefile.read_text(registry))[1]
 
 
 # --- folders next to the model: numbers, reservations, a lock -----------------------------------------
@@ -729,9 +820,9 @@ def reserve(folder: str, slot: tuple | None, computer: str | None) -> dict:
                 return {"target": n, "placeholders": made}
             path = os.path.join(folder, str(n))
             os.makedirs(path, exist_ok=True)
-            with open(os.path.join(path, RESERVED_FILE), "w", encoding="utf-8") as fh:
-                json.dump({"computer": computer, "reserved": time.strftime("%Y-%m-%d %H:%M:%S"),
-                           "why": "keeps this number from a PC it does not belong to"}, fh)
+            safefile.write_json(os.path.join(path, RESERVED_FILE),
+                                {"computer": computer, "reserved": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                 "why": "keeps this number from a PC it does not belong to"})
             made.append(path)
         n += 1
 
@@ -754,8 +845,7 @@ def release(placeholders) -> list:
 def read_lock(folder: str) -> dict | None:
     try:
         path = os.path.join(folder, LOCK_FILE)
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
+        data = safefile.read_json(path)
         if isinstance(data, dict):
             data["age_s"] = max(0.0, time.time() - os.path.getmtime(path))
             return data
@@ -774,8 +864,8 @@ def lock(folder: str, computer: str | None, doing: str) -> str | None:
         return (f"{held.get('computer')} is making a Flow project in this folder right now "
                 f"({held.get('doing')}, {held['age_s']:.0f} s ago): wait until its folder has synced")
     try:
-        with open(os.path.join(folder, LOCK_FILE), "w", encoding="utf-8") as fh:
-            json.dump({"computer": computer, "doing": doing, "at": time.strftime("%Y-%m-%d %H:%M:%S")}, fh)
+        safefile.write_json(os.path.join(folder, LOCK_FILE),
+                            {"computer": computer, "doing": doing, "at": time.strftime("%Y-%m-%d %H:%M:%S")})
     except OSError:
         pass
     return None

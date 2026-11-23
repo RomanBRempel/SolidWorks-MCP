@@ -73,6 +73,47 @@ def load_hidden(session, abs_path: str, doc_type: int) -> bool:
     return True
 
 
+NATIVE = {".sldprt": SW_DOC_PART, ".sldasm": SW_DOC_ASSEMBLY}
+
+
+def open_hidden(session, path: str) -> dict:
+    """Load a part or an assembly WITHOUT a document window and make it the current document
+    of the tools (no GDI objects; SolidWorks' active document stays in front).
+
+    A document open already becomes current as it is (visible or not). Only native files:
+    an import needs a window of its own."""
+    abs_path = os.path.abspath(path)
+    doc_type = NATIVE.get(os.path.splitext(abs_path)[1].lower())
+    if doc_type is None:
+        raise SolidWorksError("visible=False opens native .sldprt / .sldasm files only; an import "
+                              "(STEP, IGES, Parasolid) needs a window.")
+    if not os.path.isfile(abs_path):
+        raise SolidWorksError(f"No such file: {abs_path}")
+    sw = session._ensure()
+    loaded = load_hidden(session, abs_path, doc_type)
+    model = binding.wrap(sw.GetOpenDocumentByName(abs_path), session._mod.IModelDoc2)
+    if model is None:
+        raise SolidWorksError(f"SolidWorks loaded '{abs_path}' but does not hand it out by name.")
+    session._model = model
+    return {"ok": True, "title": model.GetTitle(), "path": abs_path, "visible": bool(model.Visible),
+            "loaded": loaded,
+            "note": "Loaded without a window: the tools work on it as the current document; SolidWorks' own "
+                    "active window is unchanged. close_part closes it; screenshot needs mode='render'."}
+
+
+def _with_visible(name: str, original):
+    """open_part / open_assembly with visible=False: the file is loaded without a window."""
+
+    @functools.wraps(original)
+    def opener(self, path: str, visible: bool = True) -> dict:
+        if visible:
+            return original(self, path)
+        return open_hidden(self, path)
+
+    opener._rbr_visible = True
+    return opener
+
+
 def insert_component(self, path: str, x_mm: float = 0.0, y_mm: float = 0.0,
                      z_mm: float = 0.0, fixed: bool | None = None) -> dict:
     """Upstream's insert_component with the component's file loaded invisibly.
@@ -119,14 +160,23 @@ def insert_component(self, path: str, x_mm: float = 0.0, y_mm: float = 0.0,
 
 
 def apply() -> None:
-    if not _ORIGINAL:
+    if "insert_component" not in _ORIGINAL:
         _ORIGINAL["insert_component"] = SolidWorksSession.insert_component
         functools.update_wrapper(insert_component, _ORIGINAL["insert_component"])  # keeps doc and __wrapped__
         SolidWorksSession.insert_component = insert_component
+    for name in ("open_part", "open_assembly"):   # also when insert_component was installed before
+        current = getattr(SolidWorksSession, name)
+        if not getattr(current, "_rbr_visible", False):
+            _ORIGINAL[name] = current
+            setattr(SolidWorksSession, name, _with_visible(name, current))
 
 
 def unapply() -> None:
     """Restore upstream's insert_component (test teardown)."""
     if _ORIGINAL:
-        SolidWorksSession.insert_component = _ORIGINAL["insert_component"]
+        if "insert_component" in _ORIGINAL:
+            SolidWorksSession.insert_component = _ORIGINAL["insert_component"]
+        for name in ("open_part", "open_assembly"):
+            if name in _ORIGINAL:
+                setattr(SolidWorksSession, name, _ORIGINAL[name])
         _ORIGINAL.clear()

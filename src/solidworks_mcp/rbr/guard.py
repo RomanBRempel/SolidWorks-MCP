@@ -34,7 +34,7 @@ import pythoncom
 from .. import binding
 from ..errors import SolidWorksError
 from ..session import SolidWorksSession
-from . import journal
+from . import journal, safefile
 
 # Tools that only read: no snapshot, no UI freeze or redraw (CommandInProgress is still set).
 READ_ONLY = frozenset({
@@ -119,8 +119,7 @@ class _ProcessLock:
     def holder(self) -> dict | None:
         """What the holder file says: the last process that took the lock (it may be done)."""
         try:
-            with open(self._holder_path(), encoding="utf-8") as fh:
-                data = json.load(fh)
+            data = safefile.read_json(self._holder_path())
             return data if isinstance(data, dict) else None
         except (OSError, ValueError):
             return None
@@ -176,8 +175,8 @@ class _ProcessLock:
         elif not self._local.acquire(timeout=timeout_s):
             raise SolidWorksError(f"SolidWorks is in use; waited {timeout_s:.0f}s.")
         try:
-            with open(self._holder_path(), "w", encoding="utf-8") as fh:
-                json.dump({"pid": os.getpid(), "tool": tool, "since": time.strftime("%H:%M:%S")}, fh)
+            safefile.write_json(self._holder_path(), {"pid": os.getpid(), "tool": tool,
+                                                      "since": time.strftime("%H:%M:%S")}, indent=None)
         except OSError:
             pass
 
@@ -211,18 +210,14 @@ def _owners_path() -> str:
 
 def owners() -> dict:
     try:
-        with open(_owners_path(), encoding="utf-8") as fh:
-            data = json.load(fh)
+        data = safefile.read_json(_owners_path())
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
 def _save_owners(data: dict) -> None:
-    tmp = _owners_path() + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=1)
-    os.replace(tmp, _owners_path())
+    safefile.write_json(_owners_path(), data)
 
 
 def live_entries(data: dict, alive) -> tuple:

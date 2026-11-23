@@ -7,13 +7,14 @@ Constant values were read from swconst.tlb of SOLIDWORKS 2025 (rev 33).
 """
 
 import csv
+import io
 import inspect
 import os
 
 from .. import binding
 from ..errors import SolidWorksError
 from ..session import SolidWorksSession
-from . import meshwall
+from . import meshwall, safefile
 
 SW_DOC_PART = 1
 SW_DOC_ASSEMBLY = 2
@@ -328,15 +329,15 @@ def assembly_bom(session, csv_path: str | None = None, top_level_only: bool = Fa
            "items": items}
     if csv_path:
         keys = sorted({k for r in items for k in r["properties"]})
-        os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
-        with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
-            w = csv.writer(fh, delimiter=";")
-            w.writerow(["file", "config", "type", "qty", "mass_g", "total_g", "material", *keys, "path"])
-            for r in items:
-                vals = [r["properties"].get(k, "") for k in keys]
-                vals = [v.get("resolved") if isinstance(v, dict) else v for v in vals]
-                w.writerow([r["file"], r["config"], r["type"], r["qty"], r["mass_g"], r["total_g"],
-                            r["material"], *vals, r["path"]])
+        buf = io.StringIO()
+        w = csv.writer(buf, delimiter=";", lineterminator="\r\n")
+        w.writerow(["file", "config", "type", "qty", "mass_g", "total_g", "material", *keys, "path"])
+        for r in items:
+            vals = [r["properties"].get(k, "") for k in keys]
+            vals = [v.get("resolved") if isinstance(v, dict) else v for v in vals]
+            w.writerow([r["file"], r["config"], r["type"], r["qty"], r["mass_g"], r["total_g"],
+                        r["material"], *vals, r["path"]])
+        safefile.write_text(csv_path, buf.getvalue(), "utf-8-sig")
         res["csv"] = csv_path
     return res
 

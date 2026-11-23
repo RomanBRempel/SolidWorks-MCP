@@ -121,6 +121,97 @@ def link_dimension(session, dimension: str, expression) -> dict:
             "rebuild_ok": result["rebuild_ok"], "failing_features": result["failing_features"]}
 
 
+NAME_RX = re.compile(r"^[A-Za-z_Ѐ-ӿ][\wЀ-ӿ]*$")
+
+
+def pairs_of(items, what: str) -> list:
+    """[(key, value)] of {key: value} or [[key, value], ...] / [{name|dimension, value|expression}];
+    pure. Order is kept; a key given twice is refused."""
+    if isinstance(items, dict):
+        pairs = list(items.items())
+    elif isinstance(items, (list, tuple)):
+        pairs = []
+        for item in items:
+            if isinstance(item, dict):
+                key = item.get("name", item.get("dimension"))
+                value = item.get("value", item.get("expression"))
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                key, value = item
+            else:
+                raise SolidWorksError(f"{what}: each item is [key, value] or {{name, value}} (got {item!r}).")
+            pairs.append((key, value))
+    else:
+        raise SolidWorksError(f"{what} takes {{key: value}} or a list of [key, value].")
+    if not pairs:
+        raise SolidWorksError(f"{what}: nothing to set.")
+    seen = set()
+    for key, value in pairs:
+        if key is None or value is None or str(key).strip() == "":
+            raise SolidWorksError(f"{what}: a key or value is missing in {key!r} = {value!r}.")
+        if str(key).lower() in seen:
+            raise SolidWorksError(f"{what}: '{key}' is given twice.")
+        seen.add(str(key).lower())
+    return pairs
+
+
+def global_equations(values, known) -> list:
+    """The equation texts that set several globals at once; pure. A value that is an
+    expression may use the other globals - those already there and those of this batch."""
+    pairs = pairs_of(values, "set_globals")
+    for name, _ in pairs:
+        if not NAME_RX.match(str(name)):
+            raise SolidWorksError(f"A global variable name is letters, digits and _ (got {name!r}).")
+    names = list(known) + [str(n) for n, _ in pairs]
+    out = []
+    for name, value in pairs:
+        rhs = value if isinstance(value, (int, float)) and not isinstance(value, bool) else \
+            quote_names(value, [n for n in names if n.lower() != str(name).lower()])
+        out.append(f'"{name}" = {rhs}')
+    return out
+
+
+def link_equations(links, known) -> list:
+    """The equation texts that drive several dimensions at once; pure."""
+    pairs = pairs_of(links, "link_dimensions")
+    return [f'"{dim}" = {quote_names(expr, known)}' for dim, expr in pairs]
+
+
+def set_globals(session, values) -> dict:
+    """Add or change several global variables with ONE rebuild: {name: value | expression}.
+    All or nothing - a refused equation undoes the whole batch."""
+    equations = global_equations(values, _globals(session))
+    result = session.set_equations(equations)
+    entries = {(e.get("name") or "").lower(): e for e in session._equation_entries()}
+    rows = []
+    for text in equations:
+        name = session._equation_lhs(text)
+        entry = entries.get(name.lower()) or {}
+        rows.append({"name": name, "equation": entry.get("equation", text), "value": entry.get("value")})
+    return {"ok": True, "count": len(rows), "globals": rows, "rebuilds": 1,
+            "rebuild_ok": result["rebuild_ok"], "failing_features": result["failing_features"]}
+
+
+def link_dimensions(session, links) -> dict:
+    """Drive several dimensions by expressions of global variables with ONE rebuild:
+    {'D1@Plane5': 'WALL', 'diameter@SK_BOSS': 'HOLE * 2'}. Every dimension is checked to
+    exist before anything changes; all or nothing."""
+    model = session._require_model()
+    pairs = pairs_of(links, "link_dimensions")
+    missing = [d for d, _ in pairs if model.Parameter(d) is None]
+    if missing:
+        raise SolidWorksError(f"No dimension {', '.join(repr(m) for m in missing)} (feature_dimensions lists "
+                              "the full names); nothing was changed.")
+    equations = link_equations(pairs, _globals(session))
+    result = session.set_equations(equations)
+    rows = []
+    for (dimension, _), text in zip(pairs, equations):
+        dim = binding.wrap(model.Parameter(dimension), session._mod.IDimension)
+        unit, _to, from_system = session._dimension_unit(dim)
+        rows.append({"dimension": dimension, "equation": text, f"value_{unit}": round(from_system(dim.SystemValue), 6)})
+    return {"ok": True, "count": len(rows), "dimensions": rows, "rebuilds": 1,
+            "rebuild_ok": result["rebuild_ok"], "failing_features": result["failing_features"]}
+
+
 def feature_dimensions(session, feature: str | None = None) -> dict:
     """Every dimension of a feature AND of the sketches it absorbed (or of all
     features), with its full name for link_dimension and the equation driving it."""

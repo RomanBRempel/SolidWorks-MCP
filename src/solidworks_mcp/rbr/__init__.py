@@ -25,7 +25,7 @@ from . import (apiref, assembly, batch, bodies as bodies_mod, cavity, chain, con
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.13.0"
+RBR_VERSION = "1.14.0"
 
 INSTRUCTIONS = """
 
@@ -45,9 +45,9 @@ RBR extension (solidworks-mcp-rbr)
 - check_containment(envelope, keepout) measures how much of each body sits inside another part's envelope body (master-model parts sharing an origin).
 - Flow Simulation on a saved part: flow_create_project(name, template, mesh_level=5, domain_m=...) -> flow_add_boundary_condition(kind, faces, value) (an internal flow needs an inlet and a pressure condition on the inner faces of its lids) -> flow_add_goal(kind, faces) -> flow_set_conditions(velocity_mps, mesh_level, domain_m, min_gap_mm) -> flow_solve -> flow_goals. flow_solve does NOT hold SolidWorks: it answers {job_id}, every other tool works meanwhile (other documents too), flow_status(job_id) shows iteration, current goal values and percent, get_job(job_id, wait_s=45) returns the goals at the end. The next case is flow_clone(name, new_name, velocity_mps=...) - one call, same mesh, domain, conditions and goals; flow_activate(name) switches projects, flow_delete(name) removes one. Before comparing two projects check flow_info: mesh_level, domain_m and min_gap_mm must match (Flow's automatic domain is several times a hand-set one and shifts forces by percents; a coarse mesh by tens of percents). Check each goal against a hand estimate (pressure drop, drag) as you would a mass.
 - Flow runs that must compare with earlier ones: level, gap and domain are NOT the whole mesh (control-plane ratios and the thin-channel level come with the project or template a project was made from, and no API writes them). flow_mesh_get shows all of it; flow_case_from_project(name, results_dir=...) keeps a reference run as a case; flow_create_from_case(case, name, alpha_deg | velocity_mps) makes a project and verifies every solver setting against the case before handing it back; flow_solve(case=...) refuses a project that is not the case before meshing and writes result.json + a registry line; flow_compare(run_a, run_b) refuses runs of different setups. Compare goals by `averaged`, not by the last value (the parallel solver is not bit-repeatable). flow_solve / flow_delete refuse a folder that holds another model's or PC's calculation (force=True overrides).
-- More script names: vec(*doubles) / pt(x,y,z) (COM-ready VARIANTs), ui_unlocked() (lift the UI freeze for InsertSketch/EditSketch), tree_before() + features_added(before) + rename_new(before, name), combine(op, main, tools), mirror_body(body, plane, merge=True), whats_wrong(), new_part(), activate(title), rays(bodies, points, dirs), export(path, fmt), split_segment / trim_to_intersection (in the sketch being edited).
-- Parametric building on SolidWorks objects, no tool bodies: set_global / link_dimension / feature_dimensions; sketch_circles (also centred on a profile's mean line at a station) / sketch_rect; convert_entities, add_relation; offset_face_loop (a wall-thick contour inside a face, also where SolidWorks' own offset refuses); extrude_toward / cut_toward (explicit direction, depth / through_all / up_to, also one region of a sketch); plane_normal_to_line; mirror_features. Drive every size and position by a global variable.
-- A cavity following a curved skin, section by section: sketch_intersection(plane=..., body/faces) -> sketch_trim_region(sketch, keep_box) (one closed contour) -> sketch_offset_chain(sketch, wall_mm) (inside, original to construction) -> loft_cut([sections]) or cut_offset_from_surface(sketch, face, wall_mm, toward) ending a wall short of the skin; split_line_project(sketch, faces) cuts the skin patch such a cut ends on. Check region_area_mm2 and the removed volume against a hand estimate.
+- More script names: vec(*doubles) / pt(x,y,z) (COM-ready VARIANTs), ui_unlocked() (lift the UI freeze for InsertSketch/EditSketch), tree_before() + features_added(before) + rename_new(before, name), combine(op, main, tools), mirror_body(body, plane, merge=True), whats_wrong(), new_part(), activate(title), rays(bodies, points, dirs, component=None) (component: an assembly component's part, rays and hits in assembly space), export(path, fmt), split_segment / trim_to_intersection (in the sketch being edited).
+- Parametric building on SolidWorks objects, no tool bodies: set_global / link_dimension / feature_dimensions; set_globals({name: value}) / link_dimensions({dim: expr}) change many with ONE rebuild (all or nothing) - use them instead of loops; sketch_circles (also centred on a profile's mean line at a station) / sketch_rect; convert_entities, add_relation; offset_face_loop (a wall-thick contour inside a face, also where SolidWorks' own offset refuses); extrude_toward / cut_toward (explicit direction, depth / through_all / up_to, also one region of a sketch); plane_normal_to_line; mirror_features. Drive every size and position by a global variable.
+- A cavity following a curved skin, section by section: sketch_intersection(plane=..., body/faces) -> sketch_trim_region(sketch, keep_box) (one closed contour) -> sketch_offset_chain(sketch, wall_mm) (inside, original to construction) -> loft_cut([sections]) (loft_boss([sections], guides=[...]) adds material the same way) or cut_offset_from_surface(sketch, face, wall_mm, toward) ending a wall short of the skin; split_line_project(sketch, faces) cuts the skin patch such a cut ends on. Check region_area_mm2 and the removed volume against a hand estimate.
 - Multibody parts: body_properties (mass, volume, area, centre, box, material per body), rename_body, show_bodies(visible), delete_bodies(keep=False), move_copy_body(translate_mm, rotate, copies), set_feature_scope(feature, bodies) (a cut or boss acting on some bodies only), save_bodies(bodies, path) (to a new part), insert_part(path) (another part as bodies). A material per body is not settable through the API (SolidWorks ignores it): bodies carry the part's material.
 - Working in the middle of a big part: edit_context(freeze_to=..., rollback_before=...) limits rebuilds to the features between the two bars (set_dimension 10 s -> 3-4 s on 205 features); new features land above the rollback bar under the names you give; save_part is refused until edit_context(end=True). get_status and server_health show an open context.
 - Seeing: screenshot renders off-screen and returns the picture in the reply - no window needed, works for a document that is not active or not visible (document='title'), bodies=[...] limits it. section_screenshot(point_mm, normal) shows a cut; section_profile(point_mm, normal) gives the exact contours with wall_mm per segment - measure walls with it, not by eye.
@@ -59,7 +59,7 @@ RBR extension (solidworks-mcp-rbr)
 - Derived parts: derive_part(body, path) gives a body its own part file that follows the master; list_external_refs shows what a part takes from other files and whether each link is alive; update_external_refs loads the sources, rebuilds and reports each body's volume before / after. After changing a master: rebuild_chain(root) rebuilds and saves every part derived from it, through any number of levels, in dependency order, without activating anything, and returns each body's volume before / after. export_static_body(body, path, suppress=[...]) writes a body as a part with NO link back (a frozen copy), switching features for the moment and leaving this part exactly as it was.
 - Moving sketch geometry: sketch_move(sketch, delta_mm | target_mm, filter) shifts the whole selection in one move and checks every point; geometry placed by dimensions gets those dimensions changed. Never loop SetCoords over the points of a constrained shape: each point drags the others and the shape travels twice the distance.
 - A call that answers DIALOG_BLOCKING ran into a modal SolidWorks dialog: the reply holds its text and buttons. dialog_respond(button) presses one ('yes' / 'no' / 'ok' / 'cancel' or the caption); the interrupted call is NOT cancelled and goes on then - never send it again. dialog_list shows the open dialogs at any time. Read the text before answering; when it asks about the user's data (save changes?), ask the user.
-- Assemblies: insert_component loads the part without a window of its own (a document window costs SolidWorks about 250 of its 10 000 GDI objects; at the limit it fails with 'resource unavailable', error 61704, and crashes). server_health.sldworks_gui shows the count; new_part / open_part / new_assembly / open_assembly are refused when no window fits any more; close_hidden_documents(windows=True) closes saved document windows. tree_folder(name, components) puts components into a FeatureManager folder and verifies it (raw InsertFeatureTreeFolder2(1) makes an empty folder; ReorderComponents with where 1 or 2 puts them next to the folder).
+- Assemblies: insert_component loads the part without a window of its own (a document window costs SolidWorks about 250 of its 10 000 GDI objects; at the limit it fails with 'resource unavailable', error 61704, and crashes). server_health.sldworks_gui shows the count; new_part / open_part / new_assembly / open_assembly are refused from 80% of the GDI quota; open_part / open_assembly(path, visible=False) and open_doc(path, visible=False) in a script load a native file WITHOUT a window (0 GDI objects, measured; a window costs about 240 and keeps about 40 after closing) - use it for files that are read, measured or changed by tools only; close_hidden_documents(windows=True) closes saved document windows. A script that fails (rollback_on_error=True) closes the documents it opened that have no unsaved changes. tree_folder(name, components) puts components into a FeatureManager folder and verifies it (raw InsertFeatureTreeFolder2(1) makes an empty folder; ReorderComponents with where 1 or 2 puts them next to the folder).
 - In run_script, model / active / part / asm / ext / fm / selmgr always mean the document that is current NOW: after closing, reloading or opening documents in the script they follow. Objects the script itself keeps (md = swApp.ActiveDoc) die with their document - fetch them again. swApp.CloseAllDocuments is refused while documents with unsaved changes that this server did not make, or documents of another server process, are open.
 - An error or a `solidworks_lost` note saying SolidWorks crashed or was closed names the last call before it and what SolidWorks' journal recorded; tell the user, nothing unsaved survived.
 - api_search(query) finds a method, property or constant of the installed SolidWorks API with its parameters - use it before a run_script call you are not sure of. sw_instances lists the running SolidWorks processes and the one this server drives; only one SolidWorks may run on a machine - never start a second one.
@@ -462,17 +462,17 @@ def register(server) -> None:
         merge=True) mirrors without SolidWorks' broken Merge and welds afterwards;
         whats_wrong() lists SolidWorks' rebuild errors when an Insert* returned None.
         new_part() / activate(title) return the IModelDoc2 (raw NewDocument from a script gets
-        an empty template path; ActivateDoc3 answers a tuple); rays(bodies, points, dirs) casts
+        an empty template path; ActivateDoc3 answers a tuple); rays(bodies, points, dirs, component=None) casts
         RayIntersections with the bodies as the VARIANT array it needs; export(path, fmt)
         rebuilds first and checks the file; split_segment(seg, point_mm) and
         trim_to_intersection(seg, pick_mm) edit the sketch being edited (not offset or
         converted curves: SolidWorks keeps those whole). The parametric tools are here too:
-        set_global, link_dimension, feature_dimensions, sketch_circles, sketch_rect,
+        set_global, link_dimension, set_globals, link_dimensions, feature_dimensions, sketch_circles, sketch_rect,
         convert_entities, add_relation, offset_face_loop, extrude_toward, cut_toward,
         plane_normal_to_line, mirror_features; and find_faces / find_edges / entity(ref),
         section_profile, read_sketches, set_dimensions, add_sketch3d, sweep_cut, sweep_boss,
         fully_define_sketch, add_dimension, sketch_fillet, sketch_intersection,
-        sketch_trim_region, sketch_offset_chain, split_line_project, loft_cut,
+        sketch_trim_region, sketch_offset_chain, split_line_project, loft_cut, loft_boss,
         cut_offset_from_surface (keyword arguments as the tools of those names).
         Raw API calls that mislead, and what to call instead: IBody2.GetBodyBox /
         IPartDoc.GetPartBox run loose round curved faces -> body_box(body) (tight, from
@@ -711,6 +711,34 @@ def register(server) -> None:
         window holds about 250 of SolidWorks' 10 000 GDI objects; a part an open assembly uses
         stays loaded, only its window goes) - use it when server_health warns about GDI objects."""
         return await _timed(health.close_hidden_documents, session, keep, dry_run, windows, timeout_s=120)
+
+    for _name in ("open_part", "open_assembly"):
+        try:
+            mcp.remove_tool(_name)  # upstream's: always into a window
+        except Exception:  # noqa: BLE001 - an mcp without remove_tool: upstream's stays
+            pass
+
+    @mcp.tool()
+    async def open_part(path: str, visible: bool = True) -> dict:
+        """Open a .sldprt, or import a STEP/IGES/Parasolid file as a new part; it becomes the current part.
+
+        list_features shows its history, list_dimensions its dimensions. An imported body has
+        no history, but the tools work on it; an import returns its solid body count and mass
+        properties. A file holding an assembly is refused.
+        visible=False loads a .sldprt WITHOUT a document window (no GDI objects - a window costs
+        about 250 of SolidWorks' 10 000): the tools work on it as the current part, SolidWorks'
+        own active window stays. Use it for parts that are only read, measured or changed by
+        tools; screenshot then needs mode='render'. A window is refused past 80% of the GDI quota."""
+        return await _timed(session.open_part, path, bool(visible), timeout_s=300)
+
+    @mcp.tool()
+    async def open_assembly(path: str, visible: bool = True) -> dict:
+        """Open a .sldasm, or import a STEP/IGES/Parasolid assembly; it becomes the current document.
+
+        An imported assembly's parts arrive as components at their places. A file holding a
+        single part is refused (use open_part). visible=False loads a .sldasm without a window,
+        as open_part(visible=False)."""
+        return await _timed(session.open_assembly, path, bool(visible), timeout_s=600)
 
     @mcp.tool()
     async def tree_folder(name: str, components: list[str]) -> dict:
@@ -969,6 +997,20 @@ def register(server) -> None:
         'diameter1@SK_BOSS' - feature_dimensions lists them), expression e.g. 'WALL',
         'HOLE_DEPTH + 2', 'abs(POS_1)'; bare variable names are quoted for you."""
         return await call(param.link_dimension, session, dimension, expression)
+
+    @mcp.tool()
+    async def set_globals(values: dict | list) -> dict:
+        """Add or change SEVERAL global variables with ONE rebuild: {"WALL": 2, "H": "WALL * 10"}
+        (or [[name, value], ...]). Expressions may use the batch's own names. All or nothing: a
+        refused equation undoes the whole batch. Use it instead of set_global in a loop - every
+        set_global rebuilds the part."""
+        return await _timed(param.set_globals, session, values, timeout_s=600)
+
+    @mcp.tool()
+    async def link_dimensions(links: dict | list) -> dict:
+        """Drive SEVERAL dimensions by global variables with ONE rebuild: {"D1@Plane5": "WALL",
+        "diameter1@SK_BOSS": "HOLE * 2"}. Every dimension is checked first; all or nothing."""
+        return await _timed(param.link_dimensions, session, links, timeout_s=600)
 
     @mcp.tool()
     async def feature_dimensions(feature: str | None = None) -> dict:
@@ -1411,6 +1453,18 @@ def register(server) -> None:
         sections from sketch_intersection -> sketch_trim_region -> sketch_offset_chain); guides:
         guide-curve sketches. Returns removed_mm3; a loft that removes nothing is rolled back."""
         return await _timed(cavity.loft_cut, session, sketches, guides, closed, name, timeout_s=300)
+
+    @mcp.tool()
+    async def loft_boss(sketches: list, guides: list | None = None, closed: bool = False, merge: bool = True,
+                        name: str = "Loft", guide_influence: str = "next_sharp") -> dict:
+        """Add material as a loft through existing sketches in the given order (each one closed
+        contour), optionally along guide-curve sketches (each guide must touch every profile:
+        pierce / coincident). merge=False keeps a separate body. Returns added_mm3; a loft that
+        adds nothing is rolled back. guide_influence: 'next_sharp' (default) or 'next_edge' bend the
+        loft along a guide; 'next_guide' / 'global' ignored a single guide in a test (SW 2025).
+        add_lofted_solid builds its own polygon profiles instead."""
+        return await _timed(cavity.loft_boss, session, sketches, guides, closed, merge, name, guide_influence,
+                            timeout_s=300)
 
     @mcp.tool()
     async def cut_offset_from_surface(sketch: str, face: str | list, offset_mm: float, toward: list,

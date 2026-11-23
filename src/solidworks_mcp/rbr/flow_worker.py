@@ -37,7 +37,7 @@ try:
 except ImportError:  # not Windows: the pure parts are still importable (tests)
     winreg = None
 
-from . import flow_case
+from . import flow_case, safefile
 
 NIK_TYPELIB = ("{CB182AE6-7258-43F3-B058-25ACFBD58535}", 0, 1, 0)
 FEATURE_TYPES = {2: "boundary_condition", 3: "surface_source", 4: "volume_source", 5: "rotating_region",
@@ -666,8 +666,7 @@ CLAIM_FILE = "mcp_owner.json"
 def read_claim(folder: str | None) -> dict | None:
     """Who made the project of a folder (written by this server at create / clone / solve)."""
     try:
-        with open(os.path.join(folder or "", CLAIM_FILE), encoding="utf-8") as fh:
-            data = json.load(fh)
+        data = safefile.read_json(os.path.join(folder or "", CLAIM_FILE))
         return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
@@ -677,9 +676,7 @@ def write_claim(folder: str, document, computer, project, uuid=None, server=None
     claim = {"computer": computer, "model": os.path.basename(str(document or "")), "project": project,
              "project_uuid": uuid, "claimed": time.strftime("%Y-%m-%d %H:%M:%S"), "server": server}
     try:
-        os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, CLAIM_FILE), "w", encoding="utf-8") as fh:
-            json.dump(claim, fh, ensure_ascii=False, indent=1)
+        safefile.write_json(os.path.join(folder, CLAIM_FILE), claim)
     except OSError:
         return None
     return claim
