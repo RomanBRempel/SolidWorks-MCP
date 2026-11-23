@@ -30,7 +30,13 @@ the session in a separate process (`tests/test_rbr_s36_live.py`).
   `SWMCP_GDI_REFUSE_PCT` overrides). `open_part` / `open_assembly(path, visible=False)` and
   `open_doc(path, visible=False)` in a script load a native file without a window (measured:
   +0 GDI objects, against +238 into a window and +40 kept for good after closing it; mass
-  properties of a hidden part hold about 160 until it is closed).
+  properties of a hidden part hold about 160 until it is closed). Upstream 0.20.0 makes the
+  current document SolidWorks' active one before every writing tool, which gave a windowless
+  document a window (measured: +443 GDI objects for a cylinder and a dimension); such a
+  document is now neither activated nor stilled. Without a window dimensions, equations,
+  suppression and reading work (a dimension change: +0 GDI objects); a sketch does not
+  (SolidWorks: 'Could not create line segment'), and the failing call says so and names
+  visible=True. `allow_large` (upstream: imports over 30 MB) passes through the ordinary open.
 - A script that fails with `rollback_on_error=True` closes the documents it opened that have
   no unsaved changes and makes the document current before current again; ones with unsaved
   changes are named and left open.

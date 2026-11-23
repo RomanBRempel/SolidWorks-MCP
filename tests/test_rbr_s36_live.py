@@ -54,6 +54,34 @@ def test_open_part_without_a_window_costs_no_gdi_objects(sw, block):
     assert result["title"] not in _titles(sw)
 
 
+def test_a_windowless_document_is_changed_without_getting_a_window(sw, block):
+    """Upstream activates the current document before a writing tool; a document loaded
+    without a window must stay without one (measured: +443 GDI objects otherwise)."""
+    sw.open_part(block, visible=False)
+    try:
+        before = _gdi()
+        out = sw.run_guarded(sw.set_dimension, "D1@BlockExtrude", 15.0)
+        assert out["ok"] and bool(sw._model.Visible) is False
+        assert sw.get_mass_properties()["mass_properties"]["volume_mm3"] == pytest.approx(40 * 20 * 15, rel=1e-6)
+        if before is not None:
+            assert _gdi() - before < 50
+        features = len(list(sw._history()))
+        with pytest.raises(SolidWorksError, match="without a window"):
+            sw.run_guarded(sw.add_cylinder, 5.0, 8.0)   # a sketch needs a window
+        assert len(list(sw._history())) == features and bool(sw._model.Visible) is False
+    finally:
+        sw._sw.CloseDoc(sw._model.GetTitle())
+        sw._model = None
+
+
+def test_open_part_passes_allow_large_on(sw, tmp_path):
+    big = tmp_path / "big.step"
+    with open(big, "wb") as fh:
+        fh.truncate(31 * 2 ** 20)   # over upstream's 30 MB import limit; never imported
+    with pytest.raises(SolidWorksError, match="allow_large"):
+        sw.open_part(str(big), allow_large=False)
+
+
 def test_open_hidden_refuses_an_import(sw, tmp_path):
     with pytest.raises(SolidWorksError, match="native"):
         sw.open_part(str(tmp_path / "x.step"), visible=False)

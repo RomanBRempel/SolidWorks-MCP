@@ -719,7 +719,7 @@ def register(server) -> None:
             pass
 
     @mcp.tool()
-    async def open_part(path: str, visible: bool = True) -> dict:
+    async def open_part(path: str, visible: bool = True, allow_large: bool = False) -> dict:
         """Open a .sldprt, or import a STEP/IGES/Parasolid file as a new part; it becomes the current part.
 
         list_features shows its history, list_dimensions its dimensions. An imported body has
@@ -728,17 +728,20 @@ def register(server) -> None:
         visible=False loads a .sldprt WITHOUT a document window (no GDI objects - a window costs
         about 250 of SolidWorks' 10 000): the tools work on it as the current part, SolidWorks'
         own active window stays. Use it for parts that are only read, measured or changed by
-        tools; screenshot then needs mode='render'. A window is refused past 80% of the GDI quota."""
-        return await _timed(session.open_part, path, bool(visible), timeout_s=300)
+        tools; screenshot then needs mode='render'. Without a window dimensions, equations,
+        suppression and reading work; a sketch needs a window (the call says so). A window is
+        refused past 80% of the GDI quota. allow_large: an import over 30 MB is refused unless
+        True (it can outlast the 2-minute call limit)."""
+        return await _timed(session.open_part, path, bool(visible), bool(allow_large), timeout_s=300)
 
     @mcp.tool()
-    async def open_assembly(path: str, visible: bool = True) -> dict:
+    async def open_assembly(path: str, visible: bool = True, allow_large: bool = False) -> dict:
         """Open a .sldasm, or import a STEP/IGES/Parasolid assembly; it becomes the current document.
 
         An imported assembly's parts arrive as components at their places. A file holding a
         single part is refused (use open_part). visible=False loads a .sldasm without a window,
-        as open_part(visible=False)."""
-        return await _timed(session.open_assembly, path, bool(visible), timeout_s=600)
+        as open_part(visible=False); allow_large as in open_part."""
+        return await _timed(session.open_assembly, path, bool(visible), bool(allow_large), timeout_s=600)
 
     @mcp.tool()
     async def tree_folder(name: str, components: list[str]) -> dict:

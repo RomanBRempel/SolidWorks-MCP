@@ -102,16 +102,69 @@ def open_hidden(session, path: str) -> dict:
 
 
 def _with_visible(name: str, original):
-    """open_part / open_assembly with visible=False: the file is loaded without a window."""
+    """open_part / open_assembly with visible=False: the file is loaded without a window.
+    allow_large (upstream: an import over 30 MB) applies to the ordinary open only - a
+    windowless open takes native files, never imports."""
 
     @functools.wraps(original)
-    def opener(self, path: str, visible: bool = True) -> dict:
+    def opener(self, path: str, visible: bool = True, allow_large: bool = False) -> dict:
         if visible:
-            return original(self, path)
+            return original(self, path, allow_large=allow_large)
         return open_hidden(self, path)
 
     opener._rbr_visible = True
     return opener
+
+
+HIDDEN_HINT = ("The document was loaded without a window (visible=False): SolidWorks sketches only in a "
+               "document with a window. Changing dimensions, equations, suppression and reading work without "
+               "one; to sketch, open the file again with visible=True (it costs about 250 GDI objects).")
+
+
+def _windowless_require_model(original):
+    """Upstream makes the current document SolidWorks' active one before a writing tool runs;
+    for a document loaded without a window that gives it one (measured: +443 GDI objects for
+    a cylinder and a dimension). Such a document stays windowless: what works without a
+    window (dimensions, equations, features that do not sketch) runs, a sketch fails with
+    HIDDEN_HINT (see _with_hidden_hint)."""
+
+    @functools.wraps(original)
+    def require_model(self):
+        model = self._model
+        if model is not None:
+            try:
+                hidden = not bool(model.Visible)
+            except Exception:  # noqa: BLE001 - cannot tell: upstream's way
+                hidden = False
+            if hidden:
+                # not stilled either: without a window nothing redraws, and waking the feature
+                # tree of a windowless document closed during the call faults inside SolidWorks
+                # (RPC_E_SERVERFAULT, measured) where a windowed one only answers an RPC error
+                return model
+        return original(self)
+
+    require_model._rbr_windowless = True
+    return require_model
+
+
+def _with_hidden_hint(original):
+    """run_guarded: a failure in a windowless current document says why it may have failed."""
+
+    @functools.wraps(original)
+    def run_guarded(self, fn, *args, **kwargs):
+        try:
+            return original(self, fn, *args, **kwargs)
+        except SolidWorksError as exc:
+            try:
+                hidden = self._model is not None and not bool(self._model.Visible)
+            except Exception:  # noqa: BLE001
+                hidden = False
+            if hidden and HIDDEN_HINT not in str(exc):
+                raise SolidWorksError(f"{exc} {HIDDEN_HINT}") from exc
+            raise
+
+    run_guarded._rbr_hidden_hint = True
+    return run_guarded
 
 
 def insert_component(self, path: str, x_mm: float = 0.0, y_mm: float = 0.0,
@@ -169,6 +222,12 @@ def apply() -> None:
         if not getattr(current, "_rbr_visible", False):
             _ORIGINAL[name] = current
             setattr(SolidWorksSession, name, _with_visible(name, current))
+    if not getattr(SolidWorksSession._require_model, "_rbr_windowless", False):
+        _ORIGINAL["_require_model"] = SolidWorksSession._require_model
+        SolidWorksSession._require_model = _windowless_require_model(SolidWorksSession._require_model)
+    if not getattr(SolidWorksSession.run_guarded, "_rbr_hidden_hint", False):
+        _ORIGINAL["run_guarded"] = SolidWorksSession.run_guarded
+        SolidWorksSession.run_guarded = _with_hidden_hint(SolidWorksSession.run_guarded)
 
 
 def unapply() -> None:
@@ -176,7 +235,7 @@ def unapply() -> None:
     if _ORIGINAL:
         if "insert_component" in _ORIGINAL:
             SolidWorksSession.insert_component = _ORIGINAL["insert_component"]
-        for name in ("open_part", "open_assembly"):
+        for name in ("open_part", "open_assembly", "_require_model", "run_guarded"):
             if name in _ORIGINAL:
                 setattr(SolidWorksSession, name, _ORIGINAL[name])
         _ORIGINAL.clear()
