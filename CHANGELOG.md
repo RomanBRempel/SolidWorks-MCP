@@ -455,12 +455,136 @@ crashed' report (fakes only).
   did-not-execute twin RPC_S_CALL_FAILED_DNE. And a read-only tool that
   loses the link mid-call now answers with the same readable reattach
   message as a modifying one, not a raw COM error.
+
+## [0.21.0] — 2026-11-18
+
+### Changed
+- A tool call that had to make its document SOLIDWORKS' active one (to
+  sketch, add a feature, export or take a screenshot while another document
+  was in front) brings that other document back to the front when it is done,
+  also when the call failed. A person or another session working in the same
+  SOLIDWORKS finds the window they were in. A call whose document was in front
+  already switches nothing. `activate_document` keeps its document in front,
+  as asked; `new_part`, `open_part` and the like leave the new document in front.
+
+## [0.20.0] — 2026-11-13
+
+### Changed
+- Tools that only read the current document (list_features, list_dimensions,
+  read_sketch, list_equations, list_faces, list_edges, list_bodies,
+  get_mass_properties, get_bounding_box, check_printability, list_components,
+  check_interference, measure_distance, get_assembly_bounding_box) no longer
+  make it SOLIDWORKS' active document first. A person or another session
+  working in the same SOLIDWORKS keeps the window they are in. Sketching,
+  features, exports and screenshots still activate it.
+  `measure_distance` to an axis does too: it draws a temporary sketch line.
+  The history snapshot every tool call takes, to undo a failed call, reads
+  without activating too: it brought the part to the front on every call.
+  A read still keeps its document's view still while it works, the guard
+  against SOLIDWORKS 2026 SP4.0's random crash in its user interface.
+
+### Fixed
+- `make_drawing` could not place the isometric view on a SOLIDWORKS in
+  another language: it asked for the view named `*Isometric`, which a
+  French SOLIDWORKS calls `*Isométrique`. It now picks the standard view
+  that looks isometric, whatever its name.
+
+## [0.19.0] — 2026-11-04
+
+### Changed
+- The guide shows how to make features follow each other: tie a hole to
+  its block with an equation, so it stays centred or a fixed distance from
+  an edge when the block grows.
+
+### Added
+- `add_hole_on_face(..., from_edges=True)` and `add_boss_on_face(...,
+  from_edges=True)` dimension the centre from the face's nearest straight
+  edges instead of the origin, so the hole or boss keeps its distance to
+  them when the part changes, as a person would draw it. `measured_from`
+  names the edges.
+
+## [0.18.0] — 2026-11-03
+
+### Changed
+- The Z-up template message and the README say how to get Y-up parts:
+  choosing Y-up in the New Document dialog is not used for parts made
+  through the API, so save a Y-up part as a part template and set that
+  file as the default part template.
+- The connect-time instructions gain a "Design intent" section: plan the
+  feature tree first, change a shape where it is made instead of stacking
+  bodies and cuts at the end of the tree, extrude details up to the surface
+  they meet, stop and say so when an operation is missing or refused, and
+  measure what a hand calculation cannot judge.
+
+### Added
+- `loft_sketches(sketches)` lofts through closed sketches on any planes,
+  in order (add_plane, then add_sketch on it, or a person's sketches), so a
+  loft can run in any direction; add_lofted_solid stacks only along +Z.
+- `reorder_feature` moves the reference planes and axes a feature is
+  built on along with it (`moved_along`): a plane made at the end of the
+  tree would not move earlier, because the axis and plane it stood on came
+  after the place.
+
+### Fixed
+- `slice_mesh` failed with "No running SolidWorks found" while SolidWorks
+  was gone, though it only reads an STL or 3MF. It now runs without
+  SolidWorks.
+
+## [0.17.0] — 2026-10-28
+
+### Added
+- `check_printability` finds where a print starts in the air, also where
+  no face leans past the overhang limit. `islands`: a point, edge or patch
+  lower than all around it with nothing beneath (a V's point between
+  steep sides). `unsupported_edges`: stretches of an edge the material
+  rises from with air right below, such as the ends of a chamfered pad's
+  edge that rests on a tube only in the middle. Each comes with its
+  height above the bed, where it is and its faces.
+- `list_dimensions(contains=...)` keeps the dimensions whose name or
+  feature holds the text: on a part of hundreds of features the full list
+  was too long to read back.
+- `cut_profile_through_plane` and `add_extruded_profile_on_plane` also
+  take the points as [u, v] in the plane's own frame, as `add_sketch` does.
+- `add_shell` opens several faces at once: a list of directions and
+  list_faces indexes (`["+z", "#5"]`). Shell before cutting openings: a
+  shell after them puts a wall along every cut edge.
+- `replace_component(name, path)` puts another file in a component's
+  place, keeping its position and, where they find their faces, its mates.
+  `list_components` gives a component that shows no geometry a `problem`:
+  a part made anew under the same path vanished from its assembly.
+- `set_dimension` names the features that fail since the change in
+  `broken_features` (a later cut now off the part, a split whose bodies
+  moved), with their error.
+
+### Fixed
+- [u, v] points given where [x, y, z] were expected took SolidWorks down.
+  The points' shape is now checked before any sketch opens.
+- The wall-thickness check of `check_printability` could run past the
+  120 s a call may take (24064 rays took 151 s on a small part), and the
+  agent got no result. It now stops after a minute with the rays spread
+  over all faces, and `rays` says how many it measured.
+- A STEP, IGES or Parasolid import over 30 MB is refused unless
+  `allow_large=True`: a 77 MB STEP ran past the 2 minutes a call may take
+  and kept SolidWorks busy, with popups.
+
+## [0.16.3] — 2026-10-27
+
+### Fixed
+- `set_material` refused the English material names ('6061 Alloy', 'AISI
+  1020') on a SolidWorks in another language, whose database names its
+  materials in that language. An English name is now found there by its
+  material id, which is the same in every language; the localized name
+  still works too. A name that is not found gets the closest names in
+  the error.
+
+## [0.16.2] — 2026-10-27
+
+### Fixed
 - `screenshot` saved a blank, all-white image (about 1 kB) while it
   reported success, since 0.16.0: the view kept still against the
   SOLIDWORKS 2026 SP4.0 crash was stilled again just before the picture
   was written. The view now draws for the whole screenshot; every other
   tool stays still. A test now checks that the picture holds the part.
-  (Cherry-picked from main, d4439f0.)
 
 ## [0.16.1] — 2026-10-15
 
