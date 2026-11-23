@@ -35,12 +35,12 @@ it "looks about right".
   holes, counterbores, slots and pockets on any face; rounded polygon corners; ISO holes from the Hole Wizard; real ISO metric threads;
   fillets, chamfers, shells, patterns, mirrors, ribs, equations and materials. Assemblies
   with mates and interference checks. STEP/STL/3MF export and screenshots.
-  Engraved and embossed text. Work on existing parts: list, delete, suppress and reorder features; read, extrude and cut a person's sketches; import STEP. Colours per part or component. Joints with concentric and angle mates, checked over their range. Printability checks and dimensioned drawings. Planes at any offset or angle. Several bodies per part, combined and split. Variable fillets and full rounds. Free sketches with tangent arcs and splines. 86 tools in total.
+  Engraved and embossed text. Work on existing parts: list, delete, suppress and reorder features; read, extrude and cut a person's sketches; import STEP. Colours per part or component. Joints with concentric and angle mates, checked over their range. Printability checks and dimensioned drawings. Planes at any offset or angle. Several bodies per part, combined and split. Variable fillets and full rounds. Free sketches with tangent arcs and splines. 88 tools in total.
 - **It fails loud.** A call that cannot do what was asked returns
   `{ok: false, error}` with the cause, never silently wrong geometry.
 - **A fixed, typed tool surface.** There is no "run arbitrary code" tool; the
   agent can only do what the tools allow.
-- **Tested against real SolidWorks.** 691 tests; each feature's integration test
+- **Tested against real SolidWorks.** 764 tests; each feature's integration test
   compares the result with a hand calculation.
 - **Local.** It talks to your running SolidWorks over COM; the server itself
   makes no network calls.
@@ -95,7 +95,10 @@ is in [`src/solidworks_mcp/guide.md`](https://github.com/hjbaard/SolidWorks-MCP/
 - Python 3.11+ (uv fetches one if needed).
 - A **Y-up part template**, SolidWorks' standard. Since SOLIDWORKS 2025 new
   parts can also be Z-up; the tools build in the Y-up frame and refuse a Z-up
-  part with a message that says so.
+  part with a message that says so. Choosing Y-up in the New Document dialog
+  is not used for parts made through the API: make a Y-up part, save it as a
+  `.prtdot`, and set that file as the part template under Tools > Options >
+  System Options > Default Templates.
 - **Tested on SOLIDWORKS 2026** (3DEXPERIENCE R2026x). The API calls it uses
   exist since SOLIDWORKS 2020 SP2, so 2020–2025 should work, but that is
   **untested**. To check your installation, run this with SolidWorks open:
@@ -117,6 +120,11 @@ may still change. See [CHANGELOG.md](https://github.com/hjbaard/SolidWorks-MCP/b
 - **Start with the selftest**: `uvx solidworks-mcp --selftest` shows your
   SolidWorks release, language and templates, and which tool areas work. Add
   its output to a [bug report](https://github.com/hjbaard/SolidWorks-MCP/issues/new?template=bug_report.yml).
+- **Drawings get slower and come out without dimensions, or SolidWorks
+  freezes, after many tool calls** — switch off *Enhanced graphics
+  performance* (Tools > Options > System Options > Performance) and restart
+  SolidWorks. With it on, `make_drawing` slowed from 8 to 16 s over a series
+  of calls and then placed 0 dimensions; with it off it stayed at 7 s.
 - **"No running SolidWorks found" / connection fails** — SolidWorks must be
   *running* before you start the server or run a script; it attaches to the active
   instance via `GetActiveObject` and does not launch one.
@@ -201,6 +209,7 @@ The server speaks MCP over **stdio**.
 | `add_swept_pipe(path_mm, diameter_mm, bend_radius_mm, name, smooth)` | Sweep a round profile along a 2D path with rounded bends (pipes, tubes, rods), or along a spline through the points with `smooth=True` |
 | `add_swept_profile(profile_mm, path_mm, bend_radius_mm, name, corner_radii_mm)` | Sweep any closed cross-section along a 2D path (rails, gaskets, trim, channels); `corner_radii_mm` rounds the cross-section |
 | `add_lofted_solid(profiles_mm, heights_mm, name)` | Loft/blend 2+ polygon or round profiles on stacked parallel planes (transitions, adapters, a leg thick at the knee) |
+| `loft_sketches(sketches, name)` | Loft through 2+ closed sketches on any planes, in order, so a loft runs in any direction |
 | `add_rib(start_mm, end_mm, toward_mm, thickness_mm, z_mm, name)` | Straight rib / gusset in a plane parallel to Front at `z_mm`, grown toward `toward_mm` until it meets the part (L-bracket gussets) |
 | `add_extruded_profile(points_mm, depth_mm, name, corner_radii_mm, rotate_deg, about_mm, draft_deg, merge)` | Extrude any closed polygon `[[x,y],…]` (brackets, sections); `corner_radii_mm` rounds its corners with real sketch fillets, each radius a dimension; `rotate_deg` turns it about a pivot; `draft_deg` tapers its walls; `merge=False` keeps a separate body |
 | `add_plane(base, offset_mm, angle_deg, about, name)` | A reference plane offset from a plane, or turned about a model axis; its offset or angle a dimension; gives its origin and axes |
@@ -226,7 +235,7 @@ The server speaks MCP over **stdio**.
 | `add_fillet(radius_mm, edges, name, radii_at_mm, skip_shorter_mm)` | Round edges (`edges`: `all`, axis `x`/`y`/`z`, a face outline `"+z:outline"`, one feature's edges `"feature:Boss"`, or indices `"2,5"`); `radii_at_mm` varies the radius from end to end; a refusal names the edges that do not fit |
 | `add_full_round(face, x_mm, y_mm, z_mm, name)` | Round a rib's top off completely between its two closest opposite sides |
 | `add_chamfer(distance_mm, edges, name)` | Chamfer edges at 45° (`edges`: `all`, axis, a face outline, a feature's edges, or indices) |
-| `add_shell(thickness_mm, open_face)` | Hollow to a wall thickness; open a face (`+z`/…) or `none` |
+| `add_shell(thickness_mm, open_face)` | Hollow to a wall thickness; open a face (`+z`/…, `#5`), several (`["+z", "#5"]`) or `none` |
 | `add_linear_pattern(count, spacing_mm, direction, feature_name)` | Repeat a feature N times along `+x`/`-x`/… |
 | `add_circular_pattern(count, center_x_mm, center_y_mm, feature_name)` | Repeat a feature N times around an axis (bolt circle) |
 | `add_mirror(plane, offset_mm, features, name)` | Mirror features (copies follow their seeds) or the whole body about the Front/Top/Right plane, or a plane by name, moved `offset_mm`; fails when a copy would land outside the part |
@@ -234,12 +243,12 @@ The server speaks MCP over **stdio**.
 | `set_equation(equation)` | Add a global equation or variable linking dims (e.g. `"W" = 40`, then `"width@Sketch1" = "W"`), or replace the one that sets the same name; names the features that fail to rebuild |
 | `set_equations(equations)` | Add or replace a list of equations with one rebuild |
 | `list_equations` / `delete_equation(equation)` | List the equations (value, global, broken) / delete one by name or index |
-| `slice_mesh(path, axis, heights_mm, frame)` | Cross-sections of an STL/3MF mesh as polygon loops, ready to use as profiles |
+| `slice_mesh(path, axis, heights_mm, frame)` | Cross-sections of an STL/3MF mesh as polygon loops, ready to use as profiles; needs no SolidWorks |
 | `compare_with_mesh(path, axis, heights_mm, frame, offset_mm)` | Compare the part's cross-sections with a reference mesh (area and extent differences) |
 | `read_sketch(name)` | A sketch read back in model coordinates: lines, arcs, circles, splines, its dimensions, fully defined or not |
 | `add_sketch(plane, start_mm, segments, name)` | Sketch an outline of lines, arcs and splines on any plane, fully defined: tangent where it flows, dimensioned from the origin |
 | `extrude_sketch(sketch, depth_mm, reverse, name, up_to)` / `cut_sketch(sketch, depth_mm, reverse, name)` | Build on an existing sketch by name (one a person drew): extrude it blind or up to the next face, or cut it blind or through all |
-| `list_dimensions()` | Every dimension in the part: name (for `set_dimension`), feature, value, unit |
+| `list_dimensions(contains)` | Every dimension in the part, or those whose name or feature holds `contains`: name (for `set_dimension`), feature, value, unit |
 | `list_features()` | The part's history in tree order (name, type, suppressed); flags features that fail to rebuild and sketches that are not fully defined |
 | `delete_feature(name, with_children, with_equations)` | Undo a step: delete a feature with its sketch; refuses (and names them) while other features depend on it, unless `with_children`; names the equations it breaks, or deletes them with `with_equations` |
 | `suppress_feature(name, suppress)` | Take a feature out but keep it and its dimensions (try a variant); `suppress=False` brings it back with its dependents |
@@ -248,7 +257,7 @@ The server speaks MCP over **stdio**.
 | `get_mass_properties` | Volume, mass, density, surface area, centre of mass, bounding box |
 | `get_bounding_box` | Tight part bounding box (min/max/size, mm) |
 | `list_faces(component)` / `list_edges(face, feature, within_mm, min_length_mm)` | Inspect faces (normal/area/centre; a cylinder's axis, radius and centre, also of a component in an assembly) and edges (type/length/ends/axis) by index, narrowed to a face, a feature, a box or a length |
-| `check_printability(up, overhang_deg, min_wall_mm)` | For a print direction: overhanging faces (area, worst lean, centre), bed contact, height; with `min_wall_mm` the walls thinner than that |
+| `check_printability(up, overhang_deg, min_wall_mm)` | For a print direction: overhanging faces (area, worst lean, centre), islands and edge stretches that start in the air, bed contact, height; with `min_wall_mm` the walls thinner than that |
 | `export(path, file_format, quality, deviation_mm, angle_deg, per_component)` | STEP/STL/IGES/Parasolid/3MF (silent; verifies file). STL/3MF tessellation: `quality` `coarse`/`fine`, or explicit `deviation_mm`+`angle_deg`; an assembly's STL as one file or one per component |
 | `screenshot(path, view, zoom_mm, show_planes, from_dir)` | PNG/JPG/TIF from a standard view (`iso`, `front`, `top`, …) or any direction, zoomed to fit or onto a region; planes and axes left out unless asked for |
 | `make_drawing(path)` | 2D drawing as PDF or editable `.slddrw`: front, top, right (first angle) and isometric views on A4 with the model's own dimensions, each once |
@@ -265,6 +274,7 @@ The server speaks MCP over **stdio**.
 | `insert_component(path, x_mm, y_mm, z_mm, fixed)` | Insert a part, or a `.sldasm` as a sub-assembly, with its **origin** at (x, y, z); the first component is fixed by default |
 | `list_components` | Name, path, fixed, position, rotation and bounding box of every component (its own extent, also when turned), and the mates with their dimensions and errors |
 | `delete_component(component)` | Remove a component from the assembly, with its mates |
+| `replace_component(name, path, reattach_mates)` | Put another file in a component's place, keeping its position and, where they find their faces, its mates |
 | `set_component_transform(name, x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg)` | Move/rotate a component; the transform is read back and verified |
 | `add_mate(comp_a, face_a, comp_b, face_b, mate_type, distance_mm, angle_deg, flip)` | Mate two faces (by direction, or `#index` from `list_faces`): `coincident`, `distance`, `parallel`, `perpendicular`, `angle`, or `concentric` between cylinders — measured back afterwards; a refused mate is removed. A distance or angle mate returns its dimension: a joint angle as one number |
 | `check_motion(dimension_name, values, distances)` | Step a joint through its range: overlapping pairs and chosen distances per step, the smallest distance and where it occurs, the components that moved |

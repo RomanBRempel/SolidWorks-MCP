@@ -51,6 +51,53 @@ def test_set_dimension_turns_an_angle_in_degrees(part):
     assert vol(half) == pytest.approx(full / 2, rel=1e-6)
 
 
+def hole_centre(part):
+    [point] = [f["cylinder"]["point_mm"] for f in part.list_faces()["faces"] if "cylinder" in f]
+    return point
+
+
+def test_a_hole_measured_from_the_edges_follows_its_block(part):
+    """Dimensioned from the origin, a hole stays where it was when its block
+    grows. from_edges dimensions it from the face's nearest edges, as a person
+    would: 10 mm in from the right edge, 5 from the front, and there it stays."""
+    box = part.add_box(40, 20, 10)
+    hole = part.add_hole_on_face(4, "+z", 30, 5, 10, from_edges=True)
+    assert hole["fully_defined"] is True
+    sizes = {d["name"]: d["value"] for d in part.list_dimensions(contains=hole["dimensions"]["x"].split("@")[1])["dimensions"]}
+    assert sizes[hole["dimensions"]["x"]] == pytest.approx(10) and sizes[hole["dimensions"]["y"]] == pytest.approx(5)
+    assert hole["measured_from"]["x"]["edge_mm"][0][0] == pytest.approx(40)
+    part.set_dimension(box["dimensions"]["width"], 60)
+    assert hole_centre(part) == pytest.approx([50, 5, 5], abs=1e-3), "the hole did not stay 10 mm from the right edge"
+
+
+def test_a_boss_measured_from_the_edges_follows_its_block(part):
+    box = part.add_box(40, 20, 10)
+    part.add_boss_on_face(6, "+z", 8, 15, 10, 4, from_edges=True)
+    part.set_dimension(box["dimensions"]["height"], 30)
+    centres = [f["cylinder"]["point_mm"] for f in part.list_faces()["faces"] if "cylinder" in f]
+    assert centres[0][:2] == pytest.approx([8, 25], abs=1e-3), "the boss did not stay 5 mm from the back edge"
+
+
+def test_from_edges_needs_straight_edges_on_the_face(part):
+    part.add_disc(40, 10)
+    with pytest.raises(SolidWorksError, match="straight edge"):
+        part.add_hole_on_face(4, "+z", 5, 5, 10, from_edges=True)
+
+
+def test_set_dimension_names_the_features_it_breaks(part):
+    """Lengthening a window early in the tree broke a later Split ('error 1')
+    and every hole after it, while set_dimension only said 'applied'. A block
+    made narrower leaves its hole at x = 35 in the air: the cut fails."""
+    box = part.add_box(40, 20, 10)
+    part.add_hole(4, 35, 10)
+    narrower = part.set_dimension(box["dimensions"]["width"], 20)
+    assert narrower["applied"]
+    broken = [f["name"] for f in narrower["broken_features"]]
+    assert len(broken) == 1 and broken[0] != "BlockExtrude", f"the hole that lost its block was not named: {broken}"
+    back = part.set_dimension(box["dimensions"]["width"], 40)
+    assert back["broken_features"] == []
+
+
 def test_set_dimension(part):
     box = part.add_box(40, 20, 10)
     assert abs(vol(part.set_dimension(box["depth_dimension"], 25)) - 20000) < 0.01
@@ -645,6 +692,16 @@ def test_shell_open(part):
     assert abs(vol(part.add_shell(2, "+z")) - (8000 - 36 * 16 * 8)) < 0.1
 
 
+def test_a_shell_opens_several_faces_by_direction_or_index(part):
+    """A body whose openings were cut first got walls on every cut edge; a
+    shell opening the top and a side at once avoids that. Open at +z and
+    +x, the cavity runs out at both: 38 x 16 x 8."""
+    part.add_box(40, 20, 10)
+    [side] = [f["index"] for f in part.list_faces()["faces"] if f.get("normal") == pytest.approx([1, 0, 0])]
+    shell = part.add_shell(2, ["+z", f"#{side}"])
+    assert vol(shell) == pytest.approx(8000 - 38 * 16 * 8, abs=0.1), "the shell did not open both faces"
+
+
 def test_linear_pattern(part):
     part.add_box(40, 20, 10)
     part.add_hole(8, 10, 10)
@@ -676,6 +733,14 @@ def test_material_bad_name_fails(part):
     part.add_box(40, 20, 10)
     with pytest.raises(Exception):
         part.set_material("Definitely Not A Material 1234")
+
+
+def test_a_misspelt_material_names_the_close_ones(part):
+    """A refused name gives the agent names to choose from, also on a
+    SolidWorks in another language, where the database holds its own names."""
+    part.add_box(40, 20, 10)
+    with pytest.raises(SolidWorksError, match="Close names: .*6061 Alloy"):
+        part.set_material("6061 Aloy")
 
 
 def test_a_material_of_its_own_by_its_density(part, tmp_path):

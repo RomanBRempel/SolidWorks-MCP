@@ -3,7 +3,8 @@
 # Weekly (and on demand): mirror upstream/main into this fork's main, then, if
 # upstream moved, merge it into a sync branch off rbr, run all unit tests on
 # Windows and open a PR into rbr with upstream's commits and CHANGELOG. A
-# merge conflict opens an issue instead. The rbr extension lives in its own
+# merge conflict fails the run with the files in its summary (no issue: issues
+# are off here, and nothing is ever filed upstream). The rbr extension lives in its own
 # subpackage (src/solidworks_mcp/rbr), so conflicts should be rare.
 #
 # Needs: rbr as the default branch (schedules run from it); Settings ->
@@ -18,7 +19,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  issues: write
 
 jobs:
   sync:
@@ -103,10 +103,13 @@ jobs:
             --body-file body.md
       - name: Report a conflict
         if: steps.merge.outputs.conflict == 'true'
+        # No issue is opened (issues are off in this fork, and none goes to upstream): the run
+        # fails with the files in its summary and in annotations, which the failure e-mail links.
         run: |
           {
-            echo "Merging upstream \`${{ steps.fetch.outputs.short }}\` into rbr conflicts in:"
-            echo; sed 's/^/- /' conflicts.txt
-            echo; echo "Resolve locally: \`git fetch upstream && git checkout rbr && git merge upstream/main\`."
-          } > issue.md
-          gh issue create --title "Upstream sync conflict at ${{ steps.fetch.outputs.short }}" --body-file issue.md
+            echo "### Upstream sync: merging \`${{ steps.fetch.outputs.short }}\` into rbr conflicts"
+            echo; sed 's/^/- `/; s/$/`/' conflicts.txt
+            echo; echo "Resolve locally: \`git fetch upstream && git checkout -b sync/upstream-${{ steps.fetch.outputs.short }} rbr && git merge upstream/main\`, then a PR into rbr."
+          } >> "$GITHUB_STEP_SUMMARY"
+          while read -r f; do echo "::error file=$f::merge conflict with upstream ${{ steps.fetch.outputs.short }}"; done < conflicts.txt
+          exit 1

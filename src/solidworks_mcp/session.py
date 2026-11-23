@@ -10,13 +10,19 @@ green by scripts/m1_block.py and scripts/m2_parametric.py.
 """
 
 import contextlib
+import difflib
+import functools
+import html
 import itertools
+import json
 import math
 import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
+from importlib import resources
 from xml.sax.saxutils import quoteattr
 
 import pythoncom
@@ -145,6 +151,22 @@ from .sketch_constraints import MAX_DIMENSIONED_VERTICES, SketchDefiner
 from .units import deg_to_rad, m_to_mm, mm_to_m
 
 
+def _reads_only(method):
+    """Mark a tool that only reads the current document. It is not made
+    SolidWorks' active document first, so a person or another session working
+    in SolidWorks keeps the window they are in. Tools that sketch, add
+    features, export or take screenshots still activate it (_require_model).
+    """
+    @functools.wraps(method)
+    def tool(self, *args, **kwargs):
+        self._reading += 1
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._reading -= 1
+    return tool
+
+
 class SolidWorksSession:
     """Holds the SolidWorks connection and the current part document."""
 
@@ -153,7 +175,10 @@ class SolidWorksSession:
         self._mod = None      # generated wrapper module
         self._model = None    # current IModelDoc2
         self._quiet_depth = 0  # inside _quiet_ui
+        self._reading = 0      # inside a tool that only reads (_reads_only)
         self._to_wake = []     # (document, [(object, property)]) to switch back on after it
+        self._guard_depth = 0  # inside run_guarded
+        self._previous_active = None  # title of the document a call took the front from
 
     # --- connection -----------------------------------------------------------
 
@@ -191,12 +216,25 @@ class SolidWorksSession:
         relation ('refused a horizontal relation'); that happened after
         open_part returned a part that was already open behind another document,
         and would after any switch of window in SolidWorks itself.
+
+        When that takes the front from another document, its title is noted:
+        run_guarded brings it back at the end of the call. A call that finds its
+        document active already switches nothing, and brings nothing back.
         """
+        if self._reading:
+            # not activated, but kept still all the same: the guard against
+            # SP4.0's random crash in slduiu.dll is the stilled view, not activation
+            model = self._current_model()
+            if self._quiet_depth:
+                self._quiet(model)
+            return model
         if self._model is None:
             raise SolidWorksError("No active document. Call 'new_part' or 'new_assembly' first.")
         title = self._model.GetTitle()
         active = binding.wrap(self._sw.ActiveDoc, self._mod.IModelDoc2)
         if active is None or active.GetTitle() != title:
+            if active is not None and self._previous_active is None:
+                self._previous_active = active.GetTitle()
             self._sw.ActivateDoc3(title, False, SW_DONT_REBUILD_ACTIVE_DOC, 0)
         if self._quiet_depth:
             self._quiet(self._model)
@@ -208,6 +246,25 @@ class SolidWorksSession:
                 raise SolidWorksError(f"'{title}' is editing one of its parts and would not go back to editing "
                                       "the assembly; choose Edit Assembly in SolidWorks.")
         return self._model
+
+    def _current_model(self):
+        """The current document as it is, without making it SolidWorks' active one:
+        enough to read it (features, dimensions, faces, mass properties)."""
+        if self._model is None:
+            raise SolidWorksError("No active document. Call 'new_part' or 'new_assembly' first.")
+        return self._model
+
+    @contextlib.contextmanager
+    def _writing(self):
+        """Within a read-only tool, a step that writes after all (the temporary
+        sketch line measure_distance measures to): the document is made the
+        active one and stilled first, as for every tool that writes."""
+        reading, self._reading = self._reading, 0
+        try:
+            self._require_model()
+            yield
+        finally:
+            self._reading = reading
 
     def _require_part(self):
         """The current document as an IPartDoc; raises if it is an assembly.
@@ -336,6 +393,7 @@ class SolidWorksSession:
             raise SolidWorksError(f"No open document '{title}' (open: {listed}).")
         self._model = matches[0]
         self._require_model()  # SolidWorks' active document too
+        self._previous_active = None  # asked for: it stays in front after the call
         return {"ok": True, "current": self._model.GetTitle(), **self._document_entry(self._model)}
 
     def _close_active_document(self) -> dict:
@@ -377,15 +435,16 @@ class SolidWorksSession:
         self._write_via_saveas3(abs_path)
         return {"ok": True, "path": abs_path, "bytes": os.path.getsize(abs_path)}
 
-    def open_part(self, path: str) -> dict:
+    def open_part(self, path: str, allow_large: bool = False) -> dict:
         """Open an existing .sldprt, or import a STEP, IGES or Parasolid file as a
         new part; it becomes the current part.
 
         An imported body has no history, but the tools work on it: holes and
         pockets on its faces, bosses, fillets. An import also returns its solid
         body count and mass properties, to see what came in and where it lies.
+        A file over _IMPORT_LIMIT_MB is refused unless allow_large.
         """
-        abs_path, imported = self._native_or_neutral(path, "sldprt", "a part")
+        abs_path, imported = self._native_or_neutral(path, "sldprt", "a part", allow_large)
         sw = self._ensure()
         if imported:
             model = self._import_document(sw, abs_path, SW_DOC_PART)
@@ -405,10 +464,12 @@ class SolidWorksSession:
         self._model = model
         return {"ok": True, "title": model.GetTitle(), "path": abs_path}
 
+    _IMPORT_LIMIT_MB = 30  # a 77 MB STEP ran past the 120 s call limit
+
     @staticmethod
-    def _native_or_neutral(path: str, native: str, kind: str) -> tuple:
-        """(absolute path, whether it needs an import); other formats are refused
-        before SolidWorks is touched."""
+    def _native_or_neutral(path: str, native: str, kind: str, allow_large: bool = False) -> tuple:
+        """(absolute path, whether it needs an import); other formats, and an
+        import over _IMPORT_LIMIT_MB, are refused before SolidWorks is touched."""
         abs_path = os.path.abspath(path)
         extension = os.path.splitext(abs_path)[1].lower().lstrip(".")
         if extension != native and extension not in IMPORT_FORMATS:
@@ -418,6 +479,13 @@ class SolidWorksSession:
             )
         if not os.path.isfile(abs_path):
             raise SolidWorksError(f"File not found: {abs_path}")
+        size_mb = os.path.getsize(abs_path) / 2 ** 20
+        if extension != native and size_mb > SolidWorksSession._IMPORT_LIMIT_MB and not allow_large:
+            raise SolidWorksError(
+                f"{os.path.basename(abs_path)} is {size_mb:.0f} MB: an import that large can run past the 2 minutes "
+                "a call may take, and SolidWorks keeps working on it (a 77 MB STEP did, with popups). Import it "
+                "in SolidWorks by hand and save it as .sldprt/.sldasm, use a simplified model, or pass "
+                "allow_large=True to try anyway.")
         return abs_path, extension != native
 
     def _import_document(self, sw, abs_path: str, doc_type: int):
@@ -496,9 +564,11 @@ class SolidWorksSession:
         if any(self._lies_along(data, self._Z_UP_FRONT_AXES) for data in transforms):
             raise SolidWorksError("This part comes from a Z-up part template (an option since SolidWorks 2025): "
                                   "its Front, Top and Right planes are turned, and the tools build in SolidWorks' "
-                                  "standard Y-up frame. Make new parts Y-up: choose Y-up where SolidWorks offers "
-                                  "the orientation for new documents, or a Y-up part template under Tools > "
-                                  "Options > System Options > Default Templates.")
+                                  "standard Y-up frame. Make new parts Y-up: make a part with Y-up chosen in the "
+                                  "New Document dialog, save it as a part template (.prtdot), and set that file "
+                                  "as the part template under Tools > Options > System Options > Default "
+                                  "Templates. Choosing Y-up in the dialog alone is not used for parts made "
+                                  "through the API.")
         raise SolidWorksError(f"The part has no {key} plane: none of {', '.join(f.Name for f in planes)} lies "
                               f"through the origin facing {axes[2]}. Is its template unusual?")
 
@@ -1905,6 +1975,55 @@ class SolidWorksSession:
         model.ClearSelection2(True)
         return self._finish_feature(loft, name, dimensions=dimensions, fully_defined=fully_defined)
 
+    def loft_sketches(self, sketches: list, name: str = "Loft") -> dict:
+        """Loft through 2+ closed sketches of the part, by name, in order: on
+        any planes (add_plane, add_sketch), so a loft runs in any direction.
+        Each sketch is picked at its first segment's start (a circle on its
+        sketch x axis): start the sketches at matching corners to keep the
+        loft from twisting. Their dimensions come back. Returns mass properties."""
+        if len(sketches) < 2:
+            raise SolidWorksError("A loft needs at least 2 sketches.")
+        model = self._require_model()
+        self._require_part()
+        picks = [(sketch, self._loft_pick_point(sketch)) for sketch in sketches]
+        model.ClearSelection2(True)
+        ext = binding.wrap(model.Extension, self._mod.IModelDocExtension)
+        for sketch, (x, y, z) in picks:
+            if not ext.SelectByID2(sketch, "SKETCH", mm_to_m(x), mm_to_m(y), mm_to_m(z), True, 1, None, 0):
+                raise SolidWorksError(f"Could not select the sketch '{sketch}'.")
+        feat_mgr = binding.wrap(model.FeatureManager, self._mod.IFeatureManager)
+        loft = feat_mgr.InsertProtrusionBlend(False, False, False, 1.0, 0, 0, 0.0, 0.0, False, False,
+                                              False, 0.0, 0.0, 0, True, True, True)
+        model.ClearSelection2(True)
+        if loft is None:
+            raise SolidWorksError(f"SolidWorks could not loft through {', '.join(sketches)}: is each sketch one "
+                                  "closed outline, and do they lie apart from each other?")
+        dimensions = {f"{d['name']}": d["name"] for s in sketches for d in self._dimension_entries(self._sketch_by_name(s))}
+        return self._finish_feature(loft, name, dimensions=dimensions)
+
+    def _loft_pick_point(self, name: str) -> list:
+        """Where a loft picks the sketch `name`, in model mm: the start of its
+        first segment, or a circle's point on the sketch's x axis."""
+        sketch = binding.wrap(self._sketch_by_name(name).GetSpecificFeature2(), self._mod.ISketch)
+        to_model = binding.wrap(binding.wrap(sketch.ModelToSketchTransform, self._mod.IMathTransform).Inverse(),
+                                self._mod.IMathTransform)
+        for dispatch in sketch.GetSketchSegments() or ():
+            segment = binding.wrap(dispatch, self._mod.ISketchSegment)
+            if segment.ConstructionGeometry:
+                continue
+            if segment.GetType() == SW_SKETCH_LINE:
+                start = binding.wrap(binding.wrap(dispatch, self._mod.ISketchLine).GetStartPoint2(), self._mod.ISketchPoint)
+                return self._to_model_mm(to_model, start.X, start.Y, start.Z)
+            if segment.GetType() == SW_SKETCH_ARC:
+                arc = binding.wrap(dispatch, self._mod.ISketchArc)
+                if arc.IsCircle():
+                    centre = binding.wrap(arc.GetCenterPoint2(), self._mod.ISketchPoint)
+                    return self._to_model_mm(to_model, centre.X + arc.GetRadius(), centre.Y, centre.Z)
+                start = binding.wrap(arc.GetStartPoint2(), self._mod.ISketchPoint)
+                return self._to_model_mm(to_model, start.X, start.Y, start.Z)
+            break
+        raise SolidWorksError(f"The sketch '{name}' starts with no line or arc to loft from.")
+
     @staticmethod
     def _rib_material_reversed(start, end, toward) -> bool:
         """Whether InsertRib must reverse its material side to grow toward `toward`.
@@ -2408,6 +2527,25 @@ class SolidWorksSession:
         p = binding.wrap(mathutil.CreatePoint(coords), self._mod.IMathPoint)
         return binding.wrap(p.MultiplyTransform(xform), self._mod.IMathPoint).ArrayData
 
+    @staticmethod
+    def _plane_point_size(points_mm) -> int:
+        """2 for points [u, v] in a plane's own frame, 3 for [x, y, z] on it.
+        Checked before any sketch opens: [u, v] given where [x, y, z] was
+        read took SolidWorks down."""
+        sizes = {len(p) if isinstance(p, (list, tuple)) and all(isinstance(c, (int, float)) for c in p) else 0
+                 for p in points_mm}
+        if len(sizes) != 1 or sizes.pop() not in (2, 3):
+            raise SolidWorksError(f"Give the points all as [u, v] on the plane or all as [x, y, z] on it, in mm "
+                                  f"(got {points_mm}).")
+        return len(points_mm[0])
+
+    def _plane_points_uv(self, sketch, points_mm, in_plane: bool, label: str) -> list:
+        """The points as the open sketch's (u, v) in metres: [u, v] are that
+        already (the frame add_plane and add_sketch give); [x, y, z] must lie on the plane."""
+        if in_plane:
+            return [(mm_to_m(u), mm_to_m(v)) for u, v in points_mm]
+        return [self._model_to_sketch_uv(sketch, *(mm_to_m(c) for c in p), label) for p in points_mm]
+
     def _model_to_sketch_uv(self, sketch, x_m, y_m, z_m, face):
         """Map a 3D model point (m) to the active sketch's local 2D (u, v) (m).
 
@@ -2430,24 +2568,72 @@ class SolidWorksSession:
     def _open_sketch_on_face(self, face: str, point_mm):
         """Select the face -- the one through point_mm unless the selector names a
         side -- and open a sketch on it. Returns (sketch manager, open sketch)."""
+        sk, sketch, _ = self._open_sketch_on_face_of(face, point_mm)
+        return sk, sketch
+
+    def _open_sketch_on_face_of(self, face: str, point_mm):
+        """As _open_sketch_on_face, and the face itself: (sketch manager, sketch, face)."""
         body = self._solid_body()
         normal, side = self._parse_face_selector(face, default_side=None)
-        self._select_face_through(body, normal, side, point_mm, face)
+        picked = self._select_face_through(body, normal, side, point_mm, face)
         sk = binding.wrap(self._model.SketchManager, self._mod.ISketchManager)
-        return sk, self._open_face_sketch(sk, face)
+        return sk, self._open_face_sketch(sk, face), picked
 
-    def _sketch_circle_on_face(self, face: str, diameter_mm: float, x_mm: float, y_mm: float, z_mm: float) -> dict:
-        """A fully defined circle on the face through (x, y, z); the sketch is closed again."""
-        sk, sketch = self._open_sketch_on_face(face, (x_mm, y_mm, z_mm))
+    def _sketch_circle_on_face(self, face: str, diameter_mm: float, x_mm: float, y_mm: float, z_mm: float,
+                               from_edges: bool = False) -> dict:
+        """A fully defined circle on the face through (x, y, z); the sketch is
+        closed again. from_edges dimensions its centre from the face's nearest
+        straight edges instead of the origin, so it follows them."""
+        before = {f.Name for f in self._history()}
+        sk, sketch, picked = self._open_sketch_on_face_of(face, (x_mm, y_mm, z_mm))
         try:
-            u, v = self._model_to_sketch_uv(sketch, mm_to_m(x_mm), mm_to_m(y_mm),
-                                            mm_to_m(z_mm), face)
-            circle = self._draw_circle(sk, u, v, mm_to_m(diameter_mm / 2.0))
-            # x/y are the face sketch's own horizontal/vertical directions
-            return self._define_sketch(sk, circles=[circle], names={("x", 0): "x", ("y", 0): "y"})
-        finally:
-            self._model.ClearSelection2(True)
-            sk.InsertSketch(True)  # close the sketch, also when the point is rejected
+            try:
+                u, v = self._model_to_sketch_uv(sketch, mm_to_m(x_mm), mm_to_m(y_mm),
+                                                mm_to_m(z_mm), face)
+                circle = self._draw_circle(sk, u, v, mm_to_m(diameter_mm / 2.0))
+                if not from_edges:
+                    # x/y are the face sketch's own horizontal/vertical directions
+                    return self._define_sketch(sk, circles=[circle], names={("x", 0): "x", ("y", 0): "y"})
+                return self._define_from_edges(sk, sketch, circle, picked, face)
+            finally:
+                self._model.ClearSelection2(True)
+                sk.InsertSketch(True)  # close the sketch, also when the point is rejected
+        except SolidWorksError:
+            if from_edges:
+                self._remove_features_since(before)  # a refused from_edges leaves no sketch behind
+            raise
+
+    def _define_from_edges(self, sk, sketch, circle, face_dispatch, label: str) -> dict:
+        """Define a circle by its diameter and its centre's distances to the
+        nearest straight edge of the face along each sketch axis."""
+        _, definer = self._open_sketch_definer(sk)
+        arc = binding.wrap(circle, self._mod.ISketchArc)
+        centre = binding.wrap(arc.GetCenterPoint2(), self._mod.ISketchPoint)
+        nearest = {}  # axis -> (distance, edge, its end points in model mm)
+        for dispatch in binding.wrap(face_dispatch, self._mod.IFace2).GetEdges() or ():
+            edge = binding.wrap(dispatch, self._mod.IEdge)
+            curve = binding.wrap(edge.GetCurve(), self._mod.ICurve)
+            if curve is None or not curve.IsLine():
+                continue
+            ends = [binding.wrap(v, self._mod.IVertex).GetPoint() for v in (edge.GetStartVertex(), edge.GetEndVertex())]
+            (u1, v1, _), (u2, v2, _) = (self._sketch_coords(sketch, *p) for p in ends)
+            # an edge along the sketch's v axis fixes x (u), one along u fixes y (v)
+            for axis, across, along, place in (("x", abs(u2 - u1), abs(v2 - v1), u1), ("y", abs(v2 - v1), abs(u2 - u1), v1)):
+                if across < 1e-9 < along:
+                    distance = abs(place - (centre.X if axis == "x" else centre.Y))
+                    if distance < nearest.get(axis, (float("inf"),))[0]:
+                        nearest[axis] = (distance, dispatch, [[round(m_to_mm(c), 4) for c in p] for p in ends])
+        missing = [axis for axis in ("x", "y") if axis not in nearest]
+        if missing:
+            raise SolidWorksError(f"from_edges needs a straight edge on the {label} face along each sketch axis; "
+                                  f"there is none to measure {' and '.join(missing)} from. Leave from_edges out "
+                                  "to dimension from the origin.")
+        dims = {"diameter": definer._diameter(arc, "diameter")}
+        for axis, add in (("x", self._model.AddHorizontalDimension2), ("y", self._model.AddVerticalDimension2)):
+            entity = binding.wrap(nearest[axis][1], self._mod.IEntity)
+            dims[axis] = definer.dimension_to(add, centre, entity, axis)
+        return {"dimensions": dims, "fully_defined": definer.fully_defined(),
+                "measured_from": {axis: {"edge_mm": nearest[axis][2]} for axis in ("x", "y")}}
 
     def _sketch_polygon_on_face(self, face: str, points_mm, corner_radii_mm=None) -> dict:
         """A fully defined polygon through 3D points on the face, its corners
@@ -2467,7 +2653,7 @@ class SolidWorksSession:
             sk.InsertSketch(True)  # close the sketch, also when a point is rejected
 
     def add_hole_on_face(self, diameter_mm: float, face: str, x_mm: float, y_mm: float, z_mm: float,
-                         depth_mm: float | None = None, name: str = "Hole") -> dict:
+                         depth_mm: float | None = None, name: str = "Hole", from_edges: bool = False) -> dict:
         """Drill a round hole on any planar face, centred at 3D point (x, y, z).
 
         face is a direction '+x'/'-x'/'+y'/'-y'/'+z'/'-z'; the planar face facing
@@ -2475,14 +2661,16 @@ class SolidWorksSession:
         (':outer'/':inner' force the outermost/innermost face). The hole runs
         through all material along the face normal, or depth_mm deep: a blind
         hole for a heat-set insert or a screw pilot. (add_hole is the +Z 2D
-        convenience version of this.)
+        convenience version of this.) from_edges=True dimensions the centre
+        from the face's nearest straight edges, not the origin, so the hole
+        keeps its distance to them when the part changes (`measured_from`).
         """
         model = self._require_model()
         if diameter_mm <= 0:
             raise SolidWorksError(f"diameter must be > 0 (got {diameter_mm}).")
         if depth_mm is not None and depth_mm <= 0:
             raise SolidWorksError(f"depth must be > 0 (got {depth_mm}).")
-        defined = self._sketch_circle_on_face(face, diameter_mm, x_mm, y_mm, z_mm)
+        defined = self._sketch_circle_on_face(face, diameter_mm, x_mm, y_mm, z_mm, from_edges)
 
         t1, d1 = (SW_END_COND_THROUGH_ALL, 0.0) if depth_mm is None else (SW_END_COND_BLIND, mm_to_m(depth_mm))
         feat_mgr = binding.wrap(model.FeatureManager, self._mod.IFeatureManager)
@@ -2499,17 +2687,17 @@ class SolidWorksSession:
         return self._with_depth(self._finish_feature(cut, name, **defined), depth_mm)
 
     def add_boss_on_face(self, diameter_mm: float, face: str, x_mm: float, y_mm: float, z_mm: float,
-                         height_mm: float, name: str = "Boss") -> dict:
+                         height_mm: float, name: str = "Boss", from_edges: bool = False) -> dict:
         """Grow a round boss (standoff, peg) height_mm out of any planar face.
 
         Centred at 3D point (x, y, z) on the face; the face is found as for
-        add_hole_on_face. Add a blind hole in its top for a heat-set insert.
-        Volume added = pi * (d/2)^2 * height.
+        add_hole_on_face, and from_edges works as there. Add a blind hole in
+        its top for a heat-set insert. Volume added = pi * (d/2)^2 * height.
         """
         self._require_model()
         if diameter_mm <= 0 or height_mm <= 0:
             raise SolidWorksError(f"diameter and height must be > 0 (got {diameter_mm}, {height_mm}).")
-        defined = self._sketch_circle_on_face(face, diameter_mm, x_mm, y_mm, z_mm)
+        defined = self._sketch_circle_on_face(face, diameter_mm, x_mm, y_mm, z_mm, from_edges)
         return self._extrude_sketch(height_mm, name, defined, "Is the circle on the face?", role="height")
 
     def add_extruded_profile_on_face(self, points_mm: list, face: str, depth_mm: float,
@@ -2763,7 +2951,8 @@ class SolidWorksSession:
 
         plane: 'front' (z = 0), 'top' (y = 0), 'right' (x = 0) or the name of
         another plane in the part (e.g. 'Plane1'). points_mm are 3D [x, y, z]
-        vertices ON that plane (e.g. x = 0 for 'right'). The cut runs
+        vertices ON that plane (e.g. x = 0 for 'right'), or all [u, v] in the
+        plane's own frame. The cut runs
         through all in both directions (depth_mm None), or depth_mm in total,
         centred on the plane. For shapes seen from the side: wedges, windows and
         recesses symmetric about the plane. corner_radii_mm rounds the corners
@@ -2777,9 +2966,10 @@ class SolidWorksSession:
             raise SolidWorksError(f"depth must be > 0 (got {depth_mm}).")
         if keep_inside and depth_mm is not None:
             raise SolidWorksError("keep_inside cuts through all: leave depth_mm out.")
-        model = self._require_model()
         if not points_mm:
             raise SolidWorksError("No profile points given.")
+        in_plane = self._plane_point_size(points_mm) == 2
+        model = self._require_model()
         corners = self._profile_corners(points_mm, corner_radii_mm)
 
         ref, label = self._named_plane(plane)
@@ -2789,9 +2979,7 @@ class SolidWorksSession:
         sk = binding.wrap(model.SketchManager, self._mod.ISketchManager)
         sketch = self._open_face_sketch(sk, label)
         try:
-            uv_m = [self._model_to_sketch_uv(sketch, mm_to_m(p[0]), mm_to_m(p[1]),
-                                             mm_to_m(p[2]), label)
-                    for p in points_mm]
+            uv_m = self._plane_points_uv(sketch, points_mm, in_plane, label)
             defined = self._draw_defined_polygon(sk, self._clean_polygon(uv_m), corners)
         finally:
             model.ClearSelection2(True)
@@ -2822,7 +3010,8 @@ class SolidWorksSession:
 
         plane: 'front', 'top', 'right' or a plane by name, such as one add_plane
         made at an angle. points_mm are 3D [x, y, z] vertices ON that plane
-        (add_plane gives its origin and axes: origin + u x_axis + v y_axis).
+        (add_plane gives its origin and axes: origin + u x_axis + v y_axis), or
+        all [u, v] in that frame.
         depth_mm along the plane's normal, or the other way with reverse=True.
         corner_radii_mm, draft_deg and merge work as for add_extruded_profile.
         Returns mass properties.
@@ -2831,6 +3020,7 @@ class SolidWorksSession:
             raise SolidWorksError(f"depth must be > 0 (got {depth_mm}).")
         if not points_mm:
             raise SolidWorksError("No profile points given.")
+        in_plane = self._plane_point_size(points_mm) == 2
         self._check_draft(draft_deg)
         corners = self._profile_corners(points_mm, corner_radii_mm)
         model = self._require_model()
@@ -2841,7 +3031,7 @@ class SolidWorksSession:
         sk = binding.wrap(model.SketchManager, self._mod.ISketchManager)
         sketch = self._open_face_sketch(sk, label)
         try:
-            uv_m = [self._model_to_sketch_uv(sketch, *(mm_to_m(c) for c in p), label) for p in points_mm]
+            uv_m = self._plane_points_uv(sketch, points_mm, in_plane, label)
             defined = self._draw_defined_polygon(sk, self._clean_polygon(uv_m), corners)
         finally:
             model.ClearSelection2(True)
@@ -3340,25 +3530,33 @@ class SolidWorksSession:
         cosines = [sum(n * d for n, d in zip(normal, direction)) for *_, normal in triangles]
         return math.degrees(math.acos(max(-1.0, min(1.0, sum(cosines) / len(cosines)))))
 
-    def add_shell(self, thickness_mm: float, open_face: str = "+z") -> dict:
-        """Hollow the part to a wall of `thickness_mm`, optionally opening one face.
+    def add_shell(self, thickness_mm: float, open_face: str | list = "+z") -> dict:
+        """Hollow the part to a wall of `thickness_mm`, optionally opening faces.
 
         open_face: a direction '+z'/'-z'/'+x'/... selects the planar face to remove
-        (an open shell); 'none' makes a fully closed hollow. Returns mass
+        (an open shell), '#5' the face of that list_faces index; a list opens
+        several at once; 'none' makes a fully closed hollow. Returns mass
         properties (volume drops to just the walls). InsertFeatureShell returns no
         feature object, so there is no feature name.
         """
-        model = self._require_model()
         if thickness_mm <= 0:
             raise SolidWorksError(f"thickness must be > 0 (got {thickness_mm}).")
-
+        opened = self._open_faces(open_face)
+        model = self._require_model()
         body = self._solid_body()
-        opened = (open_face or "none").lower()
-        if opened == "none":
-            model.ClearSelection2(True)
-        else:
-            normal, side = self._parse_face_selector(opened)
-            self._select_planar_face(body, normal, opened, side)
+        model.ClearSelection2(True)
+        for selector in opened:
+            index = self._face_index(selector)
+            if index is None:
+                normal, side = self._parse_face_selector(selector)
+                face = self._planar_face_by_normal(body, normal, side)
+            else:
+                faces = self._body_faces(body)
+                face = faces[index] if index < len(faces) else None
+            if face is None:
+                raise SolidWorksError(f"No face '{selector}' to open: see list_faces.")
+            if not binding.wrap(face, self._mod.IEntity).Select4(True, None):
+                raise SolidWorksError(f"Could not select the face '{selector}'.")
 
         # Outward=False: the wall grows inward, so the outer size is unchanged.
         model.InsertFeatureShell(mm_to_m(thickness_mm), False)
@@ -3366,7 +3564,23 @@ class SolidWorksSession:
         props = self.get_mass_properties()["mass_properties"]
         if abs(props["volume_mm3"]) < 1e-6:
             raise SolidWorksError("The shell removed all material; is the wall too thick?")
-        return {"ok": True, "open_face": opened, "rebuild_ok": rebuilt_ok, "mass_properties": props}
+        return {"ok": True, "open_face": open_face, "rebuild_ok": rebuilt_ok, "mass_properties": props}
+
+    def _open_faces(self, open_face) -> list:
+        """The faces add_shell opens: [] for 'none', else the selectors, each a
+        direction or '#index', checked before SolidWorks is touched."""
+        if isinstance(open_face, str) and open_face.strip().lower() in ("none", ""):
+            return []
+        selectors = [open_face] if isinstance(open_face, str) else list(open_face or [])
+        if not selectors:
+            raise SolidWorksError("open_face needs a face, a list of faces, or 'none'.")
+        for selector in selectors:
+            if self._face_index(selector) is None:
+                try:
+                    self._parse_face_selector(str(selector))
+                except SolidWorksError as exc:
+                    raise SolidWorksError(f"open_face '{selector}' is no direction or '#index': {exc}") from exc
+        return [str(s).strip().lower() for s in selectors]
 
     def _first_edge_along(self, body, direction):
         """First straight edge parallel to `direction`; returns (p1, p2, dispatch).
@@ -3873,30 +4087,59 @@ class SolidWorksSession:
         Every MCP tool call goes through here, so a refused or failed call leaves
         the part as it was: no stray sketch, which would also count in the
         bounding box. A tool that switched documents is not rolled back.
+
+        A call that had to bring its document to the front gives it back
+        afterwards, also when it failed: a person or another session working in
+        SolidWorks keeps the window they were in.
         """
-        self._reattach_if_gone()
-        snapshot = self._history_snapshot()
-        busy = self._command_in_progress(True)
+        if not self._guard_depth:
+            self._previous_active = None
+        self._guard_depth += 1
         try:
-            with self._quiet_ui():
-                return fn(*args, **kwargs)
-        except SolidWorksError as exc:
-            left = self._roll_back(snapshot)
-            if left:
-                raise SolidWorksError(f"{exc} Could not remove what the call added: {', '.join(left)}.") from exc
-            raise
-        except pythoncom.com_error as exc:
-            if exc.hresult in self._GONE_HRESULTS:
-                lost = self._explain_lost_link()
-                if lost is not None:
-                    raise lost from exc
-            self._roll_back(snapshot)
-            raise
-        except Exception:
-            self._roll_back(snapshot)
-            raise
+            self._reattach_if_gone()
+            snapshot = self._history_snapshot()
+            busy = self._command_in_progress(True)
+            try:
+                with self._quiet_ui():
+                    return fn(*args, **kwargs)
+            except SolidWorksError as exc:
+                left = self._roll_back(snapshot)
+                if left:
+                    raise SolidWorksError(f"{exc} Could not remove what the call added: {', '.join(left)}.") from exc
+                raise
+            except pythoncom.com_error as exc:
+                if exc.hresult in self._GONE_HRESULTS:
+                    lost = self._explain_lost_link()
+                    if lost is not None:
+                        raise lost from exc
+                self._roll_back(snapshot)
+                raise
+            except Exception:
+                self._roll_back(snapshot)
+                raise
+            finally:
+                self._command_in_progress(busy)
         finally:
-            self._command_in_progress(busy)
+            self._guard_depth -= 1
+            if not self._guard_depth:
+                self._bring_back_previous_active()
+
+    def _bring_back_previous_active(self) -> None:
+        """Make the document a call took the front from the active one again,
+        when it is still open and not in front already. Best-effort: a failure
+        here must not hide what the tool returned or raised."""
+        title, self._previous_active = self._previous_active, None
+        if title is None or self._sw is None:
+            return
+        try:
+            active = binding.wrap(self._sw.ActiveDoc, self._mod.IModelDoc2)
+            if active is not None and active.GetTitle() == title:
+                return
+            if not any(d.GetTitle() == title for d in self._open_documents()):
+                return  # closed during the call
+            self._sw.ActivateDoc3(title, False, SW_DONT_REBUILD_ACTIVE_DOC, 0)
+        except pythoncom.com_error:
+            pass
 
     # A link into a SolidWorks that is gone (restarted or closed): RPC server
     # unavailable, RPC call failed (and its did-not-execute twin), object
@@ -4025,6 +4268,7 @@ class SolidWorksSession:
         self._sw.CommandInProgress = bool(flag)
         return before
 
+    @_reads_only  # before every tool call: reading the history needs no activation
     def _history_snapshot(self):
         """(title, history names) of the current part, or None without one."""
         if self._model is None or int(self._model.GetType()) != SW_DOC_PART:
@@ -4125,9 +4369,13 @@ class SolidWorksSession:
         or 'y2', from the origin) takes a sign, -5 being the other side of
         the origin; any other dimension is a size and cannot be negative.
         A value SolidWorks does not take is refused, the part left as it was.
+        `broken_features` names the features that fail since the change (a
+        later cut whose sketch now lies off the part, a split whose bodies
+        changed), with their error; fix or undo before going on.
         """
         self._require_model()
         dim = self._dimension(dimension_name)
+        failing_before = {f["name"] for f in self._failing_features()}
         unit, to_system, from_system = self._dimension_unit(dim)
         coordinate = self._coordinate_of(dimension_name)
         if coordinate is None and unit == "mm" and value_mm < 0:
@@ -4163,6 +4411,7 @@ class SolidWorksSession:
             f"new_value_{unit}": round(applied + value_mm - target, 6),  # -30, not the 330 SolidWorks holds
             "applied": True,
             "rebuild_ok": rebuilt_ok,
+            "broken_features": [f for f in self._failing_features() if f["name"] not in failing_before],
             "mass_properties": self.get_mass_properties()["mass_properties"],
         }
 
@@ -4299,6 +4548,7 @@ class SolidWorksSession:
                 "failing_features": self._failing_features(),
                 "mass_properties": self.get_mass_properties()["mass_properties"]}
 
+    @_reads_only
     def list_equations(self) -> dict:
         """The equations and global variables in order: index, equation, the name
         it sets, its value and whether it is a global variable. `broken` marks
@@ -4393,17 +4643,23 @@ class SolidWorksSession:
                 failing.append({"name": feat.Name, "type": feat.GetTypeName2(), **self._error_entry(code, warning)})
         return failing
 
-    def list_dimensions(self) -> dict:
+    @_reads_only
+    def list_dimensions(self, contains: str | None = None) -> dict:
         """Every dimension in the part, feature by feature, as set_dimension takes it.
 
         For a part opened from disk, or after the tool results that named them
         are gone. Values are mm, angles degrees; `driving` is False for a
         reference (driven) dimension, which set_dimension cannot change.
+        contains keeps those whose name or feature holds that text (any case):
+        a part of hundreds of features lists too much to read back.
         """
         self._require_part()
+        needle = (contains or "").lower()
         dims, seen = [], set()
         for feat in self._iter_features():
             for entry in self._dimension_entries(feat):
+                if needle not in entry["name"].lower() and needle not in entry["feature"].lower():
+                    continue
                 if entry["name"] not in seen:
                     seen.add(entry["name"])
                     dims.append(entry)
@@ -4442,6 +4698,7 @@ class SolidWorksSession:
         names = sorted({s.Name for s in sketches})
         raise SolidWorksError(f"No sketch '{name}' in the part (there are: {', '.join(names) or 'none'}).")
 
+    @_reads_only
     def read_sketch(self, name: str) -> dict:
         """A sketch of the current part read back in MODEL coordinates (mm): its
         lines, arcs, circles and splines (construction ones marked), its
@@ -4624,6 +4881,7 @@ class SolidWorksSession:
     def _is_suppressed(feat) -> bool:
         return bool(feat.IsSuppressed2(SW_THIS_CONFIGURATION, None)[0])
 
+    @_reads_only
     def list_features(self) -> dict:
         """The part's modelling history in tree order: name, type, suppressed.
 
@@ -4745,18 +5003,59 @@ class SolidWorksSession:
         # before the target's own sketch, so the two stay together in the tree
         place = min((f.Name for f in [target, *self._sub_features(target)] if f.Name in names), key=names.index)
         extension = binding.wrap(model.Extension, self._mod.IModelDocExtension)
+        along = []
         if not extension.ReorderFeature(feature.Name, place, SW_MOVE_BEFORE):
-            moved = self._goes_along(feature, with_children=False)
-            parents = {binding.wrap(p, self._mod.IFeature).Name for f in self._history() if f.Name in moved
-                       for p in (f.GetParents() or ())}
-            later = [n for n in names[names.index(place):] if n in parents and n not in moved]
-            raise SolidWorksError(f"SolidWorks did not move '{name}' before '{before}'"
-                                  + (f": it is built on {', '.join(later)}, which would come after it."
-                                     if later else ".") + " The part is as it was.")
+            later = self._later_parents(feature, place)
+            # reference planes and axes it stands on move along, theirs first
+            along = self._reference_chain(later, place)
+            if not later or along is None or not all(
+                    extension.ReorderFeature(ref, place, SW_MOVE_BEFORE) for ref in along) \
+                    or not extension.ReorderFeature(feature.Name, place, SW_MOVE_BEFORE):
+                self._restore_order(extension, names)
+                raise SolidWorksError(f"SolidWorks did not move '{name}' before '{before}'"
+                                      + (f": it is built on {', '.join(later)}, which would come after it."
+                                         if later else ".") + " The part is as it was.")
         rebuilt_ok = bool(model.ForceRebuild3(False))
-        return {"ok": True, "features": [f.Name for f in self._history()], "rebuild_ok": rebuilt_ok,
-                "failing_features": self._failing_features(),
+        return {"ok": True, "features": [f.Name for f in self._history()], "moved_along": along,
+                "rebuild_ok": rebuilt_ok, "failing_features": self._failing_features(),
                 "mass_properties": self.get_mass_properties()["mass_properties"]}
+
+    _REFERENCE_TYPES = ("RefPlane", "RefAxis", "RefPoint")
+
+    def _later_parents(self, feature, place: str) -> list:
+        """What `feature` (with what goes along with it) is built on that comes
+        at or after `place`, in tree order."""
+        names = [f.Name for f in self._history()]
+        moved = self._goes_along(feature, with_children=False)
+        parents = {binding.wrap(p, self._mod.IFeature).Name for f in self._history() if f.Name in moved
+                   for p in (f.GetParents() or ())}
+        return [n for n in names[names.index(place):] if n in parents and n not in moved]
+
+    def _reference_chain(self, later: list, place: str) -> list | None:
+        """The reference geometry to move before `place` so `later` comes with
+        it: those planes and axes and, first, what they stand on after the
+        place. None when one of them is no reference geometry (a boss, a cut),
+        which must stay where it is."""
+        by_name = {f.Name: f for f in self._history()}
+        chain = []
+        for name in later:
+            if by_name[name].GetTypeName2() not in self._REFERENCE_TYPES:
+                return None
+            deeper = self._reference_chain(self._later_parents(by_name[name], place), place)
+            if deeper is None:
+                return None
+            chain += [n for n in deeper + [name] if n not in chain]
+        return chain
+
+    def _restore_order(self, extension, names: list) -> None:
+        """Put the history back in the order `names` after a move that failed
+        halfway: each feature before the one that followed it."""
+        for name, following in reversed(list(zip(names, names[1:]))):
+            now = [f.Name for f in self._history()]
+            if now == names:
+                return
+            if name in now and following in now and now.index(name) > now.index(following):
+                extension.ReorderFeature(name, following, SW_MOVE_BEFORE)
 
     # --- meshes: slice a reference, compare the part with it ---------------------
 
@@ -4885,8 +5184,9 @@ class SolidWorksSession:
         'AISI 1020', 'ABS', 'Plain Carbon Steel'. database: path to a .sldmat, or
         '' for the default databases. density_kg_m3 makes a material of its own
         under that name instead (say TPU at 1210) that carries only its density;
-        the part keeps it, also where the material is unknown. Returns mass
-        properties (with density).
+        the part keeps it, also where the material is unknown. On a SolidWorks
+        in another language an English name is found by its material id.
+        Returns mass properties (with density).
         """
         if density_kg_m3 is not None and database:
             raise SolidWorksError("Give a database or a density_kg_m3, not both.")
@@ -4898,12 +5198,22 @@ class SolidWorksSession:
             part.SetMaterialPropertyName2("", database, name)
         else:
             self._assign_own_material(part, name, density_kg_m3)
+        applied_name = self._material_name(part)
+        if density_kg_m3 is None and not database and not self._same_name(applied_name, name):
+            # SolidWorks in another language names its materials in that
+            # language: find the English name's material there by its id
+            local_by_id = self._local_materials()
+            local = self._localized_material(name, local_by_id)
+            if local is None:
+                close = difflib.get_close_matches(name, [*self._english_material_ids(), *local_by_id.values()], 5)
+                raise SolidWorksError(f"Material '{name}' was not applied (active: '{applied_name}'): it is not in "
+                                      f"SolidWorks' database. Close names: {', '.join(close) or 'none'}.")
+            part.SetMaterialPropertyName2("", "", local)
+            applied_name, name = self._material_name(part), local
         rebuilt_ok = bool(model.ForceRebuild3(False))
         # Verify by reading the applied name back (robust to re-assignment and to
         # materials near 1000 kg/m^3, where a density heuristic would lie).
-        applied = part.GetMaterialPropertyName2("")
-        applied_name = applied[0] if isinstance(applied, (list, tuple)) else applied
-        if (applied_name or "").strip().lower() != name.strip().lower():
+        if not self._same_name(applied_name, name):
             raise SolidWorksError(
                 f"Material '{name}' was not applied (active: '{applied_name}'). "
                 "Check the exact name, e.g. '6061 Alloy', 'AISI 1020', 'ABS'."
@@ -4914,6 +5224,48 @@ class SolidWorksSession:
             "rebuild_ok": rebuilt_ok,
             "mass_properties": self.get_mass_properties()["mass_properties"],
         }
+
+    @staticmethod
+    def _material_name(part) -> str:
+        applied = part.GetMaterialPropertyName2("")
+        return (applied[0] if isinstance(applied, (list, tuple)) else applied) or ""
+
+    @staticmethod
+    def _same_name(a: str, b: str) -> bool:
+        return a.strip().lower() == b.strip().lower()
+
+    @staticmethod
+    def _english_material_ids() -> dict:
+        """{English name: matid} of SolidWorks' default material database, read
+        from an English install (material_ids.json). A material keeps its matid
+        in every language; its name is translated."""
+        text = resources.files("solidworks_mcp").joinpath("material_ids.json").read_text(encoding="utf-8")
+        return json.loads(text)
+
+    @staticmethod
+    def _materials_by_id(xml_text: str) -> dict:
+        """{matid: name} of a .sldmat's materials; pure, unit-tested."""
+        return {int(matid): html.unescape(name)
+                for name, matid in re.findall(r'<material name="([^"]*)" matid="(\d+)"', xml_text)}
+
+    @classmethod
+    def _localized_material(cls, english: str, local_by_id: dict) -> str | None:
+        """The name of the English-named material in a database of another
+        language, matched by matid; None when either lacks it."""
+        ids = {n.lower(): i for n, i in cls._english_material_ids().items()}
+        matid = ids.get(english.strip().lower())
+        return None if matid is None else local_by_id.get(matid)
+
+    def _local_materials(self) -> dict:
+        """{matid: name} of the default material database in SolidWorks' own
+        language; {} when it is not where an install keeps it."""
+        folder = os.path.join(self._sw.GetExecutablePath(), "lang", self._sw.GetCurrentLanguage(), "sldmaterials")
+        found = [f for f in (os.listdir(folder) if os.path.isdir(folder) else [])
+                 if f.lower() == "solidworks materials.sldmat"]
+        if not found:
+            return {}
+        with open(os.path.join(folder, found[0]), encoding="utf-16") as f:
+            return self._materials_by_id(f.read())
 
     def _assign_own_material(self, part, name: str, density_kg_m3: float) -> None:
         """SolidWorks reads a .sldmat only from its material folders, so one is
@@ -4956,6 +5308,7 @@ class SolidWorksSession:
 
     # --- measurement ----------------------------------------------------------
 
+    @_reads_only
     def get_mass_properties(self) -> dict:
         """Volume/mass/area/centre-of-mass plus bounding box, all in SI->mm, forced SI."""
         model = self._require_model()
@@ -4995,6 +5348,7 @@ class SolidWorksSession:
             return self._joined_box([self._component_box(c) for c in self._components(assembly)])
         return self._joined_box([self._body_box(body) for body in self._part_bodies()])
 
+    @_reads_only
     def get_bounding_box(self) -> dict:
         self._require_model()
         return {"ok": True, "bounding_box_mm": self._bounding_box()}
@@ -5008,6 +5362,7 @@ class SolidWorksSession:
                 return axis
         return None
 
+    @_reads_only
     def list_faces(self, component: str | None = None) -> dict:
         """Inspect faces: index, planar?, normal, area, centre; a cylindrical face
         also gives its axis, radius and a point on the axis (a hole's centre).
@@ -5076,6 +5431,7 @@ class SolidWorksSession:
         point = [o + along * a for o, a in zip(origin, axis)]
         return {"axis": axis, "point_mm": point, "radius_mm": round(m_to_mm(params[6]), 4)}
 
+    @_reads_only
     def list_edges(self, face=None, feature: str | None = None, within_mm=None,
                    min_length_mm: float | None = None) -> dict:
         """Inspect the solid body's edges: index, type, length and ends (a full
@@ -5163,6 +5519,7 @@ class SolidWorksSession:
         bodies = binding.wrap(self._model, self._mod.IPartDoc).GetBodies2(SW_BODY_SOLID, False) or ()
         return [binding.wrap(body, self._mod.IBody2) for body in bodies]
 
+    @_reads_only
     def list_bodies(self) -> dict:
         """The part's solid bodies: name, volume and bounding box. A part holds
         several after merge=False or split_body; combine_bodies joins them."""
@@ -5243,13 +5600,19 @@ class SolidWorksSession:
 
     _MAX_WALL_SAMPLES = 100_000  # rays per check; beyond that the samples spread out
 
+    @_reads_only
     def check_printability(self, up: str = "+z", overhang_deg: float = 45.0,
                            min_wall_mm: float | None = None) -> dict:
         """Check the current part for 3D printing, built along `up`.
 
         Overhangs: downward faces leaning more than overhang_deg from vertical
         (90 = a flat ceiling) need support; faces resting on the bed do not
-        count. With min_wall_mm, also the walls thinner than that, measured
+        count. Islands: where the print starts in the air (a downward edge or
+        point with nothing beneath), even between faces too steep to overhang.
+        Unsupported edges: stretches of an edge the material rises from with
+        air right below, such as the ends of a chamfer's edge that only rests
+        on material in the middle.
+        With min_wall_mm, also the walls thinner than that, measured
         straight through the material from points spread over every face; a
         spot right beside a sharp edge reads as thin as the wedge there is.
         Faces are list_faces indexes, so a finding can be selected and fixed.
@@ -5263,7 +5626,9 @@ class SolidWorksSession:
         body = self._solid_body()
         triangles = [(index, *tri) for index, face in enumerate(self._body_faces(body))
                      for tri in self._face_triangles(binding.wrap(face, self._mod.IFace2))]
-        result = {"ok": True, "up": up, **self._overhangs(triangles, direction, overhang_deg)}
+        result = {"ok": True, "up": up, **self._overhangs(triangles, direction, overhang_deg),
+                  "islands": self._islands(triangles, direction),
+                  "unsupported_edges": self._unsupported_edges(body, triangles, direction, overhang_deg)}
         if min_wall_mm is not None:
             result["thin_walls"] = self._thin_walls(body, triangles, min_wall_mm)
         return result
@@ -5316,6 +5681,129 @@ class SolidWorksSession:
                              "faces": found}}
 
     @staticmethod
+    def _islands(triangles, up) -> list:
+        """Where the print starts in the air: a point, edge or flat patch of
+        the surface lower than all around it, with material above it, not on
+        the bed. A slicer starts a new island there, with nothing beneath; the
+        faces beside it may lean too little to count as overhang. Pure,
+        unit-tested."""
+        def height(p):
+            return sum(c * u for c, u in zip(p, up))
+
+        def key(p):
+            return tuple(round(c, 3) for c in p)  # faces meshed apart share their edge points
+
+        points, neighbours, below, faces = {}, {}, {}, {}
+        for index, a, b, c, normal in triangles:
+            downward = sum(n * u for n, u in zip(normal, up)) < -1e-6
+            corners = [key(p) for p in (a, b, c)]
+            for k, corner in enumerate(corners):
+                points[corner] = height(corner)
+                neighbours.setdefault(corner, set()).update(corners[:k] + corners[k + 1:])
+                below[corner] = below.get(corner, False) or downward
+                faces.setdefault(corner, set()).update([index] if downward else [])  # the faces that hang there
+        bed, seen, found = min(points.values()), set(), []
+        for start in sorted(points, key=points.get):
+            level = points[start]
+            if start in seen or level - bed < 1e-3:
+                continue
+            patch, todo = {start}, [start]
+            while todo:  # the points around at the same height
+                for n in neighbours[todo.pop()]:
+                    if n not in patch and abs(points[n] - level) < 1e-3:
+                        patch.add(n)
+                        todo.append(n)
+            seen |= patch
+            lower = any(points[n] < level - 1e-3 for p in patch for n in neighbours[p])
+            if not lower and any(below[p] for p in patch):
+                found.append({"height_mm": round(level - bed, 3),
+                              "at_mm": [round(sum(p[i] for p in patch) / len(patch), 3) for i in range(3)],
+                              "faces": sorted(set().union(*(faces[p] for p in patch)))})
+        return found
+
+    @staticmethod
+    def _lower_edges(triangles, up, overhang_deg) -> list:
+        """The edges the material rises from, (a, b, faces): flatter than the
+        overhang limit, both faces beside them above them, and not both facing
+        up (that is a groove, with the material below). Such an edge must rest
+        on material along its length. Pure, unit-tested."""
+        def height(p):
+            return sum(c * u for c, u in zip(p, up))
+
+        def key(p):
+            return tuple(round(c, 3) for c in p)
+
+        sides = {}
+        for index, a, b, c, normal in triangles:
+            corners = [key(p) for p in (a, b, c)]
+            facing = sum(n * u for n, u in zip(normal, up))
+            for k in range(3):
+                edge = tuple(sorted((corners[k], corners[(k + 1) % 3])))
+                sides.setdefault(edge, []).append((corners[(k + 2) % 3], facing, index))
+        steepest = math.cos(math.radians(overhang_deg))
+        found = []
+        for (a, b), beside in sides.items():
+            length = math.dist(a, b)
+            if len(beside) != 2 or not length or abs(height(b) - height(a)) / length >= steepest:
+                continue
+            along = [(q - p) / length for p, q in zip(a, b)]
+
+            def above(point):  # higher than the edge right beside it
+                t = max(0.0, min(length, sum((c - p) * e for c, p, e in zip(point, a, along))))
+                return height(point) > height(a) + t / length * (height(b) - height(a)) + 1e-3
+
+            if all(above(third) for third, _, _ in beside) and min(f for _, f, _ in beside) < 1e-6:
+                found.append((a, b, sorted({index for _, _, index in beside})))
+        return found
+
+    _EDGE_PROBE_MM = 0.4      # how far below an edge its support must be: two layers
+    _EDGE_SAMPLE_MM = 0.5     # spacing of the probes along an edge
+    _EDGE_MIN_STRETCH_MM = 1.0  # shorter loose bits a slicer bridges: on curved parts they were noise
+
+    def _unsupported_edges(self, body, triangles, up, overhang_deg) -> list:
+        """Stretches of the lower edges with air right below them: probed just
+        under the edge, a ray that first leaves the material starts inside it."""
+        def height(p):
+            return sum(c * u for c, u in zip(p, up))
+
+        bed = min(height(p) for _, *corners, _ in triangles for p in corners)
+        probes = []
+        for a, b, faces in self._lower_edges(triangles, up, overhang_deg):
+            if min(height(a), height(b)) - bed < self._EDGE_PROBE_MM:
+                continue  # on the bed
+            count = max(1, math.ceil(math.dist(a, b) / self._EDGE_SAMPLE_MM))
+            for k in range(count):
+                point = [p + (k + 0.5) / count * (q - p) for p, q in zip(a, b)]
+                probes.append((point, math.dist(a, b) / count, faces))
+        if not probes:
+            return []
+        skew = [0.267, 0.535, 0.802]  # along no model axis, so no ray grazes a face
+        starts = [mm_to_m(c - self._EDGE_PROBE_MM * u) for point, _, _ in probes for c, u in zip(point, up)]
+        first = {}
+        for ray, distance, leaving in self._ray_hits(body, starts, skew * len(probes)):
+            if distance < first.get(ray, (math.inf,))[0]:
+                first[ray] = (distance, leaving)
+        loose = [probes[ray] for ray in range(len(probes)) if not first.get(ray, (0, False))[1]]
+        return self._stretches(loose, height, bed)
+
+    def _stretches(self, loose, height, bed) -> list:
+        """Unsupported probes joined into stretches where they touch, each with
+        its length, height above the bed, middle and faces; the short ones left out."""
+        groups = []
+        for point, length, faces in loose:
+            near = [g for g in groups if min(math.dist(point, p) for p, _, _ in g) <= 2 * self._EDGE_SAMPLE_MM]
+            merged = [(point, length, faces)] + [probe for g in near for probe in g]
+            groups = [g for g in groups if g not in near] + [merged]
+        found = []
+        for group in groups:
+            middle = [sum(p[i] for p, _, _ in group) / len(group) for i in range(3)]
+            found.append({"length_mm": round(sum(length for _, length, _ in group), 2),
+                          "height_mm": round(min(height(p) for p, _, _ in group) - bed, 3),
+                          "at_mm": [round(c, 3) for c in middle],
+                          "faces": sorted(set().union(*(faces for _, _, faces in group)))})
+        return sorted((s for s in found if s["length_mm"] >= self._EDGE_MIN_STRETCH_MM), key=lambda s: -s["length_mm"])
+
+    @staticmethod
     def _triangle_samples(a, b, c, spacing) -> list:
         """Points inside triangle abc such that every spot of it lies within
         `spacing` of one: columns across its longest edge, each filled up to the
@@ -5354,15 +5842,47 @@ class SolidWorksSession:
         stride = math.ceil(len(samples) / cls._MAX_WALL_SAMPLES)  # every stride-th: still spread over all faces
         return samples[::stride], spacing * math.sqrt(stride)
 
+    _WALL_BATCH_RAYS = 2000   # rays per call to SolidWorks
+    _WALL_TIME_S = 60.0       # a call may take 120 s: 24064 rays on a small cap took 151
+
     def _thin_walls(self, body, triangles, min_wall_mm) -> dict:
         """Wall thickness straight through the material from sample points on
-        every face (one batch of rays), and the faces thinner than min_wall_mm."""
+        every face, and the faces thinner than min_wall_mm. The rays go in
+        batches that each spread over all faces, until _WALL_TIME_S has
+        passed; `rays` says how many were measured of how many planned."""
         samples, spacing = self._wall_samples(triangles, min_wall_mm)
-        starts, directions, owners = [], [], []
-        for index, point, normal in samples:
-            starts += [mm_to_m(p - 1e-4 * n) for p, n in zip(point, normal)]  # just inside the material
-            directions += [-n for n in normal]
-            owners.append((index, point))
+        batches = max(1, math.ceil(len(samples) / self._WALL_BATCH_RAYS))
+        began, through, measured = time.monotonic(), {}, 0
+        for batch in range(batches):
+            if batch and time.monotonic() - began > self._WALL_TIME_S:
+                break
+            chosen = samples[batch::batches]
+            starts = [mm_to_m(p - 1e-4 * n) for _, point, normal in chosen
+                      for p, n in zip(point, normal)]  # just inside the material
+            directions = [-n for _, _, normal in chosen for n in normal]
+            for ray, depth, leaving in self._ray_hits(body, starts, directions):
+                if not leaving:
+                    continue  # a sample on a hollow face's facet starts in the air and enters first
+                index, point, _ = chosen[ray]
+                if 1e-3 < depth < through.get(index, (math.inf,))[0]:
+                    through[index] = (depth, point)
+            measured += len(chosen)
+        if not through:
+            raise SolidWorksError("No ray came out of the part: the wall thickness could not be measured.")
+        thin = [{"index": index, "thinnest_mm": round(depth, 3), "at_mm": [round(c, 3) for c in point]}
+                for index, (depth, point) in sorted(through.items()) if depth < min_wall_mm - 1e-6]
+        rays = {"measured": measured, "planned": len(samples)}
+        if measured < len(samples):
+            rays["note"] = (f"Stopped after {self._WALL_TIME_S:g} s, with {measured} of {len(samples)} "
+                            "rays spread over all faces: a thin spot between them may be missed. A larger "
+                            "min_wall_mm plans fewer rays.")
+        return {"min_wall_mm": min_wall_mm, "thinnest_mm": round(min(d for d, _ in through.values()), 3),
+                "sample_spacing_mm": round(spacing * math.sqrt(len(samples) / measured), 3), "rays": rays,
+                "faces": thin}
+
+    def _ray_hits(self, body, starts, directions) -> list:
+        """Cast rays (starts in m, unit directions) at the body in one call:
+        (ray, distance in mm, whether it leaves the material there) per hit."""
         model = self._model
         hits = model.RayIntersections(
             win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, [body._oleobj_]),
@@ -5370,26 +5890,13 @@ class SolidWorksSession:
             win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, directions),
             SW_RAY_NORMALS_ENTRY_EXIT, 0.0, 0.0)
         points = model.GetRayIntersectionsPoints() if hits else ()
-        through = {}
+        found = []
         for h in range(hits):
             row = points[h * RAY_HIT_WIDTH:(h + 1) * RAY_HIT_WIDTH]
             ray = int(row[1])
-            if not int(row[2]) & SW_RAY_HIT_EXIT:
-                continue  # a sample on a hollow face's facet starts in the air and enters first
-            depth = m_to_mm(math.dist(row[3:6], starts[3 * ray:3 * ray + 3]))
-            if depth > 1e-3 and depth < through.get(ray, math.inf):
-                through[ray] = depth
-        if not through:
-            raise SolidWorksError("No ray came out of the part: the wall thickness could not be measured.")
-        thinnest = {}
-        for ray, depth in through.items():
-            index, point = owners[ray]
-            if depth < thinnest.get(index, (math.inf,))[0]:
-                thinnest[index] = (depth, point)
-        thin = [{"index": index, "thinnest_mm": round(depth, 3), "at_mm": [round(c, 3) for c in point]}
-                for index, (depth, point) in sorted(thinnest.items()) if depth < min_wall_mm - 1e-6]
-        return {"min_wall_mm": min_wall_mm, "thinnest_mm": round(min(d for d, _ in thinnest.values()), 3),
-                "sample_spacing_mm": round(spacing, 3), "faces": thin}
+            found.append((ray, m_to_mm(math.dist(row[3:6], starts[3 * ray:3 * ray + 3])),
+                          bool(int(row[2]) & SW_RAY_HIT_EXIT)))
+        return found
 
     # --- output ---------------------------------------------------------------
 
@@ -5596,6 +6103,29 @@ class SolidWorksSession:
                   for corner in itertools.product(*zip(*corners_mm))]
         return [min(t[i] for t in turned) for i in range(3)], [max(t[i] for t in turned) for i in range(3)]
 
+    def _isometric_view_name(self) -> str:
+        """The part's standard isometric view by its name in SolidWorks' own
+        language ('*Isometric', '*Isométrique'): the standard view that looks
+        the way the isometric view does."""
+        model = self._model
+        screen = binding.wrap(model.ActiveView, self._mod.IModelView)
+
+        def orientation(name=""):
+            model.ShowNamedView2(name, VIEWS["iso"] if not name else -1)
+            return binding.wrap(screen.Orientation3, self._mod.IMathTransform).ArrayData[:9]
+
+        target = orientation()
+        return self._standard_view_like(list(model.GetModelViewNames() or ()), orientation, target)
+
+    @staticmethod
+    def _standard_view_like(names, orientation_of, target) -> str:
+        """The first standard view (its name starts with '*') whose rotation is
+        `target`; pure, unit-tested."""
+        for name in names:
+            if name.startswith("*") and all(abs(a - b) < 1e-3 for a, b in zip(orientation_of(name), target)):
+                return name
+        raise SolidWorksError(f"The part has no standard isometric view among {', '.join(names)}.")
+
     def make_drawing(self, path: str) -> dict:
         """A 2D drawing of the current part, saved as PDF or as an editable .slddrw.
 
@@ -5620,8 +6150,8 @@ class SolidWorksSession:
             sheets = binding.wrap(drawing, self._mod.IDrawingDoc)
             if not sheets.Create1stAngleViews2(part_path):
                 raise SolidWorksError("SolidWorks could not place the front, top and right views.")
-            iso = binding.wrap(sheets.CreateDrawViewFromModelView3(part_path, "*Isometric", 0.24, 0.16, 0.0),
-                               self._mod.IView)
+            iso = binding.wrap(sheets.CreateDrawViewFromModelView3(part_path, self._isometric_view_name(),
+                                                                   0.24, 0.16, 0.0), self._mod.IView)
             if iso is None:
                 raise SolidWorksError("SolidWorks could not place the isometric view.")
             iso.UseSheetScale = True
@@ -5680,10 +6210,11 @@ class SolidWorksSession:
         self._model = model
         return {"ok": True, "title": model.GetTitle()}
 
-    def open_assembly(self, path: str) -> dict:
+    def open_assembly(self, path: str, allow_large: bool = False) -> dict:
         """Open an existing .sldasm, or import a STEP, IGES or Parasolid assembly;
-        it becomes the current document. An import reports its component count."""
-        abs_path, imported = self._native_or_neutral(path, "sldasm", "an assembly")
+        it becomes the current document. An import reports its component count;
+        one over _IMPORT_LIMIT_MB is refused unless allow_large."""
+        abs_path, imported = self._native_or_neutral(path, "sldasm", "an assembly", allow_large)
         sw = self._ensure()
         if imported:
             self._model = self._import_document(sw, abs_path, SW_DOC_ASSEMBLY)
@@ -5938,13 +6469,44 @@ class SolidWorksSession:
         return result[-3:]
 
     def _component_entry(self, comp) -> dict:
-        return {
+        entry = {
             "name": comp.Name2,
             "path": comp.GetPathName(),
             "fixed": bool(comp.IsFixed()),
             **self._placement(comp),
             "bounding_box_mm": self._component_box(comp),
         }
+        if entry["bounding_box_mm"] is None:
+            # a part made anew and saved under the same path showed nothing in
+            # its assembly: SolidWorks no longer took the file for that component
+            entry["problem"] = ("shows no geometry: its file may be missing or made anew under the same name; "
+                                "replace_component puts the file back in its place")
+        return entry
+
+    def replace_component(self, name: str, path: str, reattach_mates: bool = True) -> dict:
+        """Put the model at `path` in the place of component `name`, keeping its
+        position and, with reattach_mates, its mates where they still find
+        their faces. Returns the new component's entry."""
+        if not os.path.isfile(path):
+            raise SolidWorksError(f"No such file: {path}")
+        asm = self._require_assembly()
+        comp = self._component_by_name(asm, name)
+        before = {c.Name2 for c in self._components(asm)}
+        model = self._model
+        model.ClearSelection2(True)
+        selmgr = binding.wrap(model.SelectionManager, self._mod.ISelectionMgr)
+        if not comp.Select4(False, selmgr.CreateSelectData(), False):
+            raise SolidWorksError(f"Could not select component '{comp.Name2}'.")
+        done = asm.ReplaceComponents2(os.path.abspath(path), "", False, 0, bool(reattach_mates))
+        model.ClearSelection2(True)
+        model.ForceRebuild3(False)
+        target = os.path.normcase(os.path.abspath(path))
+        new = [c for c in self._components(asm)
+               if os.path.normcase(c.GetPathName()) == target and (c.Name2 not in before or c.Name2 == comp.Name2)]
+        if not done or not new:
+            raise SolidWorksError(f"SolidWorks did not replace '{name}' with {path}.")
+        return {"ok": True, "replaced": name, "component": self._component_entry(new[0]),
+                "mate_errors": [entry for mate in self._mates() if "error" in (entry := self._mate_entry(mate))]}
 
     def _fix_component(self, asm, comp) -> None:
         """Pin a component in place (FixComponent acts on the selection), and verify."""
@@ -6002,6 +6564,7 @@ class SolidWorksSession:
             self._fix_component(asm, comp)
         return {"ok": True, "component": self._component_entry(comp)}
 
+    @_reads_only
     def list_components(self) -> dict:
         """List the components (name, path, fixed, placement, bounding box) and
         the mates: name, SolidWorks type, the dimension of a distance or angle
@@ -6469,6 +7032,7 @@ class SolidWorksSession:
 
     # --- interference ---------------------------------------------------------
 
+    @_reads_only
     def check_interference(self) -> dict:
         """Find components whose solids overlap; volumes in mm^3, per pair.
 
@@ -6505,6 +7069,7 @@ class SolidWorksSession:
             entry["volume_mm3"] = round(entry["volume_mm3"], 4)
         return {"ok": True, "count": len(result), "interferences": result}
 
+    @_reads_only
     def measure_distance(self, component_a: str, component_b: str | None = None,
                          point_mm: list | None = None, axis_mm: list | None = None) -> dict:
         """The smallest distance (mm) from a component of the current assembly to
@@ -6524,7 +7089,8 @@ class SolidWorksSession:
         if component_b is not None:
             return self._distance_between(comp, self._component_by_name(asm, component_b))
         if line is not None:
-            return self._distance_to_line(comp, *line)
+            with self._writing():  # it draws a temporary sketch line
+                return self._distance_to_line(comp, *line)
         return self._distance_to_point(comp, [float(c) for c in point_mm])
 
     @staticmethod
@@ -6787,6 +7353,7 @@ class SolidWorksSession:
             return tuple(sum(back[i][row] * offset[i] for i in range(3)) / size for row in range(3))  # R^T: the inverse
         return place
 
+    @_reads_only
     def get_assembly_bounding_box(self) -> dict:
         """Bounding box of the whole assembly (min/max/size in mm)."""
         self._require_assembly()
