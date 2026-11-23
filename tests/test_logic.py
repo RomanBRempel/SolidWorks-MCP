@@ -581,9 +581,25 @@ def test_check_motion_needs_values_and_pairs(s, values, distances, message):
         s.check_motion("D1@Angle1", values, distances)
 
 
+@pytest.mark.parametrize("open_face", [["+z", "up"], [], ["+z", "#x"]])
+def test_a_shell_refuses_a_face_it_cannot_read_before_solidworks(s, open_face):
+    with pytest.raises(SolidWorksError, match="open_face"):
+        s.add_shell(2, open_face)
+
+
 def test_keep_inside_cuts_through_all(s):
     with pytest.raises(SolidWorksError, match="keep_inside cuts through all"):
         s.cut_profile_through_plane([[0, 0, 0], [0, 1, 0], [0, 0, 1]], "right", depth_mm=5, keep_inside=True)
+
+
+@pytest.mark.parametrize("tool", ["cut_profile_through_plane", "add_extruded_profile_on_plane"])
+@pytest.mark.parametrize("points", [[[0, 0], [5, 0, 0], [0, 5]], [[0, 0], [5], [0, 5]], [[0, 0], [5, "a"], [0, 5]],
+                                    [[0, 0, 0, 0], [5, 0, 0, 0], [0, 5, 0, 0]]])
+def test_plane_points_of_the_wrong_shape_are_refused_before_solidworks(s, tool, points):
+    """[u, v] points given to cut_profile_through_plane, which took [x, y, z],
+    took SolidWorks down with the unsaved work in it."""
+    with pytest.raises(SolidWorksError, match=r"\[u, v\] on the plane or all as \[x, y, z\]"):
+        getattr(s, tool)(points, "right", 5)
 
 
 @pytest.mark.parametrize("rim,depth,message", [(0, 3, "rim must be > 0"), (2, -1, "depth must be > 0")])
@@ -626,7 +642,8 @@ def _tool_delegations():
         if not isinstance(node, ast.AsyncFunctionDef) or not node.decorator_list:
             continue
         call = next(n for n in ast.walk(node)
-                    if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_call")
+                    if isinstance(n, ast.Call)
+                    and getattr(n.func, "id", None) in ("_call", "_call_without_solidworks"))
         target, *passed = call.args
         yield (node.name,
                [a.arg for a in node.args.args],
@@ -701,12 +718,75 @@ def test_a_ceiling_overhangs_and_the_bed_does_not(s):
     assert s._overhangs(triangles, (0, 0, -1), 45)["overhang"]["faces"] == []
 
 
+def _hanging_wedge(material_above=True):
+    """A block on the bed (its underside z = 0) and, beside it, a wedge whose
+    sides lean 31 degrees from vertical down to a ridge at z = 3, x = 20: too
+    steep to overhang, yet the ridge starts in the air."""
+    flip = 1 if material_above else -1
+    left, right = math.hypot(5, 3), math.hypot(5, 3)
+    return (_quad(0, [(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)], (0, 0, -1))
+            + _quad(1, [(20, 0, 3), (20, 10, 3), (17, 10, 8), (17, 0, 8)], (flip * -5 / left, 0, flip * -3 / left))
+            + _quad(2, [(20, 0, 3), (23, 0, 8), (23, 10, 8), (20, 10, 3)], (flip * 5 / right, 0, flip * -3 / right))
+            + _quad(3, [(17, 0, 8), (17, 10, 8), (23, 10, 8), (23, 0, 8)], (0, 0, flip)))
+
+
+def test_an_edge_starting_in_the_air_is_an_island(s):
+    """A chamfered block's lower edge began 1 to 4.5 mm beside a tube, in the
+    air: no face leaned past 45 degrees, so the check passed it, and the
+    slicer showed it hanging."""
+    triangles = _hanging_wedge()
+    assert s._overhangs(triangles, (0, 0, 1), 45)["overhang"]["faces"] == []
+    [island] = s._islands(triangles, (0, 0, 1))
+    assert island["height_mm"] == pytest.approx(3), f"the ridge was not found starting in the air: {island}"
+    assert island["at_mm"] == pytest.approx([20, 5, 3]) and island["faces"] == [1, 2]
+
+
+def test_a_groove_and_the_bed_are_no_islands(s):
+    # the same shape with the material below the ridge is the floor of a groove
+    assert s._islands(_hanging_wedge(material_above=False), (0, 0, 1)) == []
+    # turned over, the wedge's top rests on the bed and its ridge points up
+    assert s._islands(_hanging_wedge(), (0, 0, -1)) == []
+
+
+def test_a_hanging_ridge_is_a_lower_edge(s):
+    """The edges the material starts from, which must rest on something: the
+    ridge between two faces rising from it, with the material above."""
+    [(a, b, faces)] = s._lower_edges(_hanging_wedge(), (0, 0, 1), 45)
+    assert sorted([a, b]) == [(20, 0, 3), (20, 10, 3)] and faces == [1, 2]
+
+
+def test_a_groove_a_flat_ceiling_and_the_bed_have_no_lower_edges(s):
+    """A groove holds material below; a flat ceiling is overhang already, and
+    its own edges have the ceiling beside them, not above."""
+    assert s._lower_edges(_hanging_wedge(material_above=False), (0, 0, 1), 45) == []
+    ceiling = (_quad(0, [(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)], (0, 0, -1))
+               + _quad(1, [(10, 0, 5), (14, 0, 5), (14, 10, 5), (10, 10, 5)], (0, 0, -1)))
+    assert s._lower_edges(ceiling, (0, 0, 1), 45) == []
+
+
 @pytest.mark.parametrize("arguments,message", [({"up": "up"}, "Unknown direction"),
                                                ({"overhang_deg": 90}, "between 0 and 90"),
                                                ({"min_wall_mm": 0}, "min_wall_mm must be > 0")])
 def test_check_printability_checks_its_input(s, arguments, message):
     with pytest.raises(SolidWorksError, match=message):
         s.check_printability(**arguments)
+
+
+_ISO = (0.707, 0, -0.707, -0.408, 0.816, -0.408, 0.577, 0.577, 0.577)
+
+
+def test_the_isometric_view_is_found_by_how_it_looks_not_by_name():
+    """make_drawing asked for '*Isometric', which a French SolidWorks calls
+    '*Isométrique': 'SolidWorks could not place the isometric view'."""
+    turned = {"*Face": (1, 0, 0, 0, 1, 0, 0, 0, 1), "*Dessus": (1, 0, 0, 0, 0, -1, 0, 1, 0),
+              "*Isométrique": _ISO, "Ma vue": _ISO}
+    assert SolidWorksSession._standard_view_like(list(turned), turned.get, _ISO) == "*Isométrique"
+
+
+def test_no_standard_view_like_it_is_refused():
+    with pytest.raises(SolidWorksError, match="isometric"):
+        SolidWorksSession._standard_view_like(["*Front", "Mine"], {"*Front": (1, 0, 0, 0, 1, 0, 0, 0, 1),
+                                                                    "Mine": _ISO}.get, _ISO)
 
 
 def test_a_drawing_is_a_pdf_or_a_slddrw(s):
@@ -951,3 +1031,94 @@ def test_the_y_up_planes_are_found_in_any_order(s, monkeypatch, key, name):
                                   "Top Plane": (1, 0, 0, 0, 0, -1, 0, 1, 0, 0, 0, 0),
                                   "Front Plane": (1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0)})
     assert s._default_plane(key).Name == name
+
+
+# --- materials in another language ---------------------------------------------------
+
+
+# a localized material database as SolidWorks writes it: the same matid per
+# material, the names in the user's language
+_CHINESE_MATERIALS = ('<?xml version="1.0" encoding="utf-16"?>\n'
+                      '<mstns:materials xmlns:mstns="http://www.solidworks.com/sldmaterials" version="2008.03">\n'
+                      '  <classification name="钢">\n'
+                      '    <material name="普通碳钢" matid="9" envdata="1">\n    </material>\n'
+                      '    <material name="AISI 1020" matid="2" envdata="1">\n    </material>\n'
+                      '  </classification>\n'
+                      '  <classification name="铝合金">\n'
+                      '    <material name="6061 合金" matid="21" envdata="1">\n    </material>\n'
+                      '  </classification>\n'
+                      '</mstns:materials>\n')
+
+
+def test_a_material_database_is_read_by_id():
+    assert SolidWorksSession._materials_by_id(_CHINESE_MATERIALS) == {9: "普通碳钢", 2: "AISI 1020", 21: "6061 合金"}
+
+
+@pytest.mark.parametrize("english,local", [("6061 Alloy", "6061 合金"), ("plain carbon steel", "普通碳钢")])
+def test_an_english_material_name_finds_its_translation(english, local):
+    """A Chinese SolidWorks refused '6061 Alloy' (its database says '6061 合金'),
+    and every agent writes the English names the docs give."""
+    local_by_id = SolidWorksSession._materials_by_id(_CHINESE_MATERIALS)
+    assert SolidWorksSession._localized_material(english, local_by_id) == local, \
+        f"'{english}' was not found in a Chinese material database"
+
+
+def test_a_name_the_english_database_lacks_has_no_translation():
+    local_by_id = SolidWorksSession._materials_by_id(_CHINESE_MATERIALS)
+    assert SolidWorksSession._localized_material("Unobtainium", local_by_id) is None
+    assert SolidWorksSession._localized_material("ABS", local_by_id) is None  # not in this database
+
+
+class _Feature:
+    def __init__(self, name):
+        self.Name = name
+
+
+def test_list_dimensions_keeps_those_whose_name_or_feature_holds_the_text(s, monkeypatch):
+    """On a part of 333 features the full list was 149 kB, too large to come
+    back to the agent."""
+    features = {"BlockExtrude": ["D1@BlockExtrude", "width@Sketch1"], "DcdcPadR": ["D1@DcdcPadR"],
+                "Fillet3": ["D1@Fillet3"]}
+    monkeypatch.setattr(s, "_require_part", lambda: None)
+    monkeypatch.setattr(s, "_iter_features", lambda: [_Feature(name) for name in features])
+    monkeypatch.setattr(s, "_dimension_entries", lambda feat: [{"name": n, "feature": feat.Name}
+                                                               for n in features[feat.Name]])
+    assert [d["name"] for d in s.list_dimensions(contains="dcdc")["dimensions"]] == ["D1@DcdcPadR"]
+    assert [d["name"] for d in s.list_dimensions(contains="Sketch1")["dimensions"]] == ["width@Sketch1"]
+    assert s.list_dimensions()["count"] == 4
+
+
+def test_the_wall_check_stops_in_time_and_says_how_much_it_measured(s, monkeypatch):
+    """24064 rays took 151 s on a small cap, past the 120 s a call may take:
+    the agent got 'a modal dialog is probably open' and no result at all."""
+    import solidworks_mcp.session as session_module
+    clock = iter(range(0, 10_000, 40))  # every look at the clock, 40 s later
+    monkeypatch.setattr(session_module.time, "monotonic", lambda: next(clock))
+    cast = []
+
+    def rays(body, starts, directions):
+        cast.append(len(starts) // 3)
+        return [(ray, 2.0, True) for ray in range(len(starts) // 3)]  # each leaves the material 2 mm on
+
+    monkeypatch.setattr(s, "_ray_hits", rays)
+    triangles = _quad(0, [(0, 0, 0), (100, 0, 0), (100, 100, 0), (0, 100, 0)], (0, 0, -1))
+    walls = s._thin_walls(None, triangles, 0.8)
+    assert len(cast) < 10 and walls["rays"]["measured"] == sum(cast) < walls["rays"]["planned"], walls["rays"]
+    assert walls["thinnest_mm"] == pytest.approx(2) and walls["faces"] == []
+    assert "Stopped after" in walls["rays"]["note"]
+
+
+class _Document:
+    def GetTitle(self):
+        return "Part7"
+
+
+def test_a_read_keeps_the_view_still_without_activating(s, monkeypatch):
+    """Reads stopped making their document the active one (#10), and with that
+    also stopped stilling it: the guard against SOLIDWORKS 2026 SP4.0's random
+    crash in slduiu.dll. They must still be stilled, only not activated."""
+    stilled = []
+    monkeypatch.setattr(s, "_quiet", stilled.append)
+    s._model, s._quiet_depth, s._reading = _Document(), 1, 1  # inside run_guarded, in a read
+    assert s._require_model() is s._model  # no SolidWorks to activate in: it would fail
+    assert stilled == [s._model], "a read left its document's view drawing"
