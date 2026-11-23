@@ -22,7 +22,7 @@ import time
 
 from .. import binding
 from ..errors import SolidWorksError
-from . import fastpath, geom, render
+from . import fastpath, geom, render, safefile
 
 try:
     import numpy as np
@@ -391,8 +391,7 @@ def section_view(session, point_mm, normal, zoom_mm=None, path: str | None = Non
         raise SolidWorksError("The section picture is a PNG: give a path ending in .png.")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     data = render.png_bytes(image)
-    with open(out, "wb") as fh:
-        fh.write(data)
+    safefile.write_bytes(out, data)
     if info["covered_pct"] <= 0:
         raise SolidWorksError("The section picture came out empty: the plane leaves nothing on the far side "
                               "of the normal, or zoom_mm lies off the model.")

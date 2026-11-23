@@ -888,6 +888,62 @@ def loft_cut(session, sketches: list, guides: list | None = None, closed: bool =
     return result
 
 
+GUIDE_INFLUENCE = {"next_guide": 0, "next_sharp": 1, "next_edge": 2, "global": 3}  # swGuideCurveInfluence_e
+
+
+def loft_boss(session, sketches: list, guides: list | None = None, closed: bool = False,
+              merge: bool = True, name: str = "Loft", guide_influence: str = "next_sharp") -> dict:
+    """Add a loft through existing sketches in the order given, optionally along guide-curve
+    sketches (InsertProtrusionBlend2: profiles mark 1, guides mark 2). The volume must grow
+    (merge=True) or a body be added (merge=False); otherwise it is refused and rolled back.
+
+    guide_influence: how far a guide bends the loft - 'next_sharp' (default), 'next_edge',
+    'next_guide', 'global'. Measured on SW 2025 SP3 with ONE guide on the middle of a
+    profile edge: 'next_guide' and 'global' leave the loft as without the guide (the
+    feature lists the guide, the shape ignores it); 'next_sharp' and 'next_edge' follow it."""
+    if not sketches or len(sketches) < 2:
+        raise SolidWorksError("A loft needs at least two profile sketches, in order.")
+    if guide_influence not in GUIDE_INFLUENCE:
+        raise SolidWorksError(f"guide_influence is one of {', '.join(GUIDE_INFLUENCE)} (got {guide_influence!r}).")
+    model = session._require_model()
+    session._require_part()
+    volume_before = float(session.get_mass_properties()["mass_properties"].get("volume_mm3") or 0.0)
+    profiles = [session._sketch_by_name(s) for s in sketches]
+    guide_feats = [session._sketch_by_name(g) for g in guides or ()]
+    model.ClearSelection2(True)
+    for feat in profiles:
+        if not feat.Select2(True, MARK_LOFT_PROFILE):
+            raise SolidWorksError(f"Could not select the profile '{feat.Name}'.")
+    for feat in guide_feats:
+        if not feat.Select2(True, MARK_LOFT_GUIDE):
+            raise SolidWorksError(f"Could not select the guide '{feat.Name}'.")
+    fm = binding.wrap(model.FeatureManager, session._mod.IFeatureManager)
+    made = fm.InsertProtrusionBlend2(
+        bool(closed), False, False, 1.0,   # Closed, KeepTangency, ForceNonRational, TessToleranceFactor
+        0, 0, 0.0, 0.0, False, False,      # start / end matching, tangent lengths, tangent directions
+        False, 0.0, 0.0, 0,                # thin feature: none
+        bool(merge), True, True,           # Merge, UseFeatScope, UseAutoSelect
+        GUIDE_INFLUENCE[guide_influence])  # GuideCurveInfluence
+    model.ClearSelection2(True)
+    if made is None:
+        from . import geom
+        raise SolidWorksError(
+            "SolidWorks refused the loft: each profile must be ONE closed contour, the profiles in order "
+            "without twist (start points), and every guide must touch every profile (a pierce or "
+            f"coincident relation). {geom.whats_wrong(session) or ''}".strip())
+    made = binding.wrap(made, session._mod.IFeature)
+    result = session._finish_feature(made, name, profiles=[f.Name for f in profiles],
+                                     guides=[f.Name for f in guide_feats])
+    volume_after = float((result.get("mass_properties") or {}).get("volume_mm3") or 0.0)
+    added = volume_after - volume_before
+    if added <= 1e-6 * max(volume_before, 1.0):   # run_guarded removes what the call added
+        raise SolidWorksError("The loft added no material (the profiles lie inside the body?). Rolled back.")
+    result["added_mm3"] = round(added, 3)
+    if guide_feats:
+        result["guide_influence"] = guide_influence
+    return result
+
+
 # --- 6. cut_offset_from_surface -------------------------------------------------------
 
 

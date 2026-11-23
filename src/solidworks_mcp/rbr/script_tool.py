@@ -300,21 +300,25 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
             raise SolidWorksError(f"SolidWorks did not save '{where}' (errors {errors}, warnings {warnings}).")
         return {"saved": where, "warnings": int(warnings or 0)}
 
-    def open_doc(path):
+    def open_doc(path, visible=True):
         """Open a part or an assembly by path - or switch to it when it is open already - and
-        make it the current document; returns its IModelDoc2. (sw.OpenDoc6(path, type,
+        make it the current document; returns its IModelDoc2. visible=False loads it without
+        a window (no GDI objects; SolidWorks' active window stays). (sw.OpenDoc6(path, type,
         options, config, 0, 0) itself returns (doc, errors, warnings) and does not make
         the document current for the tools.)"""
         import os
         full = os.path.normcase(os.path.abspath(path))
         for doc in session._open_documents():
             if os.path.normcase(doc.GetPathName() or "") == full:
-                session.activate_document(doc.GetTitle())
+                if doc.Visible:
+                    session.activate_document(doc.GetTitle())
+                else:
+                    session._model = doc
                 return session._model
         if full.endswith(".sldasm"):
-            session.open_assembly(path)
+            session.open_assembly(path, visible=visible)
         else:
-            session.open_part(path)
+            session.open_part(path, visible=visible)
         return session._model
 
     def feature(name):
@@ -424,7 +428,7 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         session.activate_document(title)
         return session._model
 
-    def rays(bodies, points, directions, options=SW_RAY_NORMALS_ENTRY_EXIT):
+    def rays(bodies, points, directions, options=SW_RAY_NORMALS_ENTRY_EXIT, component=None):
         """Cast rays against solid bodies and return every hit.
 
         bodies: IBody2 objects or body names; None = every solid body of the
@@ -435,8 +439,59 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         this does both. options: swRayPtsOpts_e (default: normals + entry/exit).
         Returns [{ray, body, type, point_m, normal}]; type bit 32 = the ray
         LEAVES the body there (SW_RAY_HIT_EXIT).
+
+        component: in an assembly, a component (list_components name or IComponent2) whose
+        part's bodies are hit; points and directions stay in ASSEMBLY space and so do the
+        hits - the rays are carried into the part's space by the component's transform and
+        the hits back. bodies then names bodies of that part (None: all of them).
         """
-        target = session._require_model()
+        if component is not None:
+            return _component_rays(component, bodies, points, directions, options)
+        return _cast(session._require_model(), bodies, _flat(points, "points"), _flat(directions, "directions"),
+                     options)
+
+    def _flat(values, what):
+        flat_ = []
+        for v in values:
+            if isinstance(v, (list, tuple)):
+                flat_.extend(float(c) for c in v)
+            else:
+                flat_.append(float(v))
+        if not flat_ or len(flat_) % 3:
+            raise SolidWorksError(f"{what} must be [x, y, z] triples in metres (got {len(flat_)} values).")
+        return flat_
+
+    def _component_rays(component, bodies, points, directions, options):
+        from . import xform
+        c = comp(component) if isinstance(component, str) else component
+        name = c.Name2
+        doc = c.GetModelDoc2()
+        if doc is None:
+            raise SolidWorksError(f"The component '{name}' has no loaded model (suppressed or lightweight): "
+                                  "resolve it first.")
+        part = binding.wrap(doc, session._mod.IModelDoc2)
+        if int(part.GetType()) != 1:
+            raise SolidWorksError(f"'{name}' is a sub-assembly: rays(component=...) takes a part component.")
+        transform = c.Transform2
+        arr = list(transform.ArrayData)
+        probe = [0.123, -0.456, 0.789]
+        util = typed.Auto(sw, mod).GetMathUtility()
+        moved = list(util.CreatePoint(vec(*probe)).MultiplyTransform(transform).ArrayData)
+        convention = xform.convention_of(arr, probe, moved, 1e-7)
+        pts, dirs = _flat(points, "points"), _flat(directions, "directions")
+        local_pts, local_dirs = [], []
+        for i in range(0, len(pts), 3):
+            local_pts += xform.invert(arr, pts[i:i + 3], convention)
+        for i in range(0, len(dirs), 3):
+            local_dirs += xform.unrotate(arr, dirs[i:i + 3], convention)
+        hits = _cast(part, bodies, local_pts, local_dirs, options)
+        for h in hits:
+            h["point_m"] = xform.apply(arr, h["point_m"], convention)
+            h["normal"] = xform.rotate(arr, h["normal"], convention)
+            h["component"] = name
+        return hits
+
+    def _cast(target, bodies, pts, dirs, options):
         if bodies is None:
             chosen = geom._solid_bodies(session, target)
         else:
@@ -445,18 +500,6 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
         if not chosen:
             raise SolidWorksError("No solid body to cast rays against.")
 
-        def _flat(values, what):
-            flat_ = []
-            for v in values:
-                if isinstance(v, (list, tuple)):
-                    flat_.extend(float(c) for c in v)
-                else:
-                    flat_.append(float(v))
-            if not flat_ or len(flat_) % 3:
-                raise SolidWorksError(f"{what} must be [x, y, z] triples in metres (got {len(flat_)} values).")
-            return flat_
-
-        pts, dirs = _flat(points, "points"), _flat(directions, "directions")
         if len(pts) != len(dirs):
             raise SolidWorksError(f"{len(pts) // 3} point(s) against {len(dirs) // 3} direction(s).")
         dispatches = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH,
@@ -518,6 +561,7 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
             session, sketch, distance_mm, **kw),
         split_line_project=lambda sketch, faces, **kw: cavity.split_line_project(session, sketch, faces, **kw),
         loft_cut=lambda sketches, **kw: cavity.loft_cut(session, sketches, **kw),
+        loft_boss=lambda sketches, **kw: cavity.loft_boss(session, sketches, **kw),
         cut_offset_from_surface=lambda sketch, face, offset_mm, toward, **kw: cavity.cut_offset_from_surface(
             session, sketch, face, offset_mm, toward, **kw))
     ns.update(comp=comp, select=select, feature=feature, features=features, api=api, swapp=auto_sw,
@@ -533,6 +577,8 @@ def namespace(session, out: list, args: dict | None = None) -> dict:
                   session, segment, pick_mm, space),
               set_global=lambda name, value: param.set_global(session, name, value),
               link_dimension=lambda dimension, expression: param.link_dimension(session, dimension, expression),
+              set_globals=lambda values: param.set_globals(session, values),
+              link_dimensions=lambda links: param.link_dimensions(session, links),
               feature_dimensions=lambda feature=None: param.feature_dimensions(session, feature),
               sketch_circles=lambda on, circles, name=None, profile_face=None, **kw: param.sketch_circles(
                   session, on, circles, name, profile_face, **kw),
@@ -650,6 +696,51 @@ def _undo_equations(session, before: list, change: dict) -> dict:
             session._require_model().ForceRebuild3(False)
         except Exception:  # noqa: BLE001
             pass
+    return report
+
+
+def open_titles(session) -> dict | None:
+    """{title: modified} of the open documents, and which is current; None when SolidWorks cannot say."""
+    try:
+        docs = {d.GetTitle(): bool(d.GetSaveFlag()) for d in session._open_documents()}
+        current = session._model.GetTitle() if session._model is not None else None
+        return {"docs": docs, "current": current}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def left_open(before: dict | None, now: dict | None) -> tuple:
+    """(to close, to keep) of the documents a script opened and left; pure. Unmodified ones
+    are closed; one with unsaved changes stays (closing never asks - the work would be lost)."""
+    if not before or not now:
+        return [], []
+    new = [t for t in now["docs"] if t not in before["docs"]]
+    return [t for t in new if not now["docs"][t]], [t for t in new if now["docs"][t]]
+
+
+def close_left_documents(session, before: dict | None) -> dict:
+    """After a failed script: close the documents it opened that have no unsaved changes, and
+    make the document that was current before current again."""
+    now = open_titles(session)
+    close, keep = left_open(before, now)
+    report = {}
+    closed = []
+    for title in close:
+        try:
+            session._sw.CloseDoc(title)
+            closed.append(title)
+        except Exception:  # noqa: BLE001
+            keep.append(title)
+    if closed:
+        report["closed_documents"] = closed
+        if now.get("current") in closed:   # the tools' current document is gone: back to the one before
+            was = (before or {}).get("current")
+            try:
+                session._model = next((d for d in session._open_documents() if d.GetTitle() == was), None)
+            except Exception:  # noqa: BLE001
+                session._model = None
+    if keep:
+        report["left_open_unsaved"] = keep
     return report
 
 
@@ -771,6 +862,7 @@ def run_script(session, code: str, args: dict | None = None, rollback_on_error: 
     ns = namespace(session, out, args)
     before = journal.tree_state(session, names=True)
     made_before = made_state(session)
+    docs_before = open_titles(session)
     t0 = time.perf_counter()
     try:
         exec(compile(code, "<run_script>", "exec"), ns)  # noqa: S102 - the point of the tool
@@ -792,6 +884,11 @@ def run_script(session, code: str, args: dict | None = None, rollback_on_error: 
             report = after_failure(session, made_before, bool(rollback_on_error))
         except Exception as undo_exc:  # noqa: BLE001 - the script's own error is what matters
             report = {"rolled_back": False, "note": f"Undoing failed: {type(undo_exc).__name__}: {undo_exc}"}
+        if rollback_on_error:
+            try:
+                report.update(close_left_documents(session, docs_before))
+            except Exception:  # noqa: BLE001 - the script's own error is what matters
+                pass
         if not rollback_on_error:
             return {"ok": False, "error": message, "elapsed_s": round(time.perf_counter() - t0, 3),
                     "stdout": stdout, **report,
@@ -805,6 +902,10 @@ def run_script(session, code: str, args: dict | None = None, rollback_on_error: 
             tail += f"\nCould not remove: {report['could_not_remove']}."
         if report.get("closed_open_sketch"):
             tail += f"\nLeft the sketch the script had open: {report['closed_open_sketch']}."
+        if report.get("closed_documents"):
+            tail += f"\nClosed the documents the script had opened: {report['closed_documents']}."
+        if report.get("left_open_unsaved"):
+            tail += (f"\nLeft open (unsaved changes, closing would lose them): {report['left_open_unsaved']}.")
         raise SolidWorksError(f"{message}{tail}\nstdout:\n{stdout}") from None
     elapsed = round(time.perf_counter() - t0, 3)
     after = journal.tree_state(session, names=True)

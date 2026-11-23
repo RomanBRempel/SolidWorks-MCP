@@ -27,7 +27,7 @@ import time
 
 from .. import binding
 from ..errors import SolidWorksError
-from . import flow_case, flow_templates, private
+from . import flow_case, flow_templates, private, safefile
 
 SW_DOC_PART = 1
 
@@ -633,6 +633,11 @@ def record_run(directory: str | None, request: dict) -> dict:
                  "case_file": None if not request.get("case_path") else
                  {"name": os.path.basename(request["case_path"]), "md5": flow_templates.md5_of(request["case_path"])}}
         record = flow_case.result_record(directory, case, request.get("geometry"), extra)
+        if not case:
+            try:
+                record["case_match"] = flow_case.match_case(record, private.get("cases_dir"))
+            except Exception:  # noqa: BLE001 - the registry line says 'none' then
+                record["case_match"] = None
         reduction = private.get("reference.reduction")
         velocity = flow_case.velocity_of(flow_case.read_config(flow_case.config_path(directory)))
         if isinstance(reduction, dict) and velocity:
@@ -747,8 +752,10 @@ def read_progress(directory: str | None) -> dict | None:
         if not names:
             return None
         path = max((os.path.join(directory, n) for n in names), key=os.path.getmtime)
-        with open(path, encoding="utf-8") as fh:
-            out = progress_of(json.load(fh))
+        data = safefile.read_json(path)
+        if not isinstance(data, dict):
+            return None
+        out = progress_of(data)
         out["info_age_s"] = round(max(0.0, time.time() - os.path.getmtime(path)), 1)
         return out
     except (OSError, ValueError):
@@ -1163,7 +1170,9 @@ def flow_create_from_case(session, case, name: str, alpha_deg: float | None = No
         raise SolidWorksError(f"The document already has a Flow project '{name}'.")
     source = clone_of or (loaded.get("source") or {}).get("project")
     made_by = None
-    if source and any(p.lower() == str(source).lower() for p in projects):
+    if source and not (template and not clone_of) and any(p.lower() == str(source).lower() for p in projects):
+        # an explicit template wins over the implicit clone: a project in a model file can
+        # change its hidden mesh switches (seen twice), a recorded template cannot
         reply = _call(session, _request(session, "clone", name=source, new_name=name, copy_results=False,
                                         slot=private.get("flow_folder_slot")))
         made_by = {"cloned_from": reply.get("cloned_from")}

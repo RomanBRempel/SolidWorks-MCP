@@ -5,6 +5,57 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Added (rbr 1.14.0) - safe files on a synced drive, a complete run registry, GDI, batch globals, guided lofts
+Verified with unit tests (pure, synthetic) and live on SolidWorks 2025 SP3 (2026-11-23) through
+the session in a separate process (`tests/test_rbr_s36_live.py`).
+
+- Every file the server writes (result.json, the run registry, case files, the templates
+  manifest, folder claims, reservations and locks, job records, the owners and lock-holder
+  files, saved scripts, PNG renders, the BOM CSV) goes through `rbr/safefile.py`: written to
+  a local temporary file, copied beside the target under a part name, checked by length and
+  SHA-256, renamed onto the target and checked again; a torn copy is made again, a file a
+  sync client holds is waited for. The target is the old file or the new one, never half.
+  (The journal and the reference store stay append-only local files.)
+- The solver's files are read whatever follows their content: the progress / summary file
+  `<n>.info.json` (NUL padding, the tail of a longer older version) by taking the first JSON
+  value; the registry CSV by skipping NULs and lines of another width. Before, such a tail made
+  `read_info` answer `{}` silently - the cause of registry lines without cells and iterations.
+- Run registry: `case`, `cells` and `iterations` are always filled. Cells and iterations come
+  from `<n>.info.json` (read up to six times while it is being written), else from the
+  plain-text `<n>.info`, the iterations at last from `Goals.DAT` (`size_source` in result.json
+  says which). A solve without a case is matched against the case files by fingerprint
+  (`yes (fingerprint)` / `mesh only (fingerprint)`), else `case` is `none` and `comparable`
+  `n/a`. A new registry row rewrites the file safely and drops a garbage tail.
+- GDI: a document window is refused from 80 % of the GDI quota (was 92 %;
+  `SWMCP_GDI_REFUSE_PCT` overrides). `open_part` / `open_assembly(path, visible=False)` and
+  `open_doc(path, visible=False)` in a script load a native file without a window (measured:
+  +0 GDI objects, against +238 into a window and +40 kept for good after closing it; mass
+  properties of a hidden part hold about 160 until it is closed). Upstream 0.20.0 makes the
+  current document SolidWorks' active one before every writing tool, which gave a windowless
+  document a window (measured: +443 GDI objects for a cylinder and a dimension); such a
+  document is now neither activated nor stilled. Without a window dimensions, equations,
+  suppression and reading work (a dimension change: +0 GDI objects); a sketch does not
+  (SolidWorks: 'Could not create line segment'), and the failing call says so and names
+  visible=True. `allow_large` (upstream: imports over 30 MB) passes through the ordinary open.
+- A script that fails with `rollback_on_error=True` closes the documents it opened that have
+  no unsaved changes and makes the document current before current again; ones with unsaved
+  changes are named and left open.
+- `set_globals({name: value | expression})` and `link_dimensions({dimension: expression})`:
+  many equations with ONE rebuild, all or nothing; expressions may use the batch's own names.
+- `loft_boss(sketches, guides, closed, merge, name, guide_influence)`: a boss loft through
+  existing sketches along guide curves (InsertProtrusionBlend2). Measured: with one guide,
+  influence 'next_guide' and 'global' leave the shape as without it (the feature lists the
+  guide all the same), 'next_sharp' (the default) and 'next_edge' follow it.
+- `rays(..., component=name)` in a script: rays against an assembly component's part, points,
+  directions and hits in assembly space; the transform's matrix convention is checked against
+  SolidWorks' own MultiplyTransform on every call (`rbr/xform.py`).
+- `flow_create_from_case(template=...)`: a template given explicitly is used even when the
+  document has the case's source project (the clone route took a project whose hidden mesh
+  switches had drifted again: even base mesh, thin-channel level 5 - refused before meshing).
+  `scripts/cfd_regression.py --template NAME` makes its projects that way; so run, the
+  regression passed 20/20 (cells equal, settings and mesh fingerprints equal, averaged goals
+  within the private tolerance of the reference and of each other).
+
 ### Added (rbr 1.13.0) - reproducible Flow runs: the whole mesh, cases, fingerprints, folder guard, leak guard
 Verified on a live SolidWorks 2025 SP3 + Flow Simulation 2025 (2026-11-21) through
 the real server object in a separate process, on file copies in a sandbox; unit

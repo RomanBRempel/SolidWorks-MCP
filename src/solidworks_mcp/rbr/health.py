@@ -134,7 +134,7 @@ def sldworks_memory() -> dict | None:
 # Application Error 1000. That, not memory, ended the sessions of 2026-11-18 and 11-19.
 
 GDI_WARN_PCT = float(os.environ.get("SWMCP_GDI_WARN_PCT", "70"))
-GDI_REFUSE_PCT = float(os.environ.get("SWMCP_GDI_REFUSE_PCT", "92"))
+GDI_REFUSE_PCT = float(os.environ.get("SWMCP_GDI_REFUSE_PCT", "80"))
 GDI_PER_WINDOW = 250
 _QUOTA_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows"
 
@@ -195,7 +195,8 @@ def gui_refusal(load: dict | None, what: str = "open another document window") -
             f"({load['gdi_pct']}%): it cannot {what} without failing ('the requested resource is unavailable', "
             "then a crash). Save the work, close document windows (close_hidden_documents takes the invisible "
             "ones; visible ones close with activate_document + close_part), and restart SolidWorks if the "
-            "number stays high - closed windows do not give everything back. server_health shows the count.")
+            "number stays high - closed windows do not give everything back. open_part / open_assembly with "
+            "visible=False load a file without a window (no GDI objects). server_health shows the count.")
 
 
 def process_alive(pid: int | None, image: str = "SLDWORKS.exe") -> bool:

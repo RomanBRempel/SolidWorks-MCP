@@ -33,7 +33,7 @@ import zlib
 
 from .. import binding
 from ..errors import SolidWorksError
-from . import fastpath, journal
+from . import fastpath, journal, safefile
 
 try:  # optional, as for run_script's `np`; without it only the window capture works
     import numpy as np
@@ -507,8 +507,7 @@ def render_view(session, path: str | None = None, view: str = "iso", zoom_mm=Non
         raise SolidWorksError("The off-screen renderer writes PNG: give a path ending in .png.")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     data = png_bytes(image)
-    with open(out, "wb") as fh:
-        fh.write(data)
+    safefile.write_bytes(out, data)
     if info["covered_pct"] <= 0:
         raise SolidWorksError("The render came out empty: zoom_mm lies off the model, or nothing is visible.")
     return {"ok": True, "path": out, "format": "png", "bytes": len(data), "mode": "render",

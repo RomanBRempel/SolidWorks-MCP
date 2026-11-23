@@ -14,7 +14,7 @@ import os
 import re
 
 from ..errors import SolidWorksError
-from . import journal
+from . import journal, safefile
 
 _NAME = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 BUILTIN_DIR = os.path.join(os.path.dirname(__file__), "lib")
@@ -76,8 +76,7 @@ def save_script(name: str, code: str, description: str = "") -> dict:
         code = '"""' + description.replace('"""', "'''") + '"""\n' + code
     path = os.path.join(user_dir(), name + ".py")
     existed = os.path.isfile(path)
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(code if code.endswith("\n") else code + "\n")
+    safefile.write_text(path, code if code.endswith("\n") else code + "\n")
     return {"ok": True, "name": name, "path": path, "replaced": existed}
 
 

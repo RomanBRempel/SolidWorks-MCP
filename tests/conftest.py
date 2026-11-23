@@ -30,6 +30,31 @@ def sw():
     session._command_in_progress(before)
 
 
+GDI_STOP_PCT = 75.0   # every document window keeps about 40 GDI objects for good after closing
+
+
+@pytest.fixture(autouse=True)
+def _stop_before_solidworks_runs_out_of_gdi(request):
+    """Stop the run before SolidWorks runs out of GDI objects. A test that opens a window
+    leaves about 40 behind for good (+3400 in 77 assembly tests, measured 2026-11-23); about
+    two thousand live tests in one SolidWorks session filled the 10 000 a process may hold,
+    and it crashed (heap corruption after 'resource unavailable'). Restart SolidWorks, then
+    run the rest."""
+    if "sw" not in request.fixturenames:
+        yield
+        return
+    try:
+        from solidworks_mcp.rbr import health
+        load = health.sldworks_gui()
+    except Exception:  # noqa: BLE001 - no reading: the test runs
+        load = None
+    if load and load.get("gdi_pct", 0) >= GDI_STOP_PCT:
+        pytest.exit(f"SolidWorks (pid {load.get('pid')}) holds {load['gdi']} of {load['gdi_quota']} GDI objects "
+                    f"({load['gdi_pct']}%): the run stops before it crashes. Save, restart SolidWorks and run "
+                    "the remaining tests.", returncode=3)
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _quiet_solidworks(request):
     """Each SolidWorks test runs with SolidWorks' window kept still, as every
