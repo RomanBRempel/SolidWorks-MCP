@@ -25,7 +25,7 @@ from . import (apiref, assembly, batch, bodies as bodies_mod, cavity, chain, con
 
 __all__ = ["register"]
 
-RBR_VERSION = "1.14.0"
+RBR_VERSION = "1.14.1"
 
 INSTRUCTIONS = """
 
@@ -1313,7 +1313,9 @@ def register(server) -> None:
         would be loaded. A part that fails stops the chain there (not_reached names the rest).
         Refused before anything is touched when a part of the chain is in use by another
         server process or has unsaved changes this server did not make (save=False rebuilds
-        without saving)."""
+        without saving). A part that stores its source at a path that no longer exists (made on
+        another PC, another drive letter, moved) is matched by file name - beside it first, as
+        SolidWorks does - and listed in relinked [{part, stored, found}]."""
         return await _timed(chain.rebuild_chain, session, root, folder, save, close_opened, dry_run,
                             timeout_s=1800)
 

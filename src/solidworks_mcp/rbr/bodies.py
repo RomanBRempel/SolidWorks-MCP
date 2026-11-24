@@ -450,6 +450,16 @@ def save_bodies(session, bodies, path: str, close: bool = True) -> dict:
     part = binding.wrap(model, session._mod.IPartDoc)
     if not model.GetPathName():
         raise SolidWorksError("Save this part first (save_part): the new part references it by path.")
+    try:
+        windowless = not bool(model.Visible)
+    except Exception:  # noqa: BLE001 - cannot tell: go on as before
+        windowless = False
+    if windowless:
+        # measured 2026-11-23 (SW 2025 SP3): SaveToFile3 on a part loaded without a window
+        # killed SolidWorks (access violation, then heap corruption) instead of failing
+        raise SolidWorksError(f"'{model.GetTitle()}' is loaded without a window (visible=False): SolidWorks "
+                              "crashes when bodies of such a part are saved to a new part. Open it with a "
+                              "window (open_part(path) - visible=True is the default) and call again.")
     path = os.path.abspath(path)
     if not path.lower().endswith(".sldprt"):
         path += ".SLDPRT"

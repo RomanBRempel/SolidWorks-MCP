@@ -14,7 +14,10 @@ volume before and after, saves it, and closes it again if it was loaded here.
 No document is activated: the user's current document stays in front.
 
 Verified on SOLIDWORKS 2025 SP3 (2026-11-20): GetDocumentDependencies2 on a
-closed derived part answers [name, path] pairs with its master's path.
+closed derived part answers [name, path] pairs with its master's path - the path STORED
+in the file. A part made on another PC, or synced to another drive letter or folder,
+stores a path that no longer exists, and SolidWorks finds the file by name instead;
+the chain does the same (resolve), or such parts were never rebuilt (O-60, 2026-11-23).
 """
 
 import os
@@ -40,6 +43,37 @@ def paths_of(dependencies) -> list:
     """The paths in GetDocumentDependencies2's answer ([name, path, name, path, ...]); None = none."""
     items = list(dependencies or ())
     return [str(items[i]) for i in range(1, len(items), 2) if items[i]]
+
+
+def resolve(path: str, referrer: str, by_name: dict, exists=os.path.isfile) -> tuple:
+    """(key, relinked) of a reference as SolidWorks follows it; pure apart from `exists`.
+
+    A file stores the full path of what it references. Made on another PC, or synced to a
+    drive with another letter or folder, that path leads nowhere - and SolidWorks finds the
+    file by its NAME (in memory, then beside the referencing file). Matched by the stored
+    path only, such a derived part was left out of the chain and never rebuilt (O-60).
+    by_name: {file name lower: [keys of the scanned files]}. A path that exists is taken as
+    it is; else the one scanned file of that name beside the referrer, else the only one of
+    that name anywhere; several candidates and none beside the referrer keep the stored path."""
+    stored = key(path)
+    if exists(path):
+        return stored, False
+    same = by_name.get(os.path.basename(stored).lower(), [])
+    beside = [c for c in same if os.path.dirname(c) == os.path.dirname(key(referrer))]
+    if len(beside) == 1:
+        return beside[0], True
+    if len(same) == 1:
+        return same[0], True
+    return stored, False
+
+
+def names_of(files) -> dict:
+    """{file name lower: [keys]} of the scanned files; pure."""
+    out = {}
+    for path in files:
+        k = key(path)
+        out.setdefault(os.path.basename(k).lower(), []).append(k)
+    return out
 
 
 def dependents(graph: dict, root: str) -> set:
@@ -90,11 +124,13 @@ def objections(chain: list, open_docs: dict, owners: dict, own_pid: int, save: b
     return out
 
 
-def follows(references: list, chain_keys) -> bool:
+def follows(references: list, chain_keys, resolver=None) -> bool:
     """Does a part with these external references (derive._refs rows) take anything from the
-    chain through a link that is alive? Pure."""
+    chain through a link that is alive? resolver(path) -> key maps a stored path that leads
+    nowhere onto the scanned file SolidWorks takes instead (resolve). Pure."""
     members = set(chain_keys)
-    return any(r.get("file") and key(r["file"]) in members and r.get("status") not in derive.DEAD
+    to_key = resolver or key
+    return any(r.get("file") and to_key(r["file"]) in members and r.get("status") not in derive.DEAD
                for r in references)
 
 
@@ -144,14 +180,20 @@ def _candidates(folders) -> list:
     return files
 
 
-def _graph(session, files: list) -> dict:
+def _graph(session, files: list, by_name: dict, relinked: list) -> dict:
     graph = {}
     for path in files:
         try:
             deps = session._sw.GetDocumentDependencies2(path, False, False, False)
         except Exception:  # noqa: BLE001 - a file SolidWorks cannot read is not part of a chain
             deps = None
-        graph[key(path)] = [key(p) for p in paths_of(deps)]
+        sources = []
+        for stored in paths_of(deps):
+            found, moved = resolve(stored, path, by_name)
+            sources.append(found)
+            if moved:
+                relinked.append({"part": os.path.basename(path), "stored": stored, "found": found})
+        graph[key(path)] = sources
     return graph
 
 
@@ -192,7 +234,9 @@ def rebuild_chain(session, root=None, folder=None, save: bool = True, close_open
     names = {key(p): p for p in files}
     names.setdefault(root_key, root_path)
     t0 = time.perf_counter()
-    graph = _graph(session, files)
+    by_name = names_of(files)
+    relinked = []
+    graph = _graph(session, files, by_name, relinked)
     scan = {"files": len(files), "seconds": round(time.perf_counter() - t0, 1)}
     chain = in_order(graph, dependents(graph, root_key))
     order = [root_key] + chain
@@ -200,6 +244,8 @@ def rebuild_chain(session, root=None, folder=None, save: bool = True, close_open
     plan = [{"part": os.path.basename(names[k]), "path": names[k], "open": k in open_docs,
              "references": [os.path.basename(names.get(s, s)) for s in graph.get(k, ()) if s in order]}
             for k in order]
+    moved = [{"part": r["part"], "stored": r["stored"], "found": os.path.basename(names.get(r["found"], r["found"]))}
+             for r in relinked if r["found"] in order]
     if not chain:
         return {"ok": True, "root": os.path.basename(root_path), "chain": [], "parts": [],
                 "note": f"No part file in {', '.join(folders)} references '{os.path.basename(root_path)}': "
@@ -208,9 +254,12 @@ def rebuild_chain(session, root=None, folder=None, save: bool = True, close_open
     if blocked:
         raise SolidWorksError("rebuild_chain was not started: " + "; ".join(blocked) + ". Nothing was changed.")
     if dry_run:
-        return {"ok": True, "dry_run": True, "root": os.path.basename(root_path),
-                "chain": [p["part"] for p in plan[1:]], "parts": plan,
-                "would_load": [p["part"] for p in plan if not p["open"]], "scan": scan}
+        out = {"ok": True, "dry_run": True, "root": os.path.basename(root_path),
+               "chain": [p["part"] for p in plan[1:]], "parts": plan,
+               "would_load": [p["part"] for p in plan if not p["open"]], "scan": scan}
+        if moved:
+            out["relinked"] = moved
+        return out
 
     mod = session._mod
     rows, loaded = [], []
@@ -230,7 +279,8 @@ def rebuild_chain(session, root=None, folder=None, save: bool = True, close_open
                     loaded.append(doc.GetTitle())
                     row["loaded_here"] = True
                 with derive.as_current(session, doc):
-                    if k != root_key and not follows(derive._refs(session, doc), order):
+                    if k != root_key and not follows(derive._refs(session, doc), order,
+                                                     lambda p, _k=k: resolve(p, names[_k], by_name)[0]):
                         # e.g. what export_static_body wrote: the file still names its source,
                         # but the link is cut - rebuilding and saving it would change nothing
                         row["skipped"] = ("its references to the chain are broken or locked: it does not "
@@ -286,6 +336,10 @@ def rebuild_chain(session, root=None, folder=None, save: bool = True, close_open
               "chain": [os.path.basename(names[k]) for k in chain], "parts": rows, **totals, "scan": scan}
     if closed:
         result["closed_again"] = closed
+    if moved:
+        # the files name sources at paths that no longer exist (made on another PC or moved):
+        # SolidWorks found them by name, as the chain did; a save does not always rewrite them
+        result["relinked"] = moved
     if len(rows) < len(order):
         result["not_reached"] = [os.path.basename(names[k]) for k in order[len(rows):]]
     if totals["failed"]:

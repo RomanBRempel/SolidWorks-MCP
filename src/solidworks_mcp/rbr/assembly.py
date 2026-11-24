@@ -56,7 +56,10 @@ def load_hidden(session, abs_path: str, doc_type: int) -> bool:
     sw = session._sw
     if sw.GetOpenDocumentByName(abs_path) is not None:
         return False
-    title = session._model.GetTitle() if session._model is not None else None
+    try:
+        title = session._model.GetTitle() if session._model is not None else None
+    except Exception:  # noqa: BLE001 - the current document was closed meanwhile: nothing to put back
+        title = None
     sw.DocumentVisible(False, doc_type)
     try:
         result = sw.OpenDoc6(abs_path, doc_type, SW_OPEN_DOC_SILENT, "", 0, 0)
